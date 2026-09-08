@@ -41,6 +41,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -1555,15 +1556,40 @@ internal const val FASELHD_MAIN_URL = "https://web31312x.faselhdx.bid"
 internal const val FASELHD_FALLBACK_URL = "https://www.fasel-hd.cam"
 internal const val FASELHD_TAG = "FaselHD"
 
+/** Live-mirror winner, cached per process (mirrors die across days, not minutes). */
+private var faselHdLiveBase: String? = null
+
+/** Theme markers proving a fetched page is really FaselHD, not a parked/dead mirror. */
+private fun isFaselHdPage(html: String): Boolean {
+    if (html.isBlank()) return false
+    return html.contains("postDiv", ignoreCase = true) ||
+        html.contains("dtc_live", ignoreCase = true) ||
+        html.contains("faselhd", ignoreCase = true) ||
+        html.contains("فاصل", ignoreCase = true)
+}
+
 internal suspend fun faselHdBase(): String {
-    // Try primary mirror from re-3arabi (faselhdx.bid) then fallback to .cam if blocked.
-    // Both go through resolveOrigin to follow 301 to current host.
-    val primary = resolveOrigin(FASELHD_MAIN_URL)
-    if (primary != FASELHD_MAIN_URL) return primary
-    // If primary didn't redirect (maybe blocked), try fallback
-    return if (FASELHD_FALLBACK_URL != primary) {
-        resolveOrigin(FASELHD_FALLBACK_URL).let { if (it != FASELHD_FALLBACK_URL) it else primary }
-    } else primary
+    faselHdLiveBase?.let { return it }
+    // Probe each known mirror and use the first that serves real FaselHD
+    // content — numbered .bid mirrors die often and resolveOrigin alone only
+    // follows redirects, so a parked 200 page would otherwise stick.
+    for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL)) {
+        val origin = resolveOrigin(seed)
+        val probe = try {
+            app.get(origin, timeout = 15000).text.orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+        if (isFaselHdPage(probe)) {
+            Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin")
+            faselHdLiveBase = origin
+            return origin
+        }
+        Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin not serving FaselHD, trying next")
+    }
+    val fallback = resolveOrigin(FASELHD_MAIN_URL)
+    StreamlyDiag.lastStage = "FaselHD: no live mirror"
+    return fallback
 }
 
 /**
@@ -1645,6 +1671,7 @@ private suspend fun faselHdAjaxAttempt(
         .build()
     var currentUrl = ajaxUrl
     var redirects = 0
+    var rateRetries = 0
     while (redirects < 5) {
         val reqBuilder = OkRequest.Builder()
             .url(currentUrl)
@@ -1655,9 +1682,21 @@ private suspend fun faselHdAjaxAttempt(
         val response = withContext(Dispatchers.IO) {
             client.newCall(reqBuilder.build()).execute()
         }
+        var backoffMs = 0L
         response.use { res ->
             when (res.code) {
                 403 -> throw IllegalStateException("403_FORBIDDEN")
+                429 -> {
+                    // Rate-limited infra: back off and retry (re-3arabi smartGet).
+                    if (rateRetries >= 3) {
+                        Log.w(FASELHD_TAG, "[search ] ajax 429 x3, giving up")
+                        StreamlyDiag.lastStage = "FaselHD: ajax rate-limited"
+                        return ""
+                    }
+                    rateRetries++
+                    Log.w(FASELHD_TAG, "[search ] ajax 429, retry $rateRetries/3")
+                    backoffMs = 1000L * rateRetries
+                }
                 301, 302, 307, 308 -> {
                     val location = res.header("Location")
                     if (location != null) {
@@ -1668,9 +1707,15 @@ private suspend fun faselHdAjaxAttempt(
                     }
                 }
                 200 -> return res.body?.string() ?: ""
-                else -> return ""
+                else -> {
+                    Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code}")
+                    StreamlyDiag.lastStage = "FaselHD: ajax HTTP ${res.code}"
+                    return ""
+                }
             }
         }
+        // 429 backoff happens here so the response is already closed.
+        if (backoffMs > 0) delay(backoffMs)
     }
     return "" // redirect limit reached
 }
@@ -1708,6 +1753,7 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
     // Fallback: classic `?s=` GET. WordPress 302-redirects straight to the
     // post when there is a single hit — treat that as an exact hit instead
     // of parsing list cards that aren't there (re-3arabi resp.url pattern).
+    Log.d(FASELHD_TAG, "[search ] ajax empty for '$query', trying ?s= fallback")
     try {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val searchUrl = "$base/?s=$encoded"
@@ -1725,6 +1771,7 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
             return listOf(Candidate(finalUrl, slug, query, yearFromSlug(slug)))
         }
         val items = faselHdParseCards(faselHdGet(searchUrl))
+        Log.d(FASELHD_TAG, "[search ] ?s= '$query' -> ${items.size} candidates")
         if (items.isNotEmpty()) return items
     } catch (e: Exception) {
         Log.e(FASELHD_TAG, "[search ] ?s= fallback failed: ${e.message}")
@@ -1765,7 +1812,11 @@ private suspend fun faselHdExtractServers(
     var found = false
 
     // Direct download path: .downloadLinks a -> POST -> .dl-link a (final video).
-    val downloadHref = doc.select(".downloadLinks a").attr("href")
+    // The href is often relative — absolutize it or the POST below throws.
+    val downloadRaw = doc.selectFirst(".downloadLinks a")?.let {
+        it.absUrl("href").ifEmpty { it.attr("href") }
+    }.orEmpty()
+    val downloadHref = if (downloadRaw.isBlank()) "" else fixUrl(downloadRaw, base)
     if (downloadHref.isNotBlank()) {
         try {
             val playerDoc = cfPostDoc(downloadHref, referer = postUrl, timeout = 60000)
