@@ -550,7 +550,10 @@ private suspend fun searchOnce(query: String, type: String): List<Candidate> {
 }
 
 private fun decodeSlug(url: String): String {
-    val segment = url.substringBeforeLast('/').substringAfterLast('/')
+    // Last path segment regardless of trailing slash: the .co site emits
+    // hrefs like …/movies/<slug> (no trailing slash), where the old
+    // beforeLast/afterLast dance returned the category ("movies") instead.
+    val segment = url.trimEnd('/').substringAfterLast('/').substringBefore('?')
     return runCatching { URLDecoder.decode(segment, "UTF-8") }.getOrDefault(segment)
 }
 
