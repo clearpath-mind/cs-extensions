@@ -1541,7 +1541,7 @@ private suspend fun egydeadResolveEpisode(
 }
 
 // ===========================================================================
-// FaselHD (fasel-hd.cam) link source.
+// FaselHD (fasel-hd.co) link source.
 //
 // WordPress (faselhd_2020 theme). Search is performed via `?s=` and is
 // Cloudflare-protected; `faselHdGet` routes through the shared WebView-based
@@ -1552,8 +1552,9 @@ private suspend fun egydeadResolveEpisode(
 // reuse the shared extractor registry (Vidtube/UpDown/Dooood/Filelion/…).
 // ===========================================================================
 
-internal const val FASELHD_MAIN_URL = "https://web31312x.faselhdx.bid"
+internal const val FASELHD_MAIN_URL = "https://www.fasel-hd.co"
 internal const val FASELHD_FALLBACK_URL = "https://www.fasel-hd.cam"
+internal const val FASELHD_LEGACY_URL = "https://web31312x.faselhdx.bid"
 internal const val FASELHD_TAG = "FaselHD"
 
 /** Live-mirror winner, cached per process (mirrors die across days, not minutes). */
@@ -1571,14 +1572,15 @@ private fun isFaselHdPage(html: String?): Boolean {
 internal suspend fun faselHdBase(): String {
     faselHdLiveBase?.let { return it }
     // Probe each known mirror and use the first that serves real FaselHD
-    // content — numbered .bid mirrors die often and resolveOrigin alone only
-    // follows redirects, so a parked 200 page would otherwise stick.
-    for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL)) {
+    // content. The site moved to fasel-hd.co (old .bid/.cam seeds redirect
+    // there), and the domain root is a marker-less landing page — so probe
+    // /main, which carries the theme (postDiv/dtc_live).
+    for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL, FASELHD_LEGACY_URL)) {
         val origin = resolveOrigin(seed)
         // Explicit String? type: app response accessors carry a jspecify
         // @Nullable annotation that isn't on the compile classpath.
         val probe: String? = try {
-            app.get(origin, timeout = 15000).text
+            app.get("$origin/main", timeout = 15000).text
         } catch (_: Exception) {
             null
         }

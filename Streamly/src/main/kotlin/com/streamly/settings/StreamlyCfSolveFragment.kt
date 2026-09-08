@@ -298,7 +298,7 @@ class StreamlyCfSolveFragment(
             } catch (_: Exception) {
                 null
             }
-            solveUrl = url ?: "https://www.fasel-hd.cam/"
+            solveUrl = url ?: "https://www.fasel-hd.co/"
             try {
                 wv.loadUrl(solveUrl)
             } catch (_: Exception) {
