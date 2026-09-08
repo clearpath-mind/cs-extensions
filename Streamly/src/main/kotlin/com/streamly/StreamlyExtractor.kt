@@ -1560,8 +1560,8 @@ internal const val FASELHD_TAG = "FaselHD"
 private var faselHdLiveBase: String? = null
 
 /** Theme markers proving a fetched page is really FaselHD, not a parked/dead mirror. */
-private fun isFaselHdPage(html: String): Boolean {
-    if (html.isBlank()) return false
+private fun isFaselHdPage(html: String?): Boolean {
+    if (html.isNullOrBlank()) return false
     return html.contains("postDiv", ignoreCase = true) ||
         html.contains("dtc_live", ignoreCase = true) ||
         html.contains("faselhd", ignoreCase = true) ||
@@ -1575,10 +1575,12 @@ internal suspend fun faselHdBase(): String {
     // follows redirects, so a parked 200 page would otherwise stick.
     for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL)) {
         val origin = resolveOrigin(seed)
-        val probe = try {
-            app.get(origin, timeout = 15000).text.orEmpty()
+        // Explicit String? type: app response accessors carry a jspecify
+        // @Nullable annotation that isn't on the compile classpath.
+        val probe: String? = try {
+            app.get(origin, timeout = 15000).text
         } catch (_: Exception) {
-            ""
+            null
         }
         if (isFaselHdPage(probe)) {
             Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin")
