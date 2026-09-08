@@ -46,6 +46,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import me.xdrop.fuzzywuzzy.FuzzySearch
+import okhttp3.FormBody
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -1576,75 +1577,161 @@ internal suspend fun faselHdSolveUrl(): String = faselHdBase()
 private suspend fun faselHdGet(url: String, referer: String? = null): Document =
     cfGetDoc(url, referer = referer, timeout = 20000)
 
-private suspend fun faselHdSearch(query: String): List<Candidate> {
-    val base = faselHdBase()
-    val encoded = URLEncoder.encode(query, "UTF-8")
-    val items = try {
-        val doc = faselHdGet("$base/?s=$encoded")
-        doc.select("div#postList div.postDiv, div.postDiv, article").mapNotNull { box ->
-            val a = box.selectFirst("a[href]") ?: return@mapNotNull null
-            val href = a.absUrl("href").ifEmpty { a.attr("href") }
-            if (href.isBlank()) return@mapNotNull null
-            val slug = decodeSlug(href)
-            Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-        }.filter { it.latinTitle.isNotBlank() }
-    } catch (e: Exception) {
-        Log.e(FASELHD_TAG, "[search ] failed: ${e.message}")
-        StreamlyDiag.lastStage = "FaselHD: search failed: ${e.message}"
-        emptyList()
+/** Shared card parser for FaselHD list fragments (`?s=` pages and AJAX html). */
+private fun faselHdParseCards(doc: Document): List<Candidate> =
+    doc.select("div#postList div.postDiv, div.postDiv, article, .result, .search-item").mapNotNull { box ->
+        val a = box.selectFirst("a[href]") ?: return@mapNotNull null
+        val href = a.absUrl("href").ifEmpty { a.attr("href") }
+        if (href.isBlank() || !href.startsWith("http")) return@mapNotNull null
+        val slug = decodeSlug(href)
+        Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
     }
 
-     if (items.isEmpty()) {
-        // WP search can return nothing even when results exist; recover via the
-        // theme's live-search AJAX endpoint (dtc_live).
-        try {
-            val ajax = cfPostText(
-                "${faselHdBase()}/wp-admin/admin-ajax.php",
-                data = mapOf("action" to "dtc_live", "trsearch" to query),
-                referer = base,
-                timeout = 15000,
-            )
-            if (ajax.isNotBlank()) {
-                val ajaxDoc = Jsoup.parse(ajax, base)
-                val recovered = ajaxDoc.select("div.postDiv, article, .result, .search-item").mapNotNull { box ->
-                    val a = box.selectFirst("a[href]") ?: return@mapNotNull null
-                    val href = a.absUrl("href").ifEmpty { a.attr("href") }
-                    if (href.isBlank()) return@mapNotNull null
-                    val slug = decodeSlug(href)
-                    Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-                }.filter { it.latinTitle.isNotBlank() }
-                if (recovered.isNotEmpty()) return recovered
-            }
-        } catch (e: Exception) {
-            Log.e(FASELHD_TAG, "[search ] ajax fallback failed: ${e.message}")
+/**
+ * FaselHD live-search via the theme's AJAX endpoint (`action=dtc_live`),
+ * ported from re-3arabi's Faselhd.kt: raw OkHttp POST with manual redirect
+ * handling and one CF-clearance refresh on HTTP 403. Unlike `?s=`, the
+ * server matches Arabic titles too, so this is the primary search path.
+ */
+private suspend fun faselHdAjaxSearch(query: String, base: String): List<Candidate> {
+    val formBody = FormBody.Builder()
+        .add("action", "dtc_live")
+        .add("trsearch", query)
+        .build()
+    val bodyStr = try {
+        faselHdAjaxPost("$base/wp-admin/admin-ajax.php", base, formBody)
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[search ] ajax failed: ${e.message}")
+        null
+    }
+    if (bodyStr.isNullOrBlank()) return emptyList()
+    return faselHdParseCards(Jsoup.parse(bodyStr, base))
+}
+
+/**
+ * Raw OkHttp AJAX POST with manual redirect handling (re-3arabi
+ * `makeAjaxRequest`). Throws IllegalStateException("403_FORBIDDEN") on a
+ * Cloudflare block so the caller can refresh clearance and retry once
+ * (re-3arabi `executeRequestWithCloudflareRetry`).
+ */
+private suspend fun faselHdAjaxPost(
+    ajaxUrl: String,
+    base: String,
+    formBody: FormBody,
+): String? {
+    try {
+        return faselHdAjaxAttempt(ajaxUrl, base, formBody, cfCookies(base))
+    } catch (e: IllegalStateException) {
+        if (e.message != "403_FORBIDDEN") return null
+    }
+    Log.d(FASELHD_TAG, "[search ] 403 on AJAX, refreshing CF clearance…")
+    cfSolve(ajaxUrl)
+    return try {
+        faselHdAjaxAttempt(ajaxUrl, base, formBody, cfCookies(base))
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private suspend fun faselHdAjaxAttempt(
+    ajaxUrl: String,
+    base: String,
+    formBody: FormBody,
+    cookies: String,
+): String? {
+    val client = app.baseClient.newBuilder()
+        .cookieJar(okhttp3.CookieJar.NO_COOKIES)
+        .followRedirects(false) // follow manually to keep the POST across hops
+        .build()
+    var currentUrl = ajaxUrl
+    var redirects = 0
+    while (redirects < 5) {
+        val reqBuilder = OkRequest.Builder()
+            .url(currentUrl)
+            .post(formBody)
+            .header("User-Agent", CF_UA)
+            .header("Referer", base)
+        if (cookies.isNotBlank()) reqBuilder.header("Cookie", cookies)
+        val response = withContext(Dispatchers.IO) {
+            client.newCall(reqBuilder.build()).execute()
         }
-        // Extra fallback for titles with leading article "The " (e.g. The Mentalist -> Mentalist)
-        // which the Arabic site indexes without article (slug mentalist).
-        val stripped = query.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
-        if (stripped.isNotBlank() && stripped != query) {
-            try {
-                val ajax2 = cfPostText(
-                    "${faselHdBase()}/wp-admin/admin-ajax.php",
-                    data = mapOf("action" to "dtc_live", "trsearch" to stripped),
-                    referer = base,
-                    timeout = 15000,
-                )
-                if (ajax2.isNotBlank()) {
-                    val ajaxDoc2 = Jsoup.parse(ajax2, base)
-                    val recovered2 = ajaxDoc2.select("div.postDiv, article, .result, .search-item").mapNotNull { box ->
-                        val a = box.selectFirst("a[href]") ?: return@mapNotNull null
-                        val href = a.absUrl("href").ifEmpty { a.attr("href") }
-                        if (href.isBlank()) return@mapNotNull null
-                        val slug = decodeSlug(href)
-                        Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-                    }.filter { it.latinTitle.isNotBlank() }
-                    if (recovered2.isNotEmpty()) return recovered2
+        response.use { res ->
+            when (res.code) {
+                403 -> throw IllegalStateException("403_FORBIDDEN")
+                301, 302, 307, 308 -> {
+                    val location = res.header("Location")
+                    if (location != null) {
+                        currentUrl = if (location.startsWith("http")) location else "$base$location"
+                        redirects++
+                    } else {
+                        return ""
+                    }
                 }
-            } catch (_: Exception) {}
+                200 -> return res.body?.string() ?: ""
+                else -> return ""
+            }
         }
     }
-    if (items.isEmpty()) StreamlyDiag.lastStage = "FaselHD: search empty"
-    return items
+    return "" // redirect limit reached
+}
+
+private suspend fun faselHdSearch(query: String): List<Candidate> {
+    val base = faselHdBase()
+
+    // Primary: theme live-search AJAX (matches Arabic titles server-side).
+    val primary = try {
+        faselHdAjaxSearch(query, base)
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[search ] ajax failed: ${e.message}")
+        emptyList()
+    }
+    if (primary.isNotEmpty()) {
+        Log.d(FASELHD_TAG, "[search ] ajax '$query' -> ${primary.size} candidates")
+        return primary
+    }
+
+    // Same AJAX with leading article stripped ("The X" -> "X"), which the
+    // Arabic index often drops.
+    val stripped = query.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
+    if (stripped.isNotBlank() && stripped != query) {
+        val retry = try {
+            faselHdAjaxSearch(stripped, base)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (retry.isNotEmpty()) {
+            Log.d(FASELHD_TAG, "[search ] ajax stripped '$stripped' -> ${retry.size} candidates")
+            return retry
+        }
+    }
+
+    // Fallback: classic `?s=` GET. WordPress 302-redirects straight to the
+    // post when there is a single hit — treat that as an exact hit instead
+    // of parsing list cards that aren't there (re-3arabi resp.url pattern).
+    try {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val searchUrl = "$base/?s=$encoded"
+        val finalUrl = try {
+            app.get(searchUrl, timeout = 15000).url
+        } catch (_: Exception) {
+            searchUrl
+        }
+        if (!finalUrl.contains("?s=", ignoreCase = true) &&
+            finalUrl.trimEnd('/') != base.trimEnd('/')
+        ) {
+            Log.d(FASELHD_TAG, "[search ] redirect hit -> $finalUrl")
+            val slug = decodeSlug(finalUrl)
+            // latinTitle = query scores 100 in scoreCandidate: exact hit.
+            return listOf(Candidate(finalUrl, slug, query, yearFromSlug(slug)))
+        }
+        val items = faselHdParseCards(faselHdGet(searchUrl))
+        if (items.isNotEmpty()) return items
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[search ] ?s= fallback failed: ${e.message}")
+    }
+
+    StreamlyDiag.lastStage = "FaselHD: search empty"
+    return emptyList()
 }
 
 /** Find the episode anchor on a series (or season) page that matches `episode`. */

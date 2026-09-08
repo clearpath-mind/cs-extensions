@@ -164,6 +164,28 @@ class StreamlyProvidersFragment(
                 adapter.setDisabled(provider.id, !isChecked)
             }
 
+            // Manual Cloudflare solve shortcut (FaselHD): opens the visible
+            // solver, then returns to this list. The button consumes its own
+            // taps so the row toggle below never fires for it.
+            if (provider.needsCfSolve) {
+                val solveId = res.getIdentifier("btn_cf_solve", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
+                if (solveId != 0) {
+                    val btnSolve = item.findViewById<ImageButton>(solveId)
+                    btnSolve.visibility = View.VISIBLE
+                    btnSolve.setImageDrawable(getDrawable("settings_icon"))
+                    btnSolve.makeTvCompatible()
+                    btnSolve.setOnClickListener {
+                        dismiss()
+                        container.post {
+                            StreamlyCfSolveFragment {
+                                StreamlyProvidersFragment(plugin, sharedPref, onDismissCallback)
+                                    .show(parentFragmentManager, "streamly_providers")
+                            }.show(parentFragmentManager, "streamly_cf_solve")
+                        }
+                    }
+                }
+            }
+
             container.addView(item)
             updateProviderCount()
         }
