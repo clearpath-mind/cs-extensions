@@ -77,6 +77,11 @@ class StreamlyMainSettingsFragment(
         providersRow.background = getDrawable("settings_item_background")
         providersIcon.setImageDrawable(getDrawable("settings_icon"))
 
+        val solveFaselRow: View = view.findView("solveFaselRow")
+        val solveFaselIcon = view.findView<ImageView>("solveFaselIcon")
+        solveFaselRow.background = getDrawable("settings_item_background")
+        solveFaselIcon.setImageDrawable(getDrawable("settings_icon"))
+
         val hideMetaRow: View = view.findView("hideMetaRow")
         hideMetaRow.background = getDrawable("settings_item_background")
 
@@ -103,6 +108,10 @@ class StreamlyMainSettingsFragment(
 
         providersRow.setOnClickListener {
             showSubFragment({ cb -> StreamlyProvidersFragment(plugin, sharedPref, cb) }, "streamly_providers")
+        }
+
+        solveFaselRow.setOnClickListener {
+            showSubFragment({ cb -> StreamlyCfSolveFragment(cb) }, "streamly_cf_fasel")
         }
 
         saveIcon.setOnClickListener {

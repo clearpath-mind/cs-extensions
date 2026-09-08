@@ -373,7 +373,7 @@ object StreamlyDiag {
 }
 
 private val cfSolveLock = Mutex()
-private const val CF_UA =
+internal const val CF_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
 private fun cfCookies(url: String): String =
@@ -1550,11 +1550,11 @@ private suspend fun egydeadResolveEpisode(
 // reuse the shared extractor registry (Vidtube/UpDown/Dooood/Filelion/…).
 // ===========================================================================
 
-private const val FASELHD_MAIN_URL = "https://web31312x.faselhdx.bid"
-private const val FASELHD_FALLBACK_URL = "https://www.fasel-hd.cam"
-private const val FASELHD_TAG = "FaselHD"
+internal const val FASELHD_MAIN_URL = "https://web31312x.faselhdx.bid"
+internal const val FASELHD_FALLBACK_URL = "https://www.fasel-hd.cam"
+internal const val FASELHD_TAG = "FaselHD"
 
-private suspend fun faselHdBase(): String {
+internal suspend fun faselHdBase(): String {
     // Try primary mirror from re-3arabi (faselhdx.bid) then fallback to .cam if blocked.
     // Both go through resolveOrigin to follow 301 to current host.
     val primary = resolveOrigin(FASELHD_MAIN_URL)
@@ -1564,6 +1564,13 @@ private suspend fun faselHdBase(): String {
         resolveOrigin(FASELHD_FALLBACK_URL).let { if (it != FASELHD_FALLBACK_URL) it else primary }
     } else primary
 }
+
+/**
+ * Resolved FaselHD origin for the manual Cloudflare solve dialog in settings.
+ * Same host the provider requests hit (via [faselHdBase]), so the
+ * cf_clearance cookie the user earns applies to subsequent requests.
+ */
+internal suspend fun faselHdSolveUrl(): String = faselHdBase()
 
 /** CF-aware GET backed by the shared WebView solver (see cfGetDoc). */
 private suspend fun faselHdGet(url: String, referer: String? = null): Document =
