@@ -573,10 +573,14 @@ private fun scoreCandidate(candidate: Candidate, title: String, year: Int?): Int
     val candidateTitle = candidate.latinTitle.lowercase().replace('-', ' ')
     var score = FuzzySearch.weightedRatio(candidateTitle, title.lowercase().replace('-', ' '))
     val candidateYear = candidate.year
-    if (candidateYear != null && year != null && Math.abs(candidateYear - year) > 1) {
-        score -= YEAR_PENALTY
-    } else if (candidateYear != null && year != null) {
-        score += 5
+    if (candidateYear != null && year != null) {
+        // TMDB years skew by a year or two (festival vs wide release, or just
+        // wrong metadata) — only punish clear mismatches, never veto near ones.
+        when (Math.abs(candidateYear - year)) {
+            0, 1 -> score += 5
+            2 -> { /* no penalty, no bonus */ }
+            else -> score -= 25
+        }
     }
     return score
 }
@@ -1909,15 +1913,43 @@ private suspend fun faselHdExtractServers(
     return found
 }
 
+/**
+ * Last-resort FaselHD pick when nothing clears the fuzzy threshold: accept
+ * the best-scored candidate whose slug tokens contain every significant
+ * query token (e.g. "Moana" in "1-film-moana-2-2024-..."), with years within
+ * ±3 when both are known. The AJAX endpoint already matched these server-side,
+ * so token containment is a safe tie-break, not a blind guess.
+ */
+private fun faselHdContainmentPick(
+    scored: List<Pair<Candidate, Int>>,
+    title: String,
+    year: Int?,
+): Candidate? {
+    val queryTokens = title.lowercase().replace('-', ' ')
+        .split(Regex("\\s+")).filter { it.length > 2 }
+    if (queryTokens.isEmpty()) return null
+    return scored
+        .filter { (c, _) ->
+            val tokens = c.latinTitle.lowercase().replace('-', ' ')
+                .split(Regex("\\s+")).toSet()
+            queryTokens.all { q -> tokens.any { t -> t.contains(q) || q.contains(t) } } &&
+                (year == null || c.year == null || Math.abs(c.year - year) <= 3)
+        }
+        .maxByOrNull { it.second }?.first
+}
+
 private suspend fun faselHdResolveMovie(
     title: String,
     year: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val candidates = faselHdSearch(title)
+    val all = faselHdSearch(title)
         .map { it to scoreCandidate(it, title, year) }
-        .filter { it.second >= MIN_SCORE_MOVIE }
+    all.sortedByDescending { it.second }.forEach { (c, s) ->
+        Log.d(FASELHD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
+    }
+    val candidates = all.filter { it.second >= MIN_SCORE_MOVIE }
 
     val strippedTitle = title.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
     val best = candidates.maxByOrNull { it.second }?.first
@@ -1928,6 +1960,9 @@ private suspend fun faselHdResolveMovie(
                 .filter { it.second >= MIN_SCORE_MOVIE }
                 .maxByOrNull { it.second }?.first
         } else null
+        ?: faselHdContainmentPick(all, title, year)?.also {
+            Log.d(FASELHD_TAG, "[match  ] CONTAINMENT fallback ${it.url}")
+        }
     if (best == null) {
         Log.d(FASELHD_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
         return false
@@ -1944,9 +1979,12 @@ private suspend fun faselHdResolveEpisode(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val candidates = faselHdSearch(title)
+    val allSeries = faselHdSearch(title)
         .map { it to scoreCandidate(it, title, year) }
-        .filter { it.second >= MIN_SCORE_SERIES }
+    allSeries.sortedByDescending { it.second }.forEach { (c, s) ->
+        Log.d(FASELHD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
+    }
+    val candidates = allSeries.filter { it.second >= MIN_SCORE_SERIES }
 
     // Retry with stripped leading article ("The Mentalist" -> "Mentalist") when
     // the initial search returns results but none score above the threshold.
@@ -1961,6 +1999,9 @@ private suspend fun faselHdResolveEpisode(
                 .filter { it.second >= MIN_SCORE_SERIES }
                 .maxByOrNull { it.second }?.first
         } else null
+        ?: faselHdContainmentPick(allSeries, title, year)?.also {
+            Log.d(FASELHD_TAG, "[match  ] CONTAINMENT fallback ${it.url}")
+        }
     if (best == null) {
         Log.d(FASELHD_TAG, "[match  ] no series above $MIN_SCORE_SERIES")
         return false
