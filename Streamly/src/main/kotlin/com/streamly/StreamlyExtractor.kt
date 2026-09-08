@@ -1815,10 +1815,12 @@ private suspend fun faselHdExtractServers(
 
     // Direct download path: .downloadLinks a -> POST -> .dl-link a (final video).
     // The href is often relative — absolutize it or the POST below throws.
-    val downloadRaw = doc.selectFirst(".downloadLinks a")?.let {
-        it.absUrl("href").ifEmpty { it.attr("href") }
-    }.orEmpty()
-    val downloadHref = if (downloadRaw.isBlank()) "" else fixUrl(downloadRaw, base)
+    val downloadAnchor = doc.selectFirst(".downloadLinks a")
+    var downloadHref = ""
+    if (downloadAnchor != null) {
+        val raw = downloadAnchor.absUrl("href").ifEmpty { downloadAnchor.attr("href") }
+        if (raw.isNotBlank()) downloadHref = fixUrl(raw, base)
+    }
     if (downloadHref.isNotBlank()) {
         try {
             val playerDoc = cfPostDoc(downloadHref, referer = postUrl, timeout = 60000)
