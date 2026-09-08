@@ -48,7 +48,7 @@ subprojects {
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     cloudstream {
-        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/clearpath-mind/cloudstream-extensions")
+        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/clearpath-mind/cs-extensions")
         authors = listOf("clearpath-mind")
     }
 
