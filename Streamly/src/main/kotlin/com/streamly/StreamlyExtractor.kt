@@ -10,6 +10,7 @@ import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -1587,17 +1588,18 @@ internal suspend fun faselHdBase(): String {
         val origin = resolveOrigin(seed)
         // Explicit String? type: app response accessors carry a jspecify
         // @Nullable annotation that isn't on the compile classpath.
+        val tProbe = SystemClock.elapsedRealtime()
         val probe: String? = try {
             app.get("$origin/main", timeout = 15000).text
         } catch (_: Exception) {
             null
         }
         if (isFaselHdPage(probe)) {
-            Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin")
+            Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin in ${SystemClock.elapsedRealtime() - tProbe}ms")
             faselHdLiveBase = origin
             return origin
         }
-        Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin not serving FaselHD, trying next")
+        Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin not serving FaselHD in ${SystemClock.elapsedRealtime() - tProbe}ms, trying next")
     }
     val fallback = resolveOrigin(FASELHD_MAIN_URL)
     StreamlyDiag.lastStage = "FaselHD: no live mirror"
@@ -1733,9 +1735,12 @@ private suspend fun faselHdAjaxAttempt(
 }
 
 private suspend fun faselHdSearch(query: String): List<Candidate> {
+    val tBase = SystemClock.elapsedRealtime()
     val base = faselHdBase()
+    Log.d(FASELHD_TAG, "[search ] base=$base in ${SystemClock.elapsedRealtime() - tBase}ms")
 
     // Primary: theme live-search AJAX (matches Arabic titles server-side).
+    val tAjax = SystemClock.elapsedRealtime()
     val primary = try {
         faselHdAjaxSearch(query, base)
     } catch (e: Exception) {
@@ -1743,29 +1748,33 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
         emptyList()
     }
     if (primary.isNotEmpty()) {
-        Log.d(FASELHD_TAG, "[search ] ajax '$query' -> ${primary.size} candidates")
+        Log.d(FASELHD_TAG, "[search ] ajax '$query' -> ${primary.size} candidates in ${SystemClock.elapsedRealtime() - tAjax}ms")
         return primary
     }
+    Log.d(FASELHD_TAG, "[search ] ajax '$query' empty in ${SystemClock.elapsedRealtime() - tAjax}ms")
 
     // Same AJAX with leading article stripped ("The X" -> "X"), which the
     // Arabic index often drops.
     val stripped = query.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
     if (stripped.isNotBlank() && stripped != query) {
+        val tStripped = SystemClock.elapsedRealtime()
         val retry = try {
             faselHdAjaxSearch(stripped, base)
         } catch (_: Exception) {
             emptyList()
         }
         if (retry.isNotEmpty()) {
-            Log.d(FASELHD_TAG, "[search ] ajax stripped '$stripped' -> ${retry.size} candidates")
+            Log.d(FASELHD_TAG, "[search ] ajax stripped '$stripped' -> ${retry.size} candidates in ${SystemClock.elapsedRealtime() - tStripped}ms")
             return retry
         }
+        Log.d(FASELHD_TAG, "[search ] ajax stripped '$stripped' empty in ${SystemClock.elapsedRealtime() - tStripped}ms")
     }
 
     // Fallback: classic `?s=` GET. WordPress 302-redirects straight to the
     // post when there is a single hit — treat that as an exact hit instead
     // of parsing list cards that aren't there (re-3arabi resp.url pattern).
     Log.d(FASELHD_TAG, "[search ] ajax empty for '$query', trying ?s= fallback")
+    val tQs = SystemClock.elapsedRealtime()
     try {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val searchUrl = "$base/?s=$encoded"
@@ -1783,16 +1792,57 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
             return listOf(Candidate(finalUrl, slug, query, yearFromSlug(slug)))
         }
         val items = faselHdParseCards(faselHdGet(searchUrl))
-        Log.d(FASELHD_TAG, "[search ] ?s= '$query' -> ${items.size} candidates")
+        Log.d(FASELHD_TAG, "[search ] ?s= '$query' -> ${items.size} candidates in ${SystemClock.elapsedRealtime() - tQs}ms")
         if (items.isNotEmpty()) return items
     } catch (e: Exception) {
-        Log.e(FASELHD_TAG, "[search ] ?s= fallback failed: ${e.message}")
+        Log.e(FASELHD_TAG, "[search ] ?s= fallback failed in ${SystemClock.elapsedRealtime() - tQs}ms: ${e.message}")
     }
 
     StreamlyDiag.lastStage = "FaselHD: search empty"
     return emptyList()
 }
 
+/** Host only, no path/query/token — safe for logs. */
+private fun faselHdHostOf(url: String): String =
+    runCatching { URI(url.substringBefore("#")).host ?: url.take(48) }.getOrDefault(url.take(48))
+
+/** Shared emit for a resolved m3u8: single adaptive link for masters, expansion otherwise. */
+private suspend fun faselHdEmitResolved(
+    m3u8: String,
+    iframe: String,
+    base: String,
+    callback: (ExtractorLink) -> Unit,
+) {
+    if (m3u8.contains("master.m3u8", ignoreCase = true)) {
+        // Emit the adaptive master only. Expanding it via generateM3u8
+        // yields 1080+720+360+master links; CloudStream auto-plays
+        // index 0 (forced 1080p) and thumbnails every variant via
+        // MediaMetadataRetriever without Referer headers, which
+        // stalls the UI (Slow Binder ~6s) and backpressures the
+        // decoder (pipelineFull/QueueBuffer timeout). One master link
+        // lets ExoPlayer adapt and cuts preview fetches to one.
+        Log.d(FASELHD_TAG, "[watch  ] master playlist, emitting single adaptive link")
+        callback(
+            newExtractorLink("FaselHD", "FaselHD", url = m3u8) {
+                this.referer = iframe
+                this.quality = Qualities.Unknown.value
+                this.type = ExtractorLinkType.M3U8
+                this.headers = mapOf(
+                    "Referer" to iframe,
+                    "Origin" to base,
+                    "User-Agent" to CF_UA,
+                )
+            },
+        )
+    } else {
+        generateM3u8(
+            "FaselHD",
+            m3u8,
+            referer = iframe,
+            headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
+        ).forEach(callback)
+    }
+}
 /** Find the episode anchor on a series (or season) page that matches `episode`. */
 private fun faselHdExactEpisode(scope: Document, episode: Int): String? {
     val anchors = scope.select("div#epAll a").takeIf { it.isNotEmpty() } ?: scope.select("a[href]")
@@ -1850,48 +1900,64 @@ private suspend fun faselHdExtractServers(
         }
     }
 
-    // Player iframes -> WebView jwplayer decryption (enc: sources) + m3u8 sniff.
+    // Player iframes: fast inline scan first (cheap HTTP + regex, no WebView),
+    // then WebView jwplayer decryption (enc: sources) + m3u8 sniff only where
+    // the scan came up empty. Hosts are logged without tokens for CDN comparison.
+    val tWatch = SystemClock.elapsedRealtime()
     val iframes = extractIframeSources(doc, base)
-    Log.d(FASELHD_TAG, "[watch  ] ${iframes.size} iframes on $postUrl")
+    val iframeHosts = iframes.map { faselHdHostOf(it) }
+    Log.d(FASELHD_TAG, "[watch  ] ${iframes.size} iframes hosts=$iframeHosts on $postUrl")
     if (iframes.isEmpty()) StreamlyDiag.lastStage = "FaselHD: 0 iframes"
     var resolved = false
-    for (iframe in iframes) {
-        val m3u8 = faselHdResolveWebView(iframe, postUrl)
-        if (!m3u8.isNullOrBlank()) {
+    // Pass 1: fast scan across all iframes.
+    for ((idx, iframe) in iframes.withIndex()) {
+        val t0 = SystemClock.elapsedRealtime()
+        val scanned = try {
+            cfGetText(iframe, referer = postUrl, timeout = 15000)
+                .replace(Regex("""['"]\s*\+\s*['"]"""), "")
+        } catch (_: Exception) {
+            ""
+        }
+        val fastM3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(scanned)?.value
+        if (!fastM3u8.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan HIT in ${SystemClock.elapsedRealtime() - t0}ms")
             found = true
             resolved = true
-            if (m3u8.contains("master.m3u8", ignoreCase = true)) {
-                // Emit the adaptive master only. Expanding it via generateM3u8
-                // yields 1080+720+360+master links; CloudStream auto-plays
-                // index 0 (forced 1080p) and thumbnails every variant via
-                // MediaMetadataRetriever without Referer headers, which
-                // stalls the UI (Slow Binder ~6s) and backpressures the
-                // decoder (pipelineFull/QueueBuffer timeout). One master link
-                // lets ExoPlayer adapt and cuts preview fetches to one.
-                Log.d(FASELHD_TAG, "[watch  ] master playlist, emitting single adaptive link")
-                callback(
-                    newExtractorLink("FaselHD", "FaselHD", url = m3u8) {
-                        this.referer = iframe
-                        this.quality = Qualities.Unknown.value
-                        this.type = ExtractorLinkType.M3U8
-                        this.headers = mapOf(
-                            "Referer" to iframe,
-                            "Origin" to base,
-                            "User-Agent" to CF_UA,
-                        )
-                    },
-                )
-            } else {
-                generateM3u8(
-                    "FaselHD",
-                    m3u8,
-                    referer = iframe,
-                    headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
-                ).forEach(callback)
+            faselHdEmitResolved(fastM3u8, iframe, base, callback)
+            break
+        }
+        val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
+        if (!fastMp4.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan MP4 in ${SystemClock.elapsedRealtime() - t0}ms")
+            found = true
+            resolved = true
+            callback(
+                newExtractorLink("FaselHD MP4", "FaselHD MP4", fastMp4) {
+                    this.referer = iframe
+                    this.quality = getQualityFromName(fastMp4)
+                    this.type = ExtractorLinkType.VIDEO
+                },
+            )
+            break
+        }
+        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan miss in ${SystemClock.elapsedRealtime() - t0}ms")
+    }
+    // Pass 2: WebView resolve for iframes the scan couldn't crack.
+    if (!resolved) {
+        for ((idx, iframe) in iframes.withIndex()) {
+            val t0 = SystemClock.elapsedRealtime()
+            val m3u8 = faselHdResolveWebView(iframe, postUrl)
+            if (!m3u8.isNullOrBlank()) {
+                Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
+                found = true
+                resolved = true
+                faselHdEmitResolved(m3u8, iframe, base, callback)
+                break // first working server is enough
             }
-            break // first working server is enough
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms")
         }
     }
+    Log.d(FASELHD_TAG, "[watch  ] resolve done in ${SystemClock.elapsedRealtime() - tWatch}ms resolved=$resolved")
 
     // Fallback: the older inline-scan path for non-encrypted embeds.
     if (!resolved) {
