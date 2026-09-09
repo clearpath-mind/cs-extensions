@@ -1900,61 +1900,66 @@ private suspend fun faselHdExtractServers(
         }
     }
 
-    // Player iframes: fast inline scan first (cheap HTTP + regex, no WebView),
-    // then WebView jwplayer decryption (enc: sources) + m3u8 sniff only where
-    // the scan came up empty. Hosts are logged without tokens for CDN comparison.
+    // Player iframes: WebView jwplayer decryption (enc: sources) + m3u8 sniff
+    // first — the fast inline scan never hits on encrypted embeds (v7 capture:
+    // 3 misses costing ~3.6s before the WebView even started), so it lives on
+    // as a fallback. Hosts are logged without tokens for CDN comparison.
     val tWatch = SystemClock.elapsedRealtime()
     val iframes = extractIframeSources(doc, base)
     val iframeHosts = iframes.map { faselHdHostOf(it) }
     Log.d(FASELHD_TAG, "[watch  ] ${iframes.size} iframes hosts=$iframeHosts on $postUrl")
     if (iframes.isEmpty()) StreamlyDiag.lastStage = "FaselHD: 0 iframes"
     var resolved = false
-    // Pass 1: fast scan across all iframes.
+    // Pass 1: WebView resolve (handles enc: payloads).
     for ((idx, iframe) in iframes.withIndex()) {
         val t0 = SystemClock.elapsedRealtime()
-        val scanned = try {
-            cfGetText(iframe, referer = postUrl, timeout = 15000)
-                .replace(Regex("""['"]\s*\+\s*['"]"""), "")
-        } catch (_: Exception) {
-            ""
-        }
-        val fastM3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(scanned)?.value
-        if (!fastM3u8.isNullOrBlank()) {
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan HIT in ${SystemClock.elapsedRealtime() - t0}ms")
+        val m3u8 = faselHdResolveWebView(iframe, postUrl)
+        if (!m3u8.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
             found = true
             resolved = true
-            faselHdEmitResolved(fastM3u8, iframe, base, callback)
-            break
+            faselHdEmitResolved(m3u8, iframe, base, callback)
+            break // first working server is enough
         }
-        val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
-        if (!fastMp4.isNullOrBlank()) {
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan MP4 in ${SystemClock.elapsedRealtime() - t0}ms")
-            found = true
-            resolved = true
-            callback(
-                newExtractorLink("FaselHD MP4", "FaselHD MP4", fastMp4) {
-                    this.referer = iframe
-                    this.quality = getQualityFromName(fastMp4)
-                    this.type = ExtractorLinkType.VIDEO
-                },
-            )
-            break
-        }
-        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan miss in ${SystemClock.elapsedRealtime() - t0}ms")
+        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms")
     }
-    // Pass 2: WebView resolve for iframes the scan couldn't crack.
+    // Pass 2 (fallback): cheap inline scan across all iframes for
+    // non-encrypted embeds. Also reports enc: presence: the decryptor keys
+    // are already ported into the WebView strategy JS, so a static enc: blob
+    // here would mean the WebView (~10s) can be replaced with plain HTTP.
     if (!resolved) {
         for ((idx, iframe) in iframes.withIndex()) {
             val t0 = SystemClock.elapsedRealtime()
-            val m3u8 = faselHdResolveWebView(iframe, postUrl)
-            if (!m3u8.isNullOrBlank()) {
-                Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
+            val scanned = try {
+                cfGetText(iframe, referer = postUrl, timeout = 15000)
+                    .replace(Regex("""['"]\s*\+\s*['"]"""), "")
+            } catch (_: Exception) {
+                ""
+            }
+            val encCount = Regex("""enc:""").findAll(scanned).count()
+            val fastM3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(scanned)?.value
+            if (!fastM3u8.isNullOrBlank()) {
+                Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan HIT enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
                 found = true
                 resolved = true
-                faselHdEmitResolved(m3u8, iframe, base, callback)
-                break // first working server is enough
+                faselHdEmitResolved(fastM3u8, iframe, base, callback)
+                break
             }
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms")
+            val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
+            if (!fastMp4.isNullOrBlank()) {
+                Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan MP4 enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+                found = true
+                resolved = true
+                callback(
+                    newExtractorLink("FaselHD MP4", "FaselHD MP4", fastMp4) {
+                        this.referer = iframe
+                        this.quality = getQualityFromName(fastMp4)
+                        this.type = ExtractorLinkType.VIDEO
+                    },
+                )
+                break
+            }
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan miss enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
         }
     }
     Log.d(FASELHD_TAG, "[watch  ] resolve done in ${SystemClock.elapsedRealtime() - tWatch}ms resolved=$resolved")
