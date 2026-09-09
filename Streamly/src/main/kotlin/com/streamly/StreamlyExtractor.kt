@@ -34,6 +34,7 @@ import okhttp3.Request as OkRequest
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -1561,7 +1562,6 @@ private suspend fun egydeadResolveEpisode(
 
 internal const val FASELHD_MAIN_URL = "https://www.fasel-hd.co"
 internal const val FASELHD_FALLBACK_URL = "https://www.fasel-hd.cam"
-internal const val FASELHD_LEGACY_URL = "https://web31312x.faselhdx.bid"
 internal const val FASELHD_TAG = "FaselHD"
 
 /** Live-mirror winner, cached per process (mirrors die across days, not minutes). */
@@ -1579,10 +1579,11 @@ private fun isFaselHdPage(html: String?): Boolean {
 internal suspend fun faselHdBase(): String {
     faselHdLiveBase?.let { return it }
     // Probe each known mirror and use the first that serves real FaselHD
-    // content. The site moved to fasel-hd.co (old .bid/.cam seeds redirect
-    // there), and the domain root is a marker-less landing page — so probe
-    // /main, which carries the theme (postDiv/dtc_live).
-    for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL, FASELHD_LEGACY_URL)) {
+    // content. The site lives on fasel-hd.co (old .bid seeds just redirect
+    // there, so they are not probed), with .cam kept as fallback. The domain
+    // root is a marker-less landing page — so probe /main, which carries the
+    // theme (postDiv/dtc_live).
+    for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL)) {
         val origin = resolveOrigin(seed)
         // Explicit String? type: app response accessors carry a jspecify
         // @Nullable annotation that isn't on the compile classpath.
@@ -1859,12 +1860,35 @@ private suspend fun faselHdExtractServers(
         if (!m3u8.isNullOrBlank()) {
             found = true
             resolved = true
-            generateM3u8(
-                "FaselHD",
-                m3u8,
-                referer = iframe,
-                headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
-            ).forEach(callback)
+            if (m3u8.contains("master.m3u8", ignoreCase = true)) {
+                // Emit the adaptive master only. Expanding it via generateM3u8
+                // yields 1080+720+360+master links; CloudStream auto-plays
+                // index 0 (forced 1080p) and thumbnails every variant via
+                // MediaMetadataRetriever without Referer headers, which
+                // stalls the UI (Slow Binder ~6s) and backpressures the
+                // decoder (pipelineFull/QueueBuffer timeout). One master link
+                // lets ExoPlayer adapt and cuts preview fetches to one.
+                Log.d(FASELHD_TAG, "[watch  ] master playlist, emitting single adaptive link")
+                callback(
+                    newExtractorLink("FaselHD", "FaselHD", url = m3u8) {
+                        this.referer = iframe
+                        this.quality = Qualities.Unknown.value
+                        this.type = ExtractorLinkType.M3U8
+                        this.headers = mapOf(
+                            "Referer" to iframe,
+                            "Origin" to base,
+                            "User-Agent" to CF_UA,
+                        )
+                    },
+                )
+            } else {
+                generateM3u8(
+                    "FaselHD",
+                    m3u8,
+                    referer = iframe,
+                    headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
+                ).forEach(callback)
+            }
             break // first working server is enough
         }
     }
