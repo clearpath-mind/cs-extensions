@@ -224,7 +224,16 @@ object EmbedRouter {
         providerName: String? = null,
     ) {
         val host = link.lowercase()
-        val out: (ExtractorLink) -> Unit = { l -> callback(relabelLink(l, providerName)) }
+        // Single simple link per embed: built-in extractors fan out into
+        // per-quality rows (Strwish 800p, …); keep the first and drop the
+        // rest. Subtitles still flow via subtitleCallback untouched.
+        var emittedLink = false
+        val out: (ExtractorLink) -> Unit = { l ->
+            if (!emittedLink) {
+                emittedLink = true
+                callback(relabelLink(l, providerName))
+            }
+        }
         try {
             val extractorName = when {
                 "vidtube" in host -> "Vidtube"

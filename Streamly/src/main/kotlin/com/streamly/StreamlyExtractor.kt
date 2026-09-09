@@ -67,9 +67,8 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, WeCima, EgyDead, FaselHD.
-// Inlined from previous FaselHdResolver.kt / EarnVidsExtractor.kt to match
-// StreamPlay structure (no separate files), as requested.
+// Currently: TopCinema, WeCima, EgyDead, FaselHD. One adaptive link is
+// emitted per server (no per-quality lists); ExoPlayer adapts itself.
 // ---------------------------------------------------------------------------
 
 private const val FASELHD_RES_UA =
@@ -1479,8 +1478,14 @@ private suspend fun egydeadExtract(
         } else {
             jobs += suspend {
                 runCatching {
+                    // Single simple link per locker: keep the first built-in
+                    // result, drop per-quality repeats.
+                    var emittedLink = false
                     loadExtractor(link, postUrl, subtitleCallback, { l ->
-                        callback(relabelLink(l, "EgyDead"))
+                        if (!emittedLink) {
+                            emittedLink = true
+                            callback(relabelLink(l, "EgyDead"))
+                        }
                     })
                 }
             }
