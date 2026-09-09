@@ -5,8 +5,6 @@ import android.content.SharedPreferences
 import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -22,7 +20,6 @@ import androidx.core.content.edit
 import androidx.core.view.isNotEmpty
 import androidx.core.widget.addTextChangedListener
 import androidx.fragment.app.DialogFragment
-import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.streamly.BuildConfig
 import com.streamly.Provider
 import com.streamly.ProvidersList
@@ -166,42 +163,6 @@ class StreamlyProvidersFragment(
 
             chk.setOnCheckedChangeListener { _, isChecked ->
                 adapter.setDisabled(provider.id, !isChecked)
-            }
-
-            // Manual Cloudflare solve shortcut (FaselHD): opens the visible
-            // solver, then returns to this list. The button consumes its own
-            // taps so the row toggle below never fires for it.
-            // NOTE: post on the main Handler, NOT on container — container
-            // belongs to this dialog's dying view hierarchy and a posted
-            // runnable would never run after dismiss() detaches it.
-            if (provider.needsCfSolve) {
-                val solveId = res.getIdentifier("btn_cf_solve", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
-                if (solveId != 0) {
-                    val btnSolve = item.findViewById<ImageButton>(solveId)
-                    btnSolve.visibility = View.VISIBLE
-                    btnSolve.setImageDrawable(getDrawable("settings_icon"))
-                    btnSolve.makeTvCompatible()
-                    btnSolve.setOnClickListener {
-                        val fm = parentFragmentManager
-                        val mainHandler = Handler(Looper.getMainLooper())
-                        dismissAllowingStateLoss()
-                        mainHandler.post {
-                            try {
-                                StreamlyCfSolveFragment {
-                                    try {
-                                        StreamlyProvidersFragment(plugin, sharedPref, onDismissCallback)
-                                            .show(fm, "streamly_providers")
-                                    } catch (e: Exception) {
-                                        Log.e("StreamlyProviders", "Reopen providers failed: ${e.message}")
-                                    }
-                                }.show(fm, "streamly_cf_solve")
-                            } catch (e: Exception) {
-                                Log.e("StreamlyProviders", "Open CF solver failed: ${e.message}")
-                                showToast("Could not open solver: ${e.message}")
-                            }
-                        }
-                    }
-                }
             }
 
             container.addView(item)

@@ -11,7 +11,6 @@ import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.getPacked
@@ -72,22 +71,16 @@ open class PackedJwPlayer : ExtractorApi() {
             }
 
         // Hosts like Vidtube 403 their stream CDN unless requests carry the
-        // embed host as Referer. generateM3u8 only sends the headers map while
-        // enumerating variants, so the host referer must ride along in it; the
-        // helper copies it onto every variant link for playback too.
+        // embed host as Referer, so it rides along in the headers map; the
+        // player uses it for playback too. One adaptive link per source — no
+        // quality list; ExoPlayer adapts from the master playlist itself.
         val hlsHeaders = mapOf("Referer" to mainUrl)
 
         var emitted = 0
         sources.forEach { src ->
             if (src.contains(".m3u8")) {
-                val variants = runCatching { generateM3u8(name, src, mainUrl, headers = hlsHeaders) }.getOrDefault(emptyList())
-                if (variants.isNotEmpty()) {
-                    variants.forEach(callback)
-                    emitted += variants.size
-                } else {
-                    callback(m3u8Link(src))
-                    emitted++
-                }
+                callback(m3u8Link(src, hlsHeaders))
+                emitted++
             } else {
                 callback(fileLink(src, referer, getQualityFromName(src)))
                 emitted++
@@ -123,11 +116,13 @@ open class PackedJwPlayer : ExtractorApi() {
 
     // The master-playlist fallback must present the host's own referer: CDNs
     // like Vidtube's reject cross-site (site-of-origin) referers with 403.
-    private suspend fun m3u8Link(src: String): ExtractorLink =
+    // Single adaptive link (no quality expansion) with playback headers.
+    private suspend fun m3u8Link(src: String, headers: Map<String, String> = emptyMap()): ExtractorLink =
         newExtractorLink(name, name, url = src) {
             this.referer = mainUrl
             this.quality = Qualities.Unknown.value
             this.type = ExtractorLinkType.M3U8
+            if (headers.isNotEmpty()) this.headers = headers
         }
 }
 
@@ -203,7 +198,14 @@ class Uqload : ExtractorApi() {
                 else -> null
             }
         }.toList().forEach { m3u8 ->
-            runCatching { generateM3u8(name, m3u8, mainUrl) }.getOrDefault(emptyList()).forEach(callback)
+            // Single adaptive link — no quality list.
+            callback(
+                newExtractorLink(name, name, url = m3u8) {
+                    this.referer = mainUrl
+                    this.quality = Qualities.Unknown.value
+                    this.type = ExtractorLinkType.M3U8
+                },
+            )
         }
     }
 }

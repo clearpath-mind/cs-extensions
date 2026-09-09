@@ -6,8 +6,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 data class Provider(
     val id: String,
     val name: String,
-    /** Show the manual Cloudflare-solve icon on this source's row. */
-    val needsCfSolve: Boolean = false,
     val invoke: suspend (
         res: LinkData,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -27,7 +25,7 @@ object ProvidersList {
             Provider("egydead", "EgyDead") { res, sub, cb ->
                 invokeEgydead(res, sub, cb)
             },
-            Provider("faselhd", "FaselHD", needsCfSolve = true) { res, sub, cb ->
+            Provider("faselhd", "FaselHD") { res, sub, cb ->
                 invokeFaselHd(res, sub, cb)
             },
         )

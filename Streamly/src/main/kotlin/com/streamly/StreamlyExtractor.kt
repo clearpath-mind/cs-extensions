@@ -48,6 +48,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import me.xdrop.fuzzywuzzy.FuzzySearch
 import okhttp3.FormBody
 import org.json.JSONObject
@@ -101,8 +102,13 @@ fun extractIframeSources(doc: Document, base: String): List<String> {
             if (u.contains("player") || u.contains("embed")) add(u)
         }
     }
+    // Share short-links (div.shortLink / span#liskSh, e.g. `?p=309212`) point at
+    // the post page itself and can never yield a stream — only accept
+    // player-like URLs here, or a dead page burns a full WebView cycle.
     doc.select("div.shortLink, span#liskSh, a[data-src]").forEach { el ->
-        el.text().trim().takeIf { it.startsWith("http") }?.let { add(it) }
+        el.text().trim().takeIf { it.startsWith("http") }
+            ?.takeIf { u -> u.contains("player", ignoreCase = true) || u.contains("embed", ignoreCase = true) || u.contains("video", ignoreCase = true) }
+            ?.let { add(it) }
     }
     return results.toList()
 }
@@ -1437,7 +1443,14 @@ private suspend fun egydeadExtract(
             jobs += suspend {
                 val m3u8 = ExternalEarnVidsExtractor.extract(embed, postUrl)
                 if (!m3u8.isNullOrBlank()) {
-                    generateM3u8("EgyDead - $label", m3u8, referer = embed).forEach(callback)
+                    // Single adaptive link — no quality list.
+                    callback(
+                        newExtractorLink("EgyDead - $label", "EgyDead - $label", url = m3u8) {
+                            this.referer = embed
+                            this.quality = Qualities.Unknown.value
+                            this.type = ExtractorLinkType.M3U8
+                        },
+                    )
                 } else {
                     EmbedRouter.route(embed, postUrl, subtitleCallback, callback, "EgyDead")
                 }
@@ -1605,13 +1618,6 @@ internal suspend fun faselHdBase(): String {
     StreamlyDiag.lastStage = "FaselHD: no live mirror"
     return fallback
 }
-
-/**
- * Resolved FaselHD origin for the manual Cloudflare solve dialog in settings.
- * Same host the provider requests hit (via [faselHdBase]), so the
- * cf_clearance cookie the user earns applies to subsequent requests.
- */
-internal suspend fun faselHdSolveUrl(): String = faselHdBase()
 
 /** CF-aware GET backed by the shared WebView solver (see cfGetDoc). */
 private suspend fun faselHdGet(url: String, referer: String? = null): Document =
@@ -1865,16 +1871,21 @@ private suspend fun faselHdExtractServers(
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
     val base = faselHdBase()
+    val tPost = SystemClock.elapsedRealtime()
     val doc = try {
         faselHdGet(postUrl)
     } catch (e: Exception) {
-        Log.e(FASELHD_TAG, "[watch  ] failed: ${e.message}")
+        Log.e(FASELHD_TAG, "[watch  ] post page failed in ${SystemClock.elapsedRealtime() - tPost}ms: ${e.message}")
         return false
     }
+    Log.d(FASELHD_TAG, "[watch  ] post page in ${SystemClock.elapsedRealtime() - tPost}ms")
     var found = false
 
     // Direct download path: .downloadLinks a -> POST -> .dl-link a (final video).
     // The href is often relative — absolutize it or the POST below throws.
+    // Capped: the locker host (t7meel.site) hung to its 60s timeout in the
+    // v8 capture, blocking all iframe work. A locker that doesn't answer in
+    // 15s won't yield a usable stream link anyway.
     val downloadAnchor = doc.selectFirst(".downloadLinks a")
     var downloadHref = ""
     if (downloadAnchor != null) {
@@ -1882,8 +1893,11 @@ private suspend fun faselHdExtractServers(
         if (raw.isNotBlank()) downloadHref = fixUrl(raw, base)
     }
     if (downloadHref.isNotBlank()) {
+        val tDl = SystemClock.elapsedRealtime()
         try {
-            val playerDoc = cfPostDoc(downloadHref, referer = postUrl, timeout = 60000)
+            val playerDoc = withTimeout(15_000) {
+                cfPostDoc(downloadHref, referer = postUrl, timeout = 60000)
+            }
             val dlLink = playerDoc.select("div.dl-link a").attr("href")
             if (dlLink.isNotBlank()) {
                 found = true
@@ -1895,8 +1909,9 @@ private suspend fun faselHdExtractServers(
                     },
                 )
             }
+            Log.d(FASELHD_TAG, "[direct ] done in ${SystemClock.elapsedRealtime() - tDl}ms hit=${dlLink.isNotBlank()}")
         } catch (e: Exception) {
-            Log.e(FASELHD_TAG, "[direct ] failed: ${e.message}")
+            Log.w(FASELHD_TAG, "[direct ] capped/failed in ${SystemClock.elapsedRealtime() - tDl}ms: ${e.message}")
         }
     }
 
@@ -1988,7 +2003,7 @@ private suspend fun faselHdExtractServers(
                 val m3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(playerText)?.value
                 if (!m3u8.isNullOrBlank()) {
                     found = true
-                    generateM3u8("FaselHD", m3u8, referer = iframeSrc).forEach(callback)
+                    faselHdEmitResolved(m3u8, iframeSrc, base, callback)
                 } else {
                     val mp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(playerText)?.value
                     if (!mp4.isNullOrBlank()) {
