@@ -107,13 +107,17 @@ the same items twice.
 
 ## Match banners
 
-`Today's Matches` cards use on-device 1280x720 composite banners — competition
-badge + name top-center, VS in the middle, both team crests on a dark
+`Today's Matches` cards use on-device 1280x720 composite banners —
+competition name top-center, VS in the middle, both team crests on a dark
 gradient (`matchBanner()`/`renderBanner()`), cached under
 `cacheDir/yacine_banners` per event id (`match_{id}_v2.png`) with API-logo
-fallback. Competition badges come from an in-code `competitionLogos` map
-(Wikimedia URLs, Arabic + English keys); unknown competitions render
-text-only.
+fallback.
+
+## Match details
+
+Plot is beIN-style with the match title (`شاهد بث مباشر لمباراة {title}`).
+Competition, broadcast channel, commentator, and kickoff ride in `LinkData`
+and render as tags on the detail page.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 

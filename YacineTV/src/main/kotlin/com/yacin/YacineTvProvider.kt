@@ -68,49 +68,6 @@ class YacineTvProvider : MainAPI() {
     /** On-device match banner cache (event id -> cached PNG path). */
     private val bannerCache = ConcurrentHashMap<Long, String>()
 
-    /** Competition badges (normalized Arabic/English name -> logo URL).
-     * The API only sends `champions` text, so this map covers the
-     * competitions seen in /events plus the usual leagues. Unknown
-     * competitions render text-only. */
-    private val competitionLogos = mapOf(
-        "دوري أبطال أوروبا" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f5/UEFA_Champions_League.svg/640px-UEFA_Champions_League.svg.png",
-        "uefa champions league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f5/UEFA_Champions_League.svg/640px-UEFA_Champions_League.svg.png",
-        "champions league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f5/UEFA_Champions_League.svg/640px-UEFA_Champions_League.svg.png",
-        "الدوري الأوروبي" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1b/UEFA_Europa_League_logo_%282024_version%29.svg/640px-UEFA_Europa_League_logo_%282024_version%29.svg.png",
-        "europa league" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1b/UEFA_Europa_League_logo_%282024_version%29.svg/640px-UEFA_Europa_League_logo_%282024_version%29.svg.png",
-        "دوري المؤتمر الأوروبي" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/4/4b/UEFA_Conference_League_full_logo_%282024_version%29.svg/640px-UEFA_Conference_League_full_logo_%282024_version%29.svg.png",
-        "conference league" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/4/4b/UEFA_Conference_League_full_logo_%282024_version%29.svg/640px-UEFA_Conference_League_full_logo_%282024_version%29.svg.png",
-        "كوبا ليبرتادوريس" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/a1/Copa_Libertadores_logo.svg/640px-Copa_Libertadores_logo.svg.png",
-        "copa libertadores" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/a1/Copa_Libertadores_logo.svg/640px-Copa_Libertadores_logo.svg.png",
-        "كوبا سود أمريكانا" to "https://thumb.wikimedia.org/wikipedia/en/thumb/c/c2/CONMEBOL_Sudamericana_logo_%282017%29.svg/640px-CONMEBOL_Sudamericana_logo_%282017%29.svg.png",
-        "copa sudamericana" to "https://thumb.wikimedia.org/wikipedia/en/thumb/c/c2/CONMEBOL_Sudamericana_logo_%282017%29.svg/640px-CONMEBOL_Sudamericana_logo_%282017%29.svg.png",
-        "الدوري الإنجليزي" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f2/Premier_League_Logo.svg/640px-Premier_League_Logo.svg.png",
-        "premier league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f2/Premier_League_Logo.svg/640px-Premier_League_Logo.svg.png",
-        "الدوري الإسباني" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/54/LaLiga_EA_Sports_2023_Vertical_Logo.svg/640px-LaLiga_EA_Sports_2023_Vertical_Logo.svg.png",
-        "la liga" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/54/LaLiga_EA_Sports_2023_Vertical_Logo.svg/640px-LaLiga_EA_Sports_2023_Vertical_Logo.svg.png",
-        "الدوري الإيطالي" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/ab/Serie_A_ENILIVE_logo.svg/640px-Serie_A_ENILIVE_logo.svg.png",
-        "serie a" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/ab/Serie_A_ENILIVE_logo.svg/640px-Serie_A_ENILIVE_logo.svg.png",
-        "الدوري الألماني" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/df/Bundesliga_logo_%282017%29.svg/640px-Bundesliga_logo_%282017%29.svg.png",
-        "bundesliga" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/df/Bundesliga_logo_%282017%29.svg/640px-Bundesliga_logo_%282017%29.svg.png",
-        "الدوري الفرنسي" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/Logo_Ligue_1_McDonald%27s_2024.svg/640px-Logo_Ligue_1_McDonald%27s_2024.svg.png",
-        "ligue 1" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/Logo_Ligue_1_McDonald%27s_2024.svg/640px-Logo_Ligue_1_McDonald%27s_2024.svg.png",
-        "الدوري السعودي" to "https://thumb.wikimedia.org/wikipedia/en/thumb/7/75/Roshn_Saudi_League_Logo.svg/640px-Roshn_Saudi_League_Logo.svg.png",
-        "saudi pro league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/7/75/Roshn_Saudi_League_Logo.svg/640px-Roshn_Saudi_League_Logo.svg.png",
-        "كأس العالم" to "https://thumb.wikimedia.org/wikipedia/en/thumb/1/17/2026_FIFA_World_Cup_emblem.svg/640px-2026_FIFA_World_Cup_emblem.svg.png",
-        "world cup" to "https://thumb.wikimedia.org/wikipedia/en/thumb/1/17/2026_FIFA_World_Cup_emblem.svg/640px-2026_FIFA_World_Cup_emblem.svg.png",
-        "كأس أمم أفريقيا" to "https://upload.wikimedia.org/wikipedia/en/c/cf/Africa_Cup_of_Nation_official_logo.png",
-        "africa cup of nations" to "https://upload.wikimedia.org/wikipedia/en/c/cf/Africa_Cup_of_Nation_official_logo.png",
-        "دوري أبطال آسيا" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/d7/AFC_Champions_League_Elite_logo.svg/640px-AFC_Champions_League_Elite_logo.svg.png",
-        "afc champions league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/d7/AFC_Champions_League_Elite_logo.svg/640px-AFC_Champions_League_Elite_logo.svg.png",
-        "دوري أبطال أفريقيا" to "https://upload.wikimedia.org/wikipedia/en/d/d5/CAF_Champions_League.png",
-        "caf champions league" to "https://upload.wikimedia.org/wikipedia/en/d/d5/CAF_Champions_League.png",
-        "الدوري المصري" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/ORA_League.png/640px-ORA_League.png",
-        "egyptian premier league" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/ORA_League.png/640px-ORA_League.png",
-        "الدوري المغربي" to "https://upload.wikimedia.org/wikipedia/en/c/ce/BotolaPro-logo.png",
-        "البطولة المغربية" to "https://upload.wikimedia.org/wikipedia/en/c/ce/BotolaPro-logo.png",
-        "botola" to "https://upload.wikimedia.org/wikipedia/en/c/ce/BotolaPro-logo.png",
-    )
-
     /** Categories merged into one beIN SPORTS row (one per quality upstream). */
     private val beinQualityIds = setOf(4, 5, 6, 7)
     private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
@@ -123,6 +80,9 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("poster") val poster: String? = null,
         @JsonProperty("poster2") val poster2: String? = null, // match: other team logo
         @JsonProperty("channel") val channel: String? = null, // match: broadcast channel
+        @JsonProperty("competition") val competition: String? = null, // match: champions
+        @JsonProperty("commentary") val commentary: String? = null, // match: commentator
+        @JsonProperty("kickoff") val kickoff: String? = null, // match: formatted start time
         @JsonProperty("plot") val plot: String? = null,
     )
 
@@ -284,14 +244,8 @@ class YacineTvProvider : MainAPI() {
         return e.champions?.trim().orEmpty().ifBlank { "مباراة" }
     }
 
-    private fun eventPlot(e: YacineEvent): String {
-        val parts = mutableListOf<String>()
-        e.champions?.takeIf { it.isNotBlank() }?.let { parts.add("البطولة: $it") }
-        eventTitle(e).let { parts.add(it) }
-        e.channel?.takeIf { it.isNotBlank() }?.let { parts.add("القناة: $it") }
-        e.commentary?.takeIf { it.isNotBlank() }?.let { parts.add("التعليق: $it") }
-        formatKickoff(e.startTime).takeIf { it.isNotBlank() }?.let { parts.add("الموعد: $it") }
-        return parts.joinToString("\n")
+    private fun matchPlot(title: String): String {
+        return "شاهد بث مباشر لمباراة $title"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -350,7 +304,10 @@ class YacineTvProvider : MainAPI() {
                         poster = poster,
                         poster2 = poster2,
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                        plot = eventPlot(e),
+                        competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                        commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
+                        kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
+                        plot = matchPlot(title),
                     ).toJson()
                     newLiveSearchResponse(title, data, TvType.Live) {
                         this.posterUrl = poster
@@ -455,14 +412,11 @@ class YacineTvProvider : MainAPI() {
                 val b2 = l2?.let { downloadBitmap(it) }
                 if (b1 == null && b2 == null) return@runCatching null
                 val compName = e.champions?.trim()?.takeIf { it.isNotBlank() }
-                val compLogo = compName?.let { competitionLogos[normalizeName(it)] }
-                    ?.let { downloadBitmap(it) }
-                val bmp = renderBanner(b1, b2, compLogo, compName)
+                val bmp = renderBanner(b1, b2, compName)
                 FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.PNG, 90, it) }
                 bmp.recycle()
                 if (b1 != null && b1 != bmp) b1.recycle()
                 if (b2 != null && b2 != bmp) b2.recycle()
-                compLogo?.recycle()
                 bannerCache[id] = out.absolutePath
                 out.absolutePath
             }.getOrNull()
@@ -480,7 +434,7 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull()
     }
 
-    private fun renderBanner(left: Bitmap?, right: Bitmap?, compLogo: Bitmap?, compName: String?): Bitmap {
+    private fun renderBanner(left: Bitmap?, right: Bitmap?, compName: String?): Bitmap {
         val w = 1280
         val h = 720
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -515,30 +469,14 @@ class YacineTvProvider : MainAPI() {
         }
         drawCrest(left, w * 0.22f)
         drawCrest(right, w * 0.78f)
-        // Competition badge top-center (unknown competitions skip the badge).
-        compLogo?.let { logo ->
-            val maxSide = 120
-            val scale = minOf(
-                maxSide / logo.width.toFloat(),
-                maxSide / logo.height.toFloat(),
-            )
-            val dw = (logo.width * scale).toInt().coerceAtLeast(1)
-            val dh = (logo.height * scale).toInt().coerceAtLeast(1)
-            val s = Bitmap.createScaledBitmap(logo, dw, dh, true)
-            c.drawBitmap(
-                s, w / 2f - dw / 2f, 56f,
-                Paint().apply { isFilterBitmap = true; isAntiAlias = true },
-            )
-            if (s != logo) s.recycle()
-        }
         val textPaint = Paint().apply {
             color = Color.WHITE
             textAlign = Paint.Align.CENTER
             isAntiAlias = true
         }
-        // Competition name under the badge (Canvas shapes Arabic correctly).
+        // Competition name top-center (Canvas shapes Arabic correctly).
         compName?.let {
-            c.drawText(it, w / 2f, 252f, textPaint.apply { textSize = 38f })
+            c.drawText(it, w / 2f, 130f, textPaint.apply { textSize = 40f })
         }
         // VS in the middle, with shadow for contrast.
         c.drawText(
@@ -676,7 +614,10 @@ class YacineTvProvider : MainAPI() {
                     poster = poster,
                     poster2 = poster2,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    plot = eventPlot(e),
+                    competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                    commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
+                    kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
+                    plot = matchPlot(title),
                 ).toJson()
                 out.add(
                     newLiveSearchResponse(title, data, TvType.Live) {
@@ -691,7 +632,7 @@ class YacineTvProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
         val plot = data.plot
-            ?: if (data.kind == "event") "مباراة: ${data.name}"
+            ?: if (data.kind == "event") matchPlot(data.name)
             else "شاهد بث مباشر لقناة ${data.name}"
         return newMovieLoadResponse(data.name, url, TvType.Live, url) {
             this.posterUrl = data.poster
@@ -700,6 +641,17 @@ class YacineTvProvider : MainAPI() {
                 this.backgroundPosterUrl = data.poster2
             }
             this.plot = plot
+            // Match meta as tags: competition, broadcast channel,
+            // commentator, kickoff.
+            if (data.kind == "event") {
+                val tags = listOfNotNull(
+                    data.competition?.takeIf { it.isNotBlank() },
+                    data.channel?.takeIf { it.isNotBlank() },
+                    data.commentary?.takeIf { it.isNotBlank() },
+                    data.kickoff?.takeIf { it.isNotBlank() },
+                )
+                if (tags.isNotEmpty()) this.tags = tags
+            }
         }
     }
 
