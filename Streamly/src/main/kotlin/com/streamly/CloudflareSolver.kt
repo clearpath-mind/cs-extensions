@@ -2,6 +2,7 @@ package com.streamly
 
 import android.R
 import android.app.Activity
+import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -11,16 +12,16 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.FrameLayout
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+
+/** Clearance result: final URL (follows mirror rotations) + cookies for that URL. */
+data class SolverResult(val finalUrl: String, val cookies: String?)
 
 object CloudflareSolver {
     private const val TAG = "CF_Solver_Hidden"
 
-    suspend fun solve(activity: Activity?, url: String, userAgent: String): Document? {
+    suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String): SolverResult? {
         return suspendCoroutine { continuation ->
             if (activity == null || activity.isFinishing) {
                 continuation.resume(null)
@@ -34,13 +35,14 @@ object CloudflareSolver {
                 }
 
                 val webView = WebView(activity)
-                webView.layoutParams = FrameLayout.LayoutParams(
+                webView.layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
 
-                webView.alpha = 0f
+                webView.alpha = 0.01f
                 webView.translationX = 10000f
+                webView.translationY = 10000f
                 webView.isFocusable = false
                 webView.isFocusableInTouchMode = false
                 webView.isClickable = false
@@ -62,32 +64,30 @@ object CloudflareSolver {
                 var isProcessingClick = false
                 val pollingHandler = Handler(Looper.getMainLooper())
 
-                fun finishSuccess(html: String?) {
+                fun finishSuccess(finalUrl: String, reason: String = "unknown") {
                     if (!isSolved) {
                         isSolved = true
+                        Log.i(TAG, "solved | reason: $reason | finalUrl: $finalUrl")
+
                         cookieManager.flush()
+                        val finalCookies = cookieManager.getCookie(finalUrl)
+                        if (finalCookies.isNullOrBlank()) {
+                            Log.w(TAG, "finished without cookies for $finalUrl")
+                        }
+
                         try {
                             pollingHandler.removeCallbacksAndMessages(null)
                             rootView.removeView(webView)
                             webView.destroy()
                         } catch (e: Exception) {}
 
-                        if (html == null) {
-                            continuation.resume(null)
-                            return
-                        }
-
-                        var cleanHtml = html.removeSurrounding("\"")
-                            .replace("\\u003C", "<")
-                            .replace("\\u003E", ">")
-                            .replace("\\\"", "\"")
-                            .replace("\\\\", "\\")
-
-                        continuation.resume(Jsoup.parse(cleanHtml))
+                        continuation.resume(SolverResult(finalUrl, finalCookies))
                     }
                 }
 
-                pollingHandler.postDelayed({ finishSuccess(null) }, 60000)
+                pollingHandler.postDelayed({
+                    finishSuccess(webView.url ?: initialUrl, "Timeout - 60s")
+                }, 60000)
 
                 fun simulateRealTouch(view: WebView, cssX: Float, cssY: Float) {
                     val density = activity.resources.displayMetrics.density
@@ -156,67 +156,38 @@ object CloudflareSolver {
                     pollingHandler.post(runnable)
                 }
 
-                var lastUrl: String? = null
-                var stableSince = 0L
-                var fetched = false
-
-                fun waitUntilReady() {
+                fun checkBypassSuccess() {
                     if (isSolved) return
-                    val js = """
-                        (function(){
-                            try{
-                                var hasBox = document.querySelector("$targetCssPath") != null;
-                                var html = document.documentElement.innerHTML || "";
-                                var stillCloudflare = html.toLowerCase().includes("cloudflare") || html.toLowerCase().includes("checking your browser");
-                                return location.href + "|" + document.readyState + "|" + hasBox + "|" + stillCloudflare;
-                            }catch(e){ return location.href + "|loading|false|true"; }
-                        })();
-                    """.trimIndent()
 
-                    webView.evaluateJavascript(js) { res ->
-                        if (res == null) {
-                            pollingHandler.postDelayed({ waitUntilReady() }, 200)
-                            return@evaluateJavascript
-                        }
+                    val currentLiveUrl = webView.url ?: initialUrl
+                    val currentCookies = cookieManager.getCookie(currentLiveUrl)
 
-                        val parts = res.replace("\"", "").split("|")
-                        if (parts.size < 4) {
-                            pollingHandler.postDelayed({ waitUntilReady() }, 200)
-                            return@evaluateJavascript
-                        }
-
-                        val (currentUrl, ready, hasBox, stillCloudflare) = parts
-                        val now = SystemClock.uptimeMillis()
-                        if (currentUrl != lastUrl) {
-                            lastUrl = currentUrl
-                            stableSince = now
-                        }
-                        val stableTime = now - stableSince
-
-                        if (hasBox == "false" && stillCloudflare == "false" && ready == "complete" && stableTime > 1500 && !fetched) {
-                            fetched = true
-                            pollingHandler.postDelayed({
-                                webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
-                                    finishSuccess(html)
-                                }
-                            }, 500)
-                            return@evaluateJavascript
-                        }
-                        pollingHandler.postDelayed({ waitUntilReady() }, 200)
+                    if (currentCookies != null && currentCookies.contains("cf_clearance")) {
+                        finishSuccess(currentLiveUrl, "cf_clearance captured")
+                        return
                     }
+
+                    pollingHandler.postDelayed({ checkBypassSuccess() }, 500)
                 }
 
                 webView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        if (url != null && url != initialUrl) {
+                            Log.d(TAG, "redirect to: $url")
+                        }
+                    }
+
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         isProcessingClick = false
                         startPolling()
-                        waitUntilReady()
+                        checkBypassSuccess()
                     }
                 }
 
                 rootView.addView(webView)
-                webView.loadUrl(url)
+                webView.loadUrl(initialUrl)
             }
         }
     }

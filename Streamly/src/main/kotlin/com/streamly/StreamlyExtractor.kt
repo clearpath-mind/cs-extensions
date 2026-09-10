@@ -385,6 +385,12 @@ private val cfSolveLock = Mutex()
 internal const val CF_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
+/** HTTP codes that mean Cloudflare / rate-limit wall (re-3arabi httpGet pattern). */
+private val CF_BLOCK_CODES = listOf(403, 503, 429)
+
+/** EgyDead rotates mirrors; updated from the solver's final URL (re-3arabi mainUrl pattern). */
+private var egydeadLiveBase: String? = null
+
 private fun cfCookies(url: String): String =
     runCatching { CookieManager.getInstance().getCookie(url).orEmpty() }.getOrDefault("")
 
@@ -393,15 +399,52 @@ private fun isCfChallenge(text: String): Boolean =
         text.contains("checking your browser", ignoreCase = true) ||
         text.contains("verify you are human", ignoreCase = true)
 
+/** Adopt the solver's final URL so mirror rotations stick for later calls. */
+private fun adoptSolverMirror(requestUrl: String, result: SolverResult) {
+    val newHost = runCatching { java.net.URI(result.finalUrl).host }.getOrNull()
+    val oldHost = runCatching { java.net.URI(requestUrl).host }.getOrNull()
+    if (newHost.isNullOrBlank() || newHost.equals(oldHost, ignoreCase = true)) return
+    if (oldHost?.contains("egydead", ignoreCase = true) != true &&
+        !newHost.contains("egydead", ignoreCase = true)
+    ) return
+    val scheme = runCatching { java.net.URI(result.finalUrl).scheme }.getOrDefault("https")
+    egydeadLiveBase = "$scheme://$newHost"
+    originCache[EGYDEAD_ENTRY_URL] = egydeadLiveBase!!
+    Log.d("StreamlyMirror", "cfSolve mirror $oldHost -> $newHost clearance=${!result.cookies.isNullOrBlank()}")
+}
+
+/** Swap a stale EgyDead base for the live mirror inside an already-built URL. */
+private fun swapEgydeadMirror(url: String): String {
+    val live = egydeadLiveBase ?: return url
+    val base = getBaseUrl(url)
+    if (!base.contains("egydead", ignoreCase = true)) return url
+    if (base.equals(live, ignoreCase = true)) return url
+    return url.replace(base, live)
+}
+
 /** Solve a CloudFlare challenge via the WebView solver, sharing one lock so
- *  only a single solve runs at a time. Returns the cleared document or null. */
-private suspend fun cfSolve(url: String): Document? {
+ *  only a single solve runs at a time. Cookies land in the shared
+ *  CookieManager; callers retry with them (re-3arabi httpGet pattern). */
+private suspend fun cfSolve(url: String): SolverResult? {
     val activity = StreamlyRuntime.context as? Activity
     if (activity == null) {
         Log.w(TAG, "[cf     ] no Activity context available, skipping WebView solver for $url")
         return null
     }
-    return cfSolveLock.withLock { CloudflareSolver.solve(activity, url, CF_UA) }
+    val result = cfSolveLock.withLock { CloudflareSolver.solve(activity, url, CF_UA) }
+    if (result != null) adoptSolverMirror(url, result)
+    return result
+}
+
+private fun cfHeaders(
+    url: String,
+    referer: String?,
+    extra: Map<String, String>,
+): MutableMap<String, String> = extra.toMutableMap().apply {
+    putIfAbsent("User-Agent", CF_UA)
+    val c = cfCookies(url)
+    if (c.isNotBlank()) putIfAbsent("Cookie", c)
+    if (referer != null) put("Referer", referer)
 }
 
 private suspend fun cfGetDoc(
@@ -410,21 +453,18 @@ private suspend fun cfGetDoc(
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
 ): Document {
-    val all = headers.toMutableMap().apply {
-        putIfAbsent("User-Agent", CF_UA)
-        val c = cfCookies(url)
-        if (c.isNotBlank()) putIfAbsent("Cookie", c)
-        if (referer != null) put("Referer", referer)
+    val first = runCatching {
+        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
+    }.getOrNull()
+    if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.document.toString())) {
+        return first.document
     }
-    val doc = try {
-        app.get(url, referer = referer, headers = all, timeout = timeout, allowRedirects = true).document
-    } catch (e: Exception) {
-        Log.w(TAG, "[cfGet  ] $url failed: ${e.message}")
-        null
-    }
-    val html = doc?.toString().orEmpty()
-    if (doc != null && !isCfChallenge(html)) return doc
-    return cfSolve(url) ?: doc ?: Jsoup.parse("", url)
+    Log.d(TAG, "[cfGet  ] wall ($url code=${first?.code}), solving…")
+    cfSolve(url) ?: return first?.document ?: Jsoup.parse("", url)
+    val retryUrl = swapEgydeadMirror(url)
+    return runCatching {
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true).document
+    }.getOrNull() ?: first?.document ?: Jsoup.parse("", retryUrl)
 }
 
 private suspend fun cfGetText(
@@ -433,22 +473,18 @@ private suspend fun cfGetText(
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
 ): String {
-    val all = headers.toMutableMap().apply {
-        putIfAbsent("User-Agent", CF_UA)
-        val c = cfCookies(url)
-        if (c.isNotBlank()) putIfAbsent("Cookie", c)
-        if (referer != null) put("Referer", referer)
+    val first = runCatching {
+        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
+    }.getOrNull()
+    if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.text)) {
+        return first.text
     }
-    val text = try {
-        app.get(url, referer = referer, headers = all, timeout = timeout, allowRedirects = true).text
-    } catch (e: Exception) {
-        Log.w(TAG, "[cfGet  ] $url failed: ${e.message}")
-        null
-    }
-    if (text != null && !isCfChallenge(text)) return text
-    val solved = cfSolve(url)
-    if (solved != null) return solved.toString()
-    return text ?: ""
+    Log.d(TAG, "[cfGet  ] wall ($url code=${first?.code}), solving…")
+    cfSolve(url) ?: return first?.text ?: ""
+    val retryUrl = swapEgydeadMirror(url)
+    return runCatching {
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true).text
+    }.getOrNull() ?: first?.text ?: ""
 }
 
 private suspend fun cfPostText(
@@ -458,30 +494,23 @@ private suspend fun cfPostText(
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
 ): String {
-    val all = headers.toMutableMap().apply {
-        putIfAbsent("User-Agent", CF_UA)
-        val c = cfCookies(url)
-        if (c.isNotBlank()) putIfAbsent("Cookie", c)
-        if (referer != null) put("Referer", referer)
+    val baseHeaders = headers.toMutableMap().apply {
+        putIfAbsent("X-Requested-With", "XMLHttpRequest")
     }
-    val text = try {
-        app.post(url, data = data, referer = referer, headers = all, timeout = timeout).text
-    } catch (e: Exception) {
-        Log.w(TAG, "[cfPost ] $url failed: ${e.message}")
-        null
-    }
-    if (text != null && !isCfChallenge(text)) return text
+    val first = runCatching {
+        app.post(url, data = data, referer = referer, headers = cfHeaders(url, referer, baseHeaders), timeout = timeout).text
+    }.getOrNull()
+    if (first != null && !isCfChallenge(first)) return first
     // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
+    Log.d(TAG, "[cfPost ] wall ($url), solving…")
     cfSolve(url)
-    val retry = all.toMutableMap().apply {
-        val c = cfCookies(url)
-        if (c.isNotBlank()) put("Cookie", c)
-    }
-    return try {
-        app.post(url, data = data, referer = referer, headers = retry, timeout = timeout).text
-    } catch (e: Exception) {
-        text ?: ""
-    }
+    val retryUrl = swapEgydeadMirror(url)
+    // Explicit String? type: app response accessors carry a jspecify
+    // @Nullable annotation that isn't on the compile classpath.
+    val retry: String? = runCatching {
+        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = timeout).text
+    }.getOrNull()
+    return retry ?: first ?: ""
 }
 
 private suspend fun cfPostDoc(
@@ -1227,8 +1256,11 @@ private const val EGYDEAD_ENTRY_URL = "https://egydead.beer"
 private const val EGYDEAD_TAG = "EgyDead"
 private val EGYDEAD_EPISODE_URL_REGEX = Regex("""-s(\d{1,2})e(\d{1,3})""", RegexOption.IGNORE_CASE)
 
-/** EgyDead redirects to a rotating mirror; resolve the live origin and reuse it. */
-private suspend fun egydeadBase(): String = resolveOrigin(EGYDEAD_ENTRY_URL)
+/** EgyDead redirects to a rotating mirror; reuse the solver-discovered origin when known. */
+private suspend fun egydeadBase(): String {
+    egydeadLiveBase?.let { return it }
+    return resolveOrigin(EGYDEAD_ENTRY_URL)
+}
 
 /** Arabic ordinal season words, alef-normalized matching. */
 private val ARABIC_ORDINALS = linkedMapOf(
