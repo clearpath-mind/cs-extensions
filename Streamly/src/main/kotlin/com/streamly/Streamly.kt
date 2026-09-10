@@ -106,6 +106,29 @@ data class Seasons(
     @JsonProperty("air_date") val airDate: String? = null,
 )
 
+data class ReleaseDateEntry(
+    @JsonProperty("certification") val certification: String? = null,
+    @JsonProperty("iso_3166_1") val country: String? = null,
+)
+
+data class ReleaseDatesResult(
+    @JsonProperty("iso_3166_1") val country: String? = null,
+    @JsonProperty("release_dates") val entries: List<ReleaseDateEntry>? = null,
+)
+
+data class ReleaseDates(
+    @JsonProperty("results") val results: List<ReleaseDatesResult>? = null,
+)
+
+data class ContentRatingEntry(
+    @JsonProperty("iso_3166_1") val country: String? = null,
+    @JsonProperty("rating") val rating: String? = null,
+)
+
+data class ContentRatings(
+    @JsonProperty("results") val results: List<ContentRatingEntry>? = null,
+)
+
 data class MediaDetail(
     @JsonProperty("id") val id: Int? = null,
     @JsonProperty("title") val title: String? = null,
@@ -127,6 +150,8 @@ data class MediaDetail(
     @JsonProperty("videos") val videos: VideoResults? = null,
     @JsonProperty("credits") val credits: Credits? = null,
     @JsonProperty("recommendations") val recommendations: Results? = null,
+    @JsonProperty("release_dates") val releaseDates: ReleaseDates? = null,
+    @JsonProperty("content_ratings") val contentRatings: ContentRatings? = null,
 )
 
 data class Episodes(
@@ -300,7 +325,11 @@ open class Streamly : MainAPI() {
         StreamlyRuntime.context = CommonActivity.activity
         val data = parseJson<Data>(url)
         val type = getType(data.type)
-        val append = "external_ids,videos,credits,recommendations"
+        val append = if (type == TvType.Movie) {
+            "external_ids,videos,credits,recommendations,release_dates"
+        } else {
+            "external_ids,videos,credits,recommendations,content_ratings"
+        }
 
         val resUrl = if (type == TvType.Movie) {
             "$TMDB_API/movie/${data.id}?api_key=$apiKey&language=$LANG&append_to_response=$append"
@@ -342,6 +371,20 @@ open class Streamly : MainAPI() {
 
         // English title is what TopCinema slugs use for matching
         val searchTitle = enRes?.title ?: enRes?.name ?: title
+        // Raw TMDB certification (PG-13, R, TV-MA…): US first, else first rated entry.
+        val contentRating = res.releaseDates?.results
+            ?.flatMap { r -> (r.entries.orEmpty()).map { (r.country ?: "") to (it.certification.orEmpty()) } }
+            .orEmpty()
+            .firstOrNull { it.first == "US" && it.second.isNotBlank() }?.second
+            ?: res.releaseDates?.results
+                ?.flatMap { it.entries.orEmpty() }
+                ?.mapNotNull { it.certification?.takeIf { c -> c.isNotBlank() } }
+                ?.firstOrNull()
+            ?: res.contentRatings?.results
+                ?.firstOrNull { it.country == "US" && !it.rating.isNullOrBlank() }?.rating
+            ?: res.contentRatings?.results
+                ?.mapNotNull { it.rating?.takeIf { r -> r.isNotBlank() } }
+                ?.firstOrNull()
 
         if (type == TvType.TvSeries) {
             var logoUrl: String? = null
@@ -401,6 +444,7 @@ open class Streamly : MainAPI() {
                 this.tags = genres
                 this.score = Score.from10(res.voteAverage)
                 this.showStatus = getStatus(res.status)
+                if (!contentRating.isNullOrBlank()) this.contentRating = contentRating
                 this.recommendations = recommendations
                 this.actors = actors
                 addTrailer(trailer)
@@ -427,6 +471,7 @@ open class Streamly : MainAPI() {
                 this.duration = res.runtime
                 this.tags = genres
                 this.score = Score.from10(res.voteAverage)
+                this.contentRating = contentRating
                 this.recommendations = recommendations
                 this.actors = actors
                 addTrailer(trailer)
