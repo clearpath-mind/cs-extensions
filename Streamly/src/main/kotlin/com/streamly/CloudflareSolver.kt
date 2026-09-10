@@ -62,6 +62,155 @@ private fun newHiddenWebView(activity: Activity, userAgent: String): WebView? = 
 
 object CloudflareSolver {
     private const val TAG = "CF_Solver_Hidden"
+    private const val CLICK_TARGET_CSS = "html > body > div:nth-of-type(1) > div > div:nth-of-type(2) > div"
+
+    private fun simulateTouch(activity: Activity, view: WebView, cssX: Float, cssY: Float) {
+        val density = activity.resources.displayMetrics.density
+        val realX = cssX * density
+        val realY = cssY * density
+        val downTime = SystemClock.uptimeMillis()
+        val eventTime = SystemClock.uptimeMillis() + 50
+        val downEvent = android.view.MotionEvent.obtain(downTime, downTime, android.view.MotionEvent.ACTION_DOWN, realX, realY, 0)
+        view.dispatchTouchEvent(downEvent)
+        view.postDelayed({
+            val upEvent = android.view.MotionEvent.obtain(downTime, eventTime, android.view.MotionEvent.ACTION_UP, realX, realY, 0)
+            view.dispatchTouchEvent(upEvent)
+            downEvent.recycle()
+            upEvent.recycle()
+        }, 50)
+    }
+
+    /** Auto-clicks Cloudflare checkbox/press-and-hold widgets until [isStopped]. */
+    private fun startCheckboxClicks(
+        activity: Activity,
+        webView: WebView,
+        pollingHandler: Handler,
+        isStopped: () -> Boolean,
+    ) {
+        var processing = false
+        val runnable = object : Runnable {
+            override fun run() {
+                if (isStopped() || processing) {
+                    pollingHandler.postDelayed(this, 2000)
+                    return
+                }
+                val jsGetCoords = """
+                    (function(){
+                        try{
+                            var box = document.querySelector("$CLICK_TARGET_CSS");
+                            if(!box) return "NO_BOX";
+                            var r = box.getBoundingClientRect();
+                            if(r.width === 0 && r.height === 0) return "NO_BOX";
+                            var size = Math.min(36, Math.max(18, Math.round(r.height * 0.55)));
+                            var margin = Math.round(Math.max(8, r.width * 0.03));
+                            var centerY = r.top + (r.height / 2);
+                            var rightSideX = r.right - (size / 2) - margin;
+                            var leftSideX = r.left + (size / 2) + margin;
+                            return rightSideX + "," + centerY + "|" + leftSideX + "," + centerY;
+                        }catch(e){ return "ERROR"; }
+                    })();
+                """.trimIndent()
+                try {
+                    webView.evaluateJavascript(jsGetCoords) { res ->
+                        try {
+                            val clean = res?.removeSurrounding("\"")
+                            if (clean != null && clean.contains("|")) {
+                                processing = true
+                                val sides = clean.split("|")
+                                val (rx, ry) = sides[0].split(",").map { it.toFloatOrNull() }
+                                val (lx, ly) = sides[1].split(",").map { it.toFloatOrNull() }
+                                if (rx != null && ry != null && lx != null && ly != null) {
+                                    simulateTouch(activity, webView, rx, ry)
+                                    pollingHandler.postDelayed({
+                                        simulateTouch(activity, webView, lx, ly)
+                                        pollingHandler.postDelayed({ processing = false }, 3000)
+                                    }, 250)
+                                } else {
+                                    processing = false
+                                }
+                            }
+                        } catch (_: Exception) {
+                            processing = false
+                        }
+                    }
+                } catch (_: Exception) {
+                    processing = false
+                }
+                pollingHandler.postDelayed(this, 2000)
+            }
+        }
+        pollingHandler.post(runnable)
+    }
+
+    /**
+     * Shared content waiter: polls page readiness until real content renders,
+     * then invokes [onDone] with outerHTML (null on timeout/failure). Logs the
+     * readiness tuple on change + every 5s so logcat shows what the page is
+     * stuck on (loading / challenged / thin).
+     */
+    private fun waitForPageContent(
+        webView: WebView,
+        pollingHandler: Handler,
+        timeoutMs: Long,
+        minText: Int,
+        stableMs: Long,
+        logTag: String,
+        onDone: (String?) -> Unit,
+    ) {
+        var finished = false
+        var lastState = ""
+        var lastLogAt = 0L
+        var lastUrl: String? = null
+        var stableSince = SystemClock.uptimeMillis()
+        fun finish(html: String?) {
+            if (finished) return
+            finished = true
+            Log.d(TAG, "$logTag done html=${html?.length ?: -1}")
+            onDone(html)
+        }
+        pollingHandler.postDelayed({
+            Log.d(TAG, "$logTag content wait timeout state=$lastState")
+            finish(null)
+        }, timeoutMs)
+        fun poll() {
+            if (finished) return
+            try {
+                webView.evaluateJavascript(READINESS_JS) { res ->
+                    if (finished) return@evaluateJavascript
+                    val parts = res?.removeSurrounding("\"")?.split("|") ?: emptyList()
+                    if (parts.size < 4) {
+                        pollingHandler.postDelayed({ poll() }, 500)
+                        return@evaluateJavascript
+                    }
+                    val ready = parts[0]
+                    val textLen = parts[1].toIntOrNull() ?: 0
+                    val challenged = parts[2].toBoolean()
+                    val cur = parts.subList(3, parts.size).joinToString("|")
+                    val now = SystemClock.uptimeMillis()
+                    if (cur != lastUrl) {
+                        lastUrl = cur
+                        stableSince = now
+                    }
+                    val state = "$ready|$textLen|$challenged"
+                    if (state != lastState || now - lastLogAt > 5000) {
+                        lastState = state
+                        lastLogAt = now
+                        Log.d(TAG, "$logTag readiness $state url=$cur")
+                    }
+                    if (ready == "complete" && !challenged && textLen >= minText && now - stableSince > stableMs) {
+                        webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
+                            finish(html)
+                        }
+                    } else {
+                        pollingHandler.postDelayed({ poll() }, 500)
+                    }
+                }
+            } catch (_: Exception) {
+                finish(null)
+            }
+        }
+        poll()
+    }
 
     suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String): SolverResult? {
         return suspendCoroutine { continuation ->
@@ -150,49 +299,15 @@ object CloudflareSolver {
                     // Phase 2: Cloudflare sets cf_clearance BEFORE navigating to the
                     // real page — capturing outerHTML immediately yields an empty
                     // shell. Wait for rendered content instead.
-                    var lastUrl: String? = null
-                    var stableSince = SystemClock.uptimeMillis()
-                    pollingHandler.postDelayed({ deliver(null) }, 30000)
-                    fun poll() {
-                        if (delivered) return
-                        val js = """
-                            (function(){try{
-                                var html = document.documentElement.innerHTML || "";
-                                var t = document.body ? document.body.innerText : "";
-                                var ch = /just a moment|checking your browser|verify you are human|performing security verification/i.test(html);
-                                return document.readyState + "|" + t.length + "|" + ch + "|" + location.href;
-                            }catch(e){ return "loading|0|true|"; }})();
-                        """.trimIndent()
-                        try {
-                            webView.evaluateJavascript(js) { res ->
-                                if (delivered) return@evaluateJavascript
-                                val parts = res?.removeSurrounding("\"")?.split("|") ?: emptyList()
-                                if (parts.size < 4) {
-                                    pollingHandler.postDelayed({ poll() }, 500)
-                                    return@evaluateJavascript
-                                }
-                                val ready = parts[0]
-                                val textLen = parts[1].toIntOrNull() ?: 0
-                                val challenged = parts[2].toBoolean()
-                                val currentUrl = parts[3]
-                                val now = SystemClock.uptimeMillis()
-                                if (currentUrl != lastUrl) {
-                                    lastUrl = currentUrl
-                                    stableSince = now
-                                }
-                                if (ready == "complete" && !challenged && textLen > 500 && now - stableSince > 1500) {
-                                    webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
-                                        deliver(html)
-                                    }
-                                } else {
-                                    pollingHandler.postDelayed({ poll() }, 500)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            deliver(null)
-                        }
-                    }
-                    poll()
+                    waitForPageContent(
+                        webView = webView,
+                        pollingHandler = pollingHandler,
+                        timeoutMs = 30000,
+                        minText = 500,
+                        stableMs = 1500,
+                        logTag = "solve",
+                        onDone = { html -> deliver(html) },
+                    )
                 }
 
                 pollingHandler.postDelayed({
@@ -358,8 +473,6 @@ object CloudflareSolver {
                 val rootView = activity.findViewById<ViewGroup>(R.id.content) ?: run { finish(null); return@post }
                 val webView = newHiddenWebView(activity, userAgent) ?: run { finish(null); return@post }
                 val pollingHandler = Handler(Looper.getMainLooper())
-                var lastUrl: String? = null
-                var stableSince = SystemClock.uptimeMillis()
                 fun cleanup(html: String?) {
                     runCatching {
                         pollingHandler.removeCallbacksAndMessages(null)
@@ -368,40 +481,24 @@ object CloudflareSolver {
                     }
                     finish(cleanJs(html))
                 }
-                pollingHandler.postDelayed({ cleanup(null) }, timeoutMs)
-                fun poll() {
-                    try {
-                        webView.evaluateJavascript(READINESS_JS) { res ->
-                            val parts = res?.removeSurrounding("\"")?.split("|") ?: emptyList()
-                            if (parts.size < 4) {
-                                pollingHandler.postDelayed({ poll() }, 500)
-                                return@evaluateJavascript
-                            }
-                            val ready = parts[0]
-                            val textLen = parts[1].toIntOrNull() ?: 0
-                            val challenged = parts[2].toBoolean()
-                            val cur = parts[3]
-                            val now = SystemClock.uptimeMillis()
-                            if (cur != lastUrl) {
-                                lastUrl = cur
-                                stableSince = now
-                            }
-                            if (ready == "complete" && !challenged && textLen > 500 && now - stableSince > 1500) {
-                                webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
-                                    cleanup(html)
-                                }
-                            } else {
-                                pollingHandler.postDelayed({ poll() }, 500)
-                            }
-                        }
-                    } catch (_: Exception) {
-                        cleanup(null)
-                    }
+                var waiting = false
+                fun startWaiting() {
+                    if (waiting) return
+                    waiting = true
+                    waitForPageContent(
+                        webView = webView,
+                        pollingHandler = pollingHandler,
+                        timeoutMs = timeoutMs,
+                        minText = 500,
+                        stableMs = 1500,
+                        logTag = "fetch",
+                        onDone = { html -> cleanup(html) },
+                    )
                 }
                 webView.webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        poll()
+                        startWaiting()
                     }
 
                     override fun onReceivedError(
@@ -417,7 +514,8 @@ object CloudflareSolver {
                 }
                 rootView.addView(webView)
                 webView.loadUrl(url)
-                pollingHandler.postDelayed({ poll() }, 3000)
+                startCheckboxClicks(activity, webView, pollingHandler) { done }
+                pollingHandler.postDelayed({ startWaiting() }, 3000)
             }
         }
     }
@@ -447,8 +545,6 @@ object CloudflareSolver {
                 val rootView = activity.findViewById<ViewGroup>(R.id.content) ?: run { finish(null); return@post }
                 val webView = newHiddenWebView(activity, userAgent) ?: run { finish(null); return@post }
                 val pollingHandler = Handler(Looper.getMainLooper())
-                var lastUrl: String? = null
-                var stableSince = SystemClock.uptimeMillis()
                 fun cleanup(text: String?) {
                     runCatching {
                         pollingHandler.removeCallbacksAndMessages(null)
@@ -470,38 +566,25 @@ object CloudflareSolver {
                         cleanup(null)
                     }
                 }
-                fun poll() {
-                    try {
-                        webView.evaluateJavascript(READINESS_JS) { res ->
-                            val parts = res?.removeSurrounding("\"")?.split("|") ?: emptyList()
-                            if (parts.size < 4) {
-                                pollingHandler.postDelayed({ poll() }, 500)
-                                return@evaluateJavascript
-                            }
-                            val ready = parts[0]
-                            val textLen = parts[1].toIntOrNull() ?: 0
-                            val challenged = parts[2].toBoolean()
-                            val cur = parts[3]
-                            val now = SystemClock.uptimeMillis()
-                            if (cur != lastUrl) {
-                                lastUrl = cur
-                                stableSince = now
-                            }
-                            if (ready == "complete" && !challenged && textLen > 500 && now - stableSince > 1500) {
-                                firePost()
-                            } else {
-                                pollingHandler.postDelayed({ poll() }, 500)
-                            }
-                        }
-                    } catch (_: Exception) {
-                        cleanup(null)
-                    }
+                var waiting = false
+                fun startWaiting() {
+                    if (waiting) return
+                    waiting = true
+                    waitForPageContent(
+                        webView = webView,
+                        pollingHandler = pollingHandler,
+                        timeoutMs = timeoutMs,
+                        minText = 500,
+                        stableMs = 1500,
+                        logTag = "postctx",
+                        onDone = { html -> if (html == null) cleanup(null) else firePost() },
+                    )
                 }
                 val contextUrl = referer ?: url
                 webView.webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
-                        poll()
+                        startWaiting()
                     }
 
                     override fun onReceivedError(
@@ -517,7 +600,8 @@ object CloudflareSolver {
                 }
                 rootView.addView(webView)
                 webView.loadUrl(contextUrl)
-                pollingHandler.postDelayed({ poll() }, 3000)
+                startCheckboxClicks(activity, webView, pollingHandler) { done }
+                pollingHandler.postDelayed({ startWaiting() }, 3000)
             }
         }
     }
