@@ -739,6 +739,7 @@ class YacineTvProvider : MainAPI() {
      * Keys are normalized channel names. */
     private val mbcFallbacks = mapOf(
         "mbc 1" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-1/15cf99af5de54063fdabfefe66adc075/index.m3u8",
+        "mbc 3" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-3-usa/5d58265a862a476dc7f97694addb5ded/index.m3u8",
         "mbc 4" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-4/24f134f1cd63db9346439e96b86ca6ed/index.m3u8",
         "mbc 5" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-5/ee6b000cee0629411b666ab26cb13e9b/index.m3u8",
         "mbc bollywood" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-bollywood/546eb40d7dcf9a209255dd2496903764/index.m3u8",
@@ -785,17 +786,56 @@ class YacineTvProvider : MainAPI() {
             val stream = ev.stream?.takeIf { it.isNotBlank() }
                 ?: ev.streamNoTimeshift?.takeIf { it.isNotBlank() }
                 ?: return false
+            if (playEasyBroadcast(stream, "$channelName • SNRT", pageUrl, callback)) {
+                return true
+            }
+            return false
+        } catch (_: Exception) { false }
+    }
+
+    /** Medi 1 embeds are JWPlayer pages with no static file URL, but the
+     * underlying streams live on the same EasyBroadcast CDN (bases below,
+     * via iptv-org). Resolved the same way as SNRT. Keys are normalized
+     * channel names. */
+    private val medi1Streams = mapOf(
+        "medi 1 tv maghreb" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-maghreb_jnbspmg/playlist.m3u8",
+        "medi 1 maghreb" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-maghreb_jnbspmg/playlist.m3u8",
+        "medi 1 tv arabic" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-arabic_g90v4ec/playlist.m3u8",
+        "medi 1 arabic" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-arabic_g90v4ec/playlist.m3u8",
+        "medi 1 tv afrique" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-afrique_tm7tu45/playlist.m3u8",
+        "medi 1 afrique" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-afrique_tm7tu45/playlist.m3u8",
+    )
+
+    private suspend fun emitMedi1(
+        channelName: String,
+        pageUrl: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val base = medi1Streams[normalizeName(channelName)] ?: return false
+        return playEasyBroadcast(base, "$channelName • Medi1", pageUrl, callback)
+    }
+
+    /** Signs an EasyBroadcast master URL and emits the signed best variant
+     * (players drop the ?token query on relative variant URLs, so the
+     * master itself is unplayable; .ts segments need no token). */
+    private suspend fun playEasyBroadcast(
+        baseStreamUrl: String,
+        label: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
             // The CDN gates playlists (token_authentication): sign the URL
             // first (token endpoint needs no auth). Unsigned -> 403.
-            val signedMaster = signEasyBroadcast(stream, pageUrl) ?: return false
+            val signedMaster = signEasyBroadcast(baseStreamUrl, referer) ?: return false
             // Players resolve relative variant URLs against the master and
             // drop the ?token query -> 403 on variants. Emit the signed best
             // variant instead; .ts segments play ungated.
-            val playable = bestSignedVariant(signedMaster, pageUrl) ?: signedMaster
+            val playable = bestSignedVariant(signedMaster, referer) ?: signedMaster
             callback.invoke(
-                newExtractorLink(this.name, "$channelName • SNRT", playable) {
-                    this.headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl)
-                    this.referer = pageUrl
+                newExtractorLink(this.name, label, playable) {
+                    this.headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to referer)
+                    this.referer = referer
                     this.quality = Qualities.Unknown.value
                     this.type = ExtractorLinkType.M3U8
                 }
@@ -891,6 +931,15 @@ class YacineTvProvider : MainAPI() {
                 }
                 // Fall through to the generic extractor attempt below instead
                 // of giving up: page markup may change upstream.
+            }
+            // Medi 1 embeds are dynamic JWPlayer pages: resolve via the
+            // EasyBroadcast CDN bases instead of the extractor registry.
+            if ("medi1tv.ma" in raw.lowercase()) {
+                if (emitMedi1(channelName, raw, callback)) {
+                    found = true
+                    return true
+                }
+                // Fall through to the generic extractor attempt below.
             }
             val headers = streamHeaders(s)
             val referer = headers["Referer"]?.takeIf { it.isNotBlank() }

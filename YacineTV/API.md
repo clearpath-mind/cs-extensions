@@ -95,8 +95,9 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
   `{"stream": "...playlist_dvr.m3u8", "stream_no_timeshift": "...playlist.m3u8"}`.
 - **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
   falls back to verified iptv-org EdgeNext CDN streams
-  (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`). No public stream
-  exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
+  (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`), including the USA
+  feed for MBC 3. No public stream exists for MBC 2 / MBC Action / MBC Max
+  (their embeds are obfuscated pages with nothing extractable).
 
 ## Homepage pagination (no duplicates)
 
@@ -153,8 +154,9 @@ detail hero shows the same homepage banner thumbnail.
   `{"stream": "...playlist_dvr.m3u8", "stream_no_timeshift": "...playlist.m3u8"}`.
 - **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
   falls back to verified iptv-org EdgeNext CDN streams
-  (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`). No public stream
-  exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
+  (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`), including the USA
+  feed for MBC 3. No public stream exists for MBC 2 / MBC Action / MBC Max
+  (their embeds are obfuscated pages with nothing extractable).
 - **Morocco**: 2M (`channel/546`) is a direct m3u8 and plays; the 7 SNRT
   channels (`snrtlive.ma` pages, `url_type` 5) resolve via the EasyBroadcast
   slug (`extractEasyBroadcastSlug` tries several markup variants) and the
@@ -163,9 +165,11 @@ detail hero shows the same homepage banner thumbnail.
   drop the `?token` query on relative variant URLs, so the provider emits
   the signed best variant (`bestSignedVariant()`, highest `BANDWIDTH`);
   `.ts` segments play ungated. Generic extractor attempt remains as last
-  resort. Medi 1 embeds serve a JWPlayer page with no static file URL and
-  Télé Maroc is a multi-iframe portal, so those go through the extractor
-  registry and may fail upstream.
+  resort. Medi 1 embeds serve a JWPlayer page with no static file URL, so
+  the provider maps the 3 Medi 1 channels straight to their EasyBroadcast
+  CDN bases (`medi1Streams`, verified) through the same sign → best-variant
+  pipeline. Télé Maroc is a multi-iframe portal, so it goes through the
+  extractor registry and may fail upstream.
 - **Morocco thumbnails**: SNRT channels use official snrtlive.ma vignette
   arts (`moroccoThumbs`, verified 200); other Morocco entries keep API
   logos.
