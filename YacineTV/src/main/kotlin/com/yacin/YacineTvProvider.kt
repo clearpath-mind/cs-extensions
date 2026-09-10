@@ -68,6 +68,49 @@ class YacineTvProvider : MainAPI() {
     /** On-device match banner cache (event id -> cached PNG path). */
     private val bannerCache = ConcurrentHashMap<Long, String>()
 
+    /** Competition badges (normalized Arabic/English name -> logo URL).
+     * The API only sends `champions` text, so this map covers the
+     * competitions seen in /events plus the usual leagues. Unknown
+     * competitions render text-only. */
+    private val competitionLogos = mapOf(
+        "دوري أبطال أوروبا" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f5/UEFA_Champions_League.svg/640px-UEFA_Champions_League.svg.png",
+        "uefa champions league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f5/UEFA_Champions_League.svg/640px-UEFA_Champions_League.svg.png",
+        "champions league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f5/UEFA_Champions_League.svg/640px-UEFA_Champions_League.svg.png",
+        "الدوري الأوروبي" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1b/UEFA_Europa_League_logo_%282024_version%29.svg/640px-UEFA_Europa_League_logo_%282024_version%29.svg.png",
+        "europa league" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1b/UEFA_Europa_League_logo_%282024_version%29.svg/640px-UEFA_Europa_League_logo_%282024_version%29.svg.png",
+        "دوري المؤتمر الأوروبي" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/4/4b/UEFA_Conference_League_full_logo_%282024_version%29.svg/640px-UEFA_Conference_League_full_logo_%282024_version%29.svg.png",
+        "conference league" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/4/4b/UEFA_Conference_League_full_logo_%282024_version%29.svg/640px-UEFA_Conference_League_full_logo_%282024_version%29.svg.png",
+        "كوبا ليبرتادوريس" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/a1/Copa_Libertadores_logo.svg/640px-Copa_Libertadores_logo.svg.png",
+        "copa libertadores" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/a1/Copa_Libertadores_logo.svg/640px-Copa_Libertadores_logo.svg.png",
+        "كوبا سود أمريكانا" to "https://thumb.wikimedia.org/wikipedia/en/thumb/c/c2/CONMEBOL_Sudamericana_logo_%282017%29.svg/640px-CONMEBOL_Sudamericana_logo_%282017%29.svg.png",
+        "copa sudamericana" to "https://thumb.wikimedia.org/wikipedia/en/thumb/c/c2/CONMEBOL_Sudamericana_logo_%282017%29.svg/640px-CONMEBOL_Sudamericana_logo_%282017%29.svg.png",
+        "الدوري الإنجليزي" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f2/Premier_League_Logo.svg/640px-Premier_League_Logo.svg.png",
+        "premier league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/f/f2/Premier_League_Logo.svg/640px-Premier_League_Logo.svg.png",
+        "الدوري الإسباني" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/54/LaLiga_EA_Sports_2023_Vertical_Logo.svg/640px-LaLiga_EA_Sports_2023_Vertical_Logo.svg.png",
+        "la liga" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/54/LaLiga_EA_Sports_2023_Vertical_Logo.svg/640px-LaLiga_EA_Sports_2023_Vertical_Logo.svg.png",
+        "الدوري الإيطالي" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/ab/Serie_A_ENILIVE_logo.svg/640px-Serie_A_ENILIVE_logo.svg.png",
+        "serie a" to "https://thumb.wikimedia.org/wikipedia/en/thumb/a/ab/Serie_A_ENILIVE_logo.svg/640px-Serie_A_ENILIVE_logo.svg.png",
+        "الدوري الألماني" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/df/Bundesliga_logo_%282017%29.svg/640px-Bundesliga_logo_%282017%29.svg.png",
+        "bundesliga" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/df/Bundesliga_logo_%282017%29.svg/640px-Bundesliga_logo_%282017%29.svg.png",
+        "الدوري الفرنسي" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/Logo_Ligue_1_McDonald%27s_2024.svg/640px-Logo_Ligue_1_McDonald%27s_2024.svg.png",
+        "ligue 1" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/Logo_Ligue_1_McDonald%27s_2024.svg/640px-Logo_Ligue_1_McDonald%27s_2024.svg.png",
+        "الدوري السعودي" to "https://thumb.wikimedia.org/wikipedia/en/thumb/7/75/Roshn_Saudi_League_Logo.svg/640px-Roshn_Saudi_League_Logo.svg.png",
+        "saudi pro league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/7/75/Roshn_Saudi_League_Logo.svg/640px-Roshn_Saudi_League_Logo.svg.png",
+        "كأس العالم" to "https://thumb.wikimedia.org/wikipedia/en/thumb/1/17/2026_FIFA_World_Cup_emblem.svg/640px-2026_FIFA_World_Cup_emblem.svg.png",
+        "world cup" to "https://thumb.wikimedia.org/wikipedia/en/thumb/1/17/2026_FIFA_World_Cup_emblem.svg/640px-2026_FIFA_World_Cup_emblem.svg.png",
+        "كأس أمم أفريقيا" to "https://upload.wikimedia.org/wikipedia/en/c/cf/Africa_Cup_of_Nation_official_logo.png",
+        "africa cup of nations" to "https://upload.wikimedia.org/wikipedia/en/c/cf/Africa_Cup_of_Nation_official_logo.png",
+        "دوري أبطال آسيا" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/d7/AFC_Champions_League_Elite_logo.svg/640px-AFC_Champions_League_Elite_logo.svg.png",
+        "afc champions league" to "https://thumb.wikimedia.org/wikipedia/en/thumb/d/d7/AFC_Champions_League_Elite_logo.svg/640px-AFC_Champions_League_Elite_logo.svg.png",
+        "دوري أبطال أفريقيا" to "https://upload.wikimedia.org/wikipedia/en/d/d5/CAF_Champions_League.png",
+        "caf champions league" to "https://upload.wikimedia.org/wikipedia/en/d/d5/CAF_Champions_League.png",
+        "الدوري المصري" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/ORA_League.png/640px-ORA_League.png",
+        "egyptian premier league" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/7/7b/ORA_League.png/640px-ORA_League.png",
+        "الدوري المغربي" to "https://upload.wikimedia.org/wikipedia/en/c/ce/BotolaPro-logo.png",
+        "البطولة المغربية" to "https://upload.wikimedia.org/wikipedia/en/c/ce/BotolaPro-logo.png",
+        "botola" to "https://upload.wikimedia.org/wikipedia/en/c/ce/BotolaPro-logo.png",
+    )
+
     /** Categories merged into one beIN SPORTS row (one per quality upstream). */
     private val beinQualityIds = setOf(4, 5, 6, 7)
     private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
@@ -387,10 +430,11 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** 1280x720 composite match banner (dark gradient + both crests),
-     * rendered on-device from the API team logos and cached under
-     * cacheDir/yacine_banners. Returns the cached PNG path, or null when
-     * rendering is impossible (caller falls back to the API logo). */
+    /** 1280x720 composite match banner (competition badge + name, VS,
+     * both crests on a dark gradient), rendered on-device from the API
+     * team logos and cached under cacheDir/yacine_banners. Returns the
+     * cached PNG path, or null when rendering is impossible (caller falls
+     * back to the API logo). */
     private suspend fun matchBanner(e: YacineEvent): String? {
         val id = e.id ?: return null
         bannerCache[id]?.let { if (File(it).exists()) return it }
@@ -398,10 +442,11 @@ class YacineTvProvider : MainAPI() {
         val l2 = e.team2?.logo?.takeIf { it.isNotBlank() }
         if (l1.isNullOrBlank() && l2.isNullOrBlank()) return null
         val ctx = appContext ?: return null
+        // v2 layout (VS + competition): new filename so stale v1 files regenerate.
         return withContext(Dispatchers.IO) {
             runCatching {
                 val dir = File(ctx.cacheDir, "yacine_banners").apply { mkdirs() }
-                val out = File(dir, "match_$id.png")
+                val out = File(dir, "match_${id}_v2.png")
                 if (out.exists() && out.length() > 0) {
                     bannerCache[id] = out.absolutePath
                     return@runCatching out.absolutePath
@@ -409,11 +454,15 @@ class YacineTvProvider : MainAPI() {
                 val b1 = l1?.let { downloadBitmap(it) }
                 val b2 = l2?.let { downloadBitmap(it) }
                 if (b1 == null && b2 == null) return@runCatching null
-                val bmp = renderBanner(b1, b2)
+                val compName = e.champions?.trim()?.takeIf { it.isNotBlank() }
+                val compLogo = compName?.let { competitionLogos[normalizeName(it)] }
+                    ?.let { downloadBitmap(it) }
+                val bmp = renderBanner(b1, b2, compLogo, compName)
                 FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.PNG, 90, it) }
                 bmp.recycle()
                 if (b1 != null && b1 != bmp) b1.recycle()
                 if (b2 != null && b2 != bmp) b2.recycle()
+                compLogo?.recycle()
                 bannerCache[id] = out.absolutePath
                 out.absolutePath
             }.getOrNull()
@@ -431,7 +480,7 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull()
     }
 
-    private fun renderBanner(left: Bitmap?, right: Bitmap?): Bitmap {
+    private fun renderBanner(left: Bitmap?, right: Bitmap?, compLogo: Bitmap?, compName: String?): Bitmap {
         val w = 1280
         val h = 720
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -466,6 +515,40 @@ class YacineTvProvider : MainAPI() {
         }
         drawCrest(left, w * 0.22f)
         drawCrest(right, w * 0.78f)
+        // Competition badge top-center (unknown competitions skip the badge).
+        compLogo?.let { logo ->
+            val maxSide = 120
+            val scale = minOf(
+                maxSide / logo.width.toFloat(),
+                maxSide / logo.height.toFloat(),
+            )
+            val dw = (logo.width * scale).toInt().coerceAtLeast(1)
+            val dh = (logo.height * scale).toInt().coerceAtLeast(1)
+            val s = Bitmap.createScaledBitmap(logo, dw, dh, true)
+            c.drawBitmap(
+                s, w / 2f - dw / 2f, 56f,
+                Paint().apply { isFilterBitmap = true; isAntiAlias = true },
+            )
+            if (s != logo) s.recycle()
+        }
+        val textPaint = Paint().apply {
+            color = Color.WHITE
+            textAlign = Paint.Align.CENTER
+            isAntiAlias = true
+        }
+        // Competition name under the badge (Canvas shapes Arabic correctly).
+        compName?.let {
+            c.drawText(it, w / 2f, 252f, textPaint.apply { textSize = 38f })
+        }
+        // VS in the middle, with shadow for contrast.
+        c.drawText(
+            "VS", w / 2f, h / 2f + 44f,
+            textPaint.apply {
+                textSize = 124f
+                isFakeBoldText = true
+                setShadowLayer(12f, 0f, 4f, Color.argb(160, 0, 0, 0))
+            },
+        )
         return bmp
     }
 

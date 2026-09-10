@@ -107,9 +107,13 @@ the same items twice.
 
 ## Match banners
 
-`Today's Matches` cards use on-device 1280x720 composite banners (dark
-gradient + both team crests, `matchBanner()`), cached under
-`cacheDir/yacine_banners` per event id with API-logo fallback.
+`Today's Matches` cards use on-device 1280x720 composite banners — competition
+badge + name top-center, VS in the middle, both team crests on a dark
+gradient (`matchBanner()`/`renderBanner()`), cached under
+`cacheDir/yacine_banners` per event id (`match_{id}_v2.png`) with API-logo
+fallback. Competition badges come from an in-code `competitionLogos` map
+(Wikimedia URLs, Arabic + English keys); unknown competitions render
+text-only.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 
