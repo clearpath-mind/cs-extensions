@@ -1380,6 +1380,58 @@ private fun egydeadStage(msg: String) {
     }
 }
 
+private fun egydeadActivity(): android.app.Activity? =
+    StreamlyRuntime.context as? android.app.Activity
+
+/**
+ * WebView-native GET for EgyDead: its edge re-challenges OkHttp even with
+ * valid clearance (TLS fingerprint wall), so page loads go through a hidden
+ * WebView that shares the cleared cookie store. Falls back to OkHttp.
+ */
+private suspend fun egydeadWebText(
+    url: String,
+    referer: String? = null,
+    timeout: Long = 45000,
+): String {
+    val activity = egydeadActivity()
+    if (activity != null) {
+        if (!cfCookies(url).contains("cf_clearance")) cfSolve(url)
+        val html = cfSolveLock.withLock { CloudflareSolver.fetchPage(activity, url, CF_UA, timeout) }
+        if (!html.isNullOrBlank() && !isCfChallenge(html)) {
+            Log.d(EGYDEAD_TAG, "[webget ] DOM for $url (${html.length} chars)")
+            return html
+        }
+        Log.d(EGYDEAD_TAG, "[webget ] fallback to OkHttp for $url")
+    }
+    return cfGetText(url, referer = referer, timeout = 15000)
+}
+
+/** WebView-native POST for EgyDead's ?view=watch View=1 endpoint. */
+private suspend fun egydeadWebPost(
+    url: String,
+    data: Map<String, String>,
+    referer: String?,
+    timeout: Long = 45000,
+): String {
+    val activity = egydeadActivity()
+    if (activity != null) {
+        if (!cfCookies(url).contains("cf_clearance")) cfSolve(url)
+        val text = cfSolveLock.withLock { CloudflareSolver.postPage(activity, url, data, referer, CF_UA, timeout) }
+        if (!text.isNullOrBlank() && !isCfChallenge(text)) {
+            Log.d(EGYDEAD_TAG, "[webpost] ${text.length} chars from $url")
+            return text
+        }
+        Log.d(EGYDEAD_TAG, "[webpost] fallback to OkHttp for $url")
+    }
+    return cfPostText(
+        url,
+        data = data,
+        referer = referer,
+        headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+        timeout = 20000,
+    )
+}
+
 suspend fun invokeEgydead(
     res: LinkData,
     subtitleCallback: (SubtitleFile) -> Unit,
@@ -1424,7 +1476,7 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
     for (page in 1..maxPages) {
         val url = if (page == 1) "$base/?s=$encoded" else "$base/page/$page/?s=$encoded"
         try {
-            val html = cfGetText(url, timeout = 15000)
+            val html = egydeadWebText(url, timeout = 45000)
             if (html.isBlank() || isCfChallenge(html)) {
                 val host = runCatching { java.net.URI(url).host }.getOrDefault("?")
                 Log.w(EGYDEAD_TAG, "[search ] page $page CF challenge / empty for $url")
@@ -1508,7 +1560,7 @@ private suspend fun egydeadExtract(
     // fallback to GET if POST fails. See /tmp/re-3arabi/Egydead/src/main/kotlin/com/egydead/egydeadProvider.kt:718
     val originalUrl = postUrl
     val watchPageUrl = if (!postUrl.contains("?view=watch")) "$postUrl?view=watch" else postUrl
-    val primeDoc = try { cfGetDoc(originalUrl, timeout = 15000) } catch (_: Exception) { null }
+    val primeDoc = runCatching { Jsoup.parse(egydeadWebText(originalUrl, timeout = 45000), originalUrl) }.getOrNull()
     // Collection pages (/assembly/…, franchise hubs) carry no watch servers:
     // they list the films in div.salery-list (upstream load() pattern).
     // Descend into the best /film/ item instead of failing with no servers.
@@ -1530,22 +1582,22 @@ private suspend fun egydeadExtract(
         }
     }
     val html = try {
-        cfPostText(
+        egydeadWebPost(
             watchPageUrl,
             data = mapOf("View" to "1"),
             referer = originalUrl,
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-            timeout = 20000
+            timeout = 45000
         )
     } catch (e: Exception) {
         Log.e(EGYDEAD_TAG, "[watch  ] View=1 POST failed: ${e.message}, trying fallback GET $watchPageUrl")
         try {
-            cfGetText(watchPageUrl, referer = originalUrl, timeout = 20000)
+            egydeadWebText(watchPageUrl, referer = originalUrl, timeout = 45000)
         } catch (e2: Exception) {
             Log.e(EGYDEAD_TAG, "[watch  ] fallback GET failed: ${e2.message}")
-            null
+            ""
         }
-    } ?: return@coroutineScope false
+    }
+    if (html.isBlank()) return@coroutineScope false
 
     val doc = Jsoup.parse(html, watchPageUrl)
     // url -> server label (so we can special-case EarnVids/StreamHG)
@@ -1731,7 +1783,7 @@ private suspend fun egydeadResolveEpisode(
 
     if (seasonPage != null) {
         Log.d(EGYDEAD_TAG, "[season ] page ${seasonPage.url}")
-        val doc = cfGetDoc(seasonPage.url, timeout = 15000)
+        val doc = Jsoup.parse(egydeadWebText(seasonPage.url, timeout = 45000), seasonPage.url)
         for (a in doc.select("a[href]")) {
             val href = a.absUrl("href").ifEmpty { a.attr("href") }
             if (!href.contains("/episode/")) continue
