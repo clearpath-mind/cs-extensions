@@ -104,6 +104,12 @@ All rows fit on one page (no API pagination). `getMainPage` answers
 single-row drill-ins by `request.name` and returns `hasNext = false`;
 `page > 1` returns an empty list so end-of-list scrolling never appends
 the same items twice.
+
+## Match banners
+
+`Today's Matches` cards use on-device 1280x720 composite banners (dark
+gradient + both team crests, `matchBanner()`), cached under
+`cacheDir/yacine_banners` per event id with API-logo fallback.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 
@@ -142,13 +148,13 @@ the same items twice.
   exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
 - **Morocco**: 2M (`channel/546`) is a direct m3u8 and plays; the 7 SNRT
   channels (`snrtlive.ma` pages, `url_type` 5) resolve via the EasyBroadcast
-  slug (`extractEasyBroadcastSlug` tries several markup variants) with a
-  generic extractor attempt as last resort. Medi 1 embeds serve a JWPlayer
-  page with no static file URL and Télé Maroc is a multi-iframe portal, so
-  those go through the extractor registry and may fail upstream.
+  slug (`extractEasyBroadcastSlug` tries several markup variants) and the
+  stream URL is signed via `GET https://token.easybroadcast.io/all?url=...`
+  (CDN has `token_authentication: true`; unsigned playlists 403).
+  Generic extractor attempt remains as last resort. Medi 1 embeds serve a
+  JWPlayer page with no static file URL and Télé Maroc is a multi-iframe
+  portal, so those go through the extractor registry and may fail upstream.
 - **Kids**: most entries are direct m3u8 (`url_type` 3) and play; Almajd
   Kids/Bassma/Rawda embeds are dead upstream (elahmad `Bad Gateway`,
   taghtia redirect chain empty) and have no public direct stream.
-- **Logos**: in-code `logoOverrides` map (normalized name -> logo URL,
-  iptv-org database) overrides dead/square API logos; missing keys fall
-  back to the API logo.
+- **Logos**: channel posters use the API `logo` fields as-is (no overrides).

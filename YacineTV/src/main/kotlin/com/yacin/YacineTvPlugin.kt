@@ -7,6 +7,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class YacineTvPlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(YacineTvProvider())
+        registerMainAPI(YacineTvProvider().apply { init(context) })
     }
 }

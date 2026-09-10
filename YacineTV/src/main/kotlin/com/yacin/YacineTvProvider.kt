@@ -1,5 +1,13 @@
 package com.yacin
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
@@ -22,12 +30,21 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class YacineTvProvider : MainAPI() {
     override var mainUrl = "https://def.ycnapi.com/api"
@@ -40,6 +57,16 @@ class YacineTvProvider : MainAPI() {
 
     private val baseKey = "c!xZj+N9&G@Ev@vw"
     private val BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+
+    private var appContext: Context? = null
+
+    /** Called by the plugin entry point — MainAPI has no context hook. */
+    fun init(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    /** On-device match banner cache (event id -> cached PNG path). */
+    private val bannerCache = ConcurrentHashMap<Long, String>()
 
     /** Categories merged into one beIN SPORTS row (one per quality upstream). */
     private val beinQualityIds = setOf(4, 5, 6, 7)
@@ -255,15 +282,21 @@ class YacineTvProvider : MainAPI() {
 
             val lists = mutableListOf<HomePageList>()
 
-            // 1) Matches first (horizontal cards).
+            // 1) Matches first (horizontal cards with composite banners).
             val events = eventsDeferred.await()
             if (events.isNotEmpty()) {
-                val matchItems = events.mapNotNull { e ->
+                // Banners render in parallel; each is guarded so one slow
+                // logo download never blocks the homepage.
+                val banners = events.map { e ->
+                    async { withTimeoutOrNull(12_000) { matchBanner(e) } }
+                }.awaitAll()
+                val matchItems = events.zip(banners).mapNotNull { (e, banner) ->
                     val id = e.id ?: return@mapNotNull null
                     val title = eventTitle(e)
-                    // Homepage cards expose a single poster slot: team1 logo,
+                    // Composite banner when renderable, else team1 logo with
                     // team2 as fallback. Detail page shows both (poster + background).
-                    val poster = e.team1?.logo?.takeIf { it.isNotBlank() }
+                    val poster = banner
+                        ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                         ?: e.team2?.logo?.takeIf { it.isNotBlank() }
                     val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
                         ?: e.team1?.logo?.takeIf { it.isNotBlank() }
@@ -304,7 +337,7 @@ class YacineTvProvider : MainAPI() {
                     }
                 }
                 val beinItems = merged.values.map { m ->
-                    val logo = logoFor(m.name, m.logo)
+                    val logo = m.logo?.takeIf { it.isNotBlank() }
                     val data = LinkData(
                         kind = "channel",
                         ids = m.ids.map { it.first }.distinct(),
@@ -354,39 +387,89 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Curated logo overrides (in-code). Keys are normalized channel names.
-     * Fixes dead API logos and upgrades squares to wide banners that fill
-     * the horizontal cards. Missing keys fall back to the API logo. */
-    private val logoOverrides = mapOf(
-        "mbc 1" to "https://i.imgur.com/CiA3plN.png",
-        "mbc bollywood" to "https://i.imgur.com/TTAGFHG.png",
-        "mbc drama" to "https://i.imgur.com/g5PWnqp.png",
-        "mbc action" to "https://i.imgur.com/OWZAghw.png",
-        "mbc fm" to "https://i.imgur.com/lF8UxvR.png",
-        "panorama fm" to "https://i.imgur.com/JkDD3bK.png",
-        "mbc drama +" to "https://i.imgur.com/lxWdjXG.png",
-        "mbc 3" to "https://i.imgur.com/PVt8OPN.png",
-        "gulli arabic" to "https://i.imgur.com/34Vcc7u.png",
-        "rotana kids" to "https://i.imgur.com/YQKf0tq.png",
-        "taha kids" to "https://i.imgur.com/hdsrxvX.png",
-        "atfal wa mawahib" to "https://i.imgur.com/Y2BqP9m.png",
-        "almajd rawda" to "https://i.imgur.com/sEC3Zp9.png",
-        "canal j" to "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3c/Canal_J_2019_Logo.png/960px-Canal_J_2019_Logo.png",
-        "disney xd" to "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a8/2015_Disney_XD_logo.svg/960px-2015_Disney_XD_logo.svg.png",
-        "boomerang ar" to "https://upload.wikimedia.org/wikipedia/commons/thumb/3/35/Boomerang_2014_logo.svg/960px-Boomerang_2014_logo.svg.png",
-        "boomerang fr" to "https://upload.wikimedia.org/wikipedia/commons/thumb/3/35/Boomerang_2014_logo.svg/960px-Boomerang_2014_logo.svg.png",
-        "cartoon network" to "https://upload.wikimedia.org/wikipedia/commons/thumb/b/bb/Cartoon_Network_Arabic_logo.png/960px-Cartoon_Network_Arabic_logo.png",
-        "nick jr" to "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Nick_Jr._logo_2023_(outline).svg/960px-Nick_Jr._logo_2023_(outline).svg.png",
-        "nickelodeon fr" to "https://i.imgur.com/E84jnP8.png",
-        "mangas" to "https://i.imgur.com/wmmEOza.png",
-    )
-
-    private fun logoFor(name: String, apiLogo: String?): String? {
-        logoOverrides[normalizeName(name)]?.takeIf { it.isNotBlank() }?.let { return it }
-        return apiLogo?.takeIf { it.isNotBlank() }
+    /** 1280x720 composite match banner (dark gradient + both crests),
+     * rendered on-device from the API team logos and cached under
+     * cacheDir/yacine_banners. Returns the cached PNG path, or null when
+     * rendering is impossible (caller falls back to the API logo). */
+    private suspend fun matchBanner(e: YacineEvent): String? {
+        val id = e.id ?: return null
+        bannerCache[id]?.let { if (File(it).exists()) return it }
+        val l1 = e.team1?.logo?.takeIf { it.isNotBlank() }
+        val l2 = e.team2?.logo?.takeIf { it.isNotBlank() }
+        if (l1.isNullOrBlank() && l2.isNullOrBlank()) return null
+        val ctx = appContext ?: return null
+        return withContext(Dispatchers.IO) {
+            runCatching {
+                val dir = File(ctx.cacheDir, "yacine_banners").apply { mkdirs() }
+                val out = File(dir, "match_$id.png")
+                if (out.exists() && out.length() > 0) {
+                    bannerCache[id] = out.absolutePath
+                    return@runCatching out.absolutePath
+                }
+                val b1 = l1?.let { downloadBitmap(it) }
+                val b2 = l2?.let { downloadBitmap(it) }
+                if (b1 == null && b2 == null) return@runCatching null
+                val bmp = renderBanner(b1, b2)
+                FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.PNG, 90, it) }
+                bmp.recycle()
+                if (b1 != null && b1 != bmp) b1.recycle()
+                if (b2 != null && b2 != bmp) b2.recycle()
+                bannerCache[id] = out.absolutePath
+                out.absolutePath
+            }.getOrNull()
+        }
     }
 
-    /** Single horizontal channel row, deduped by normalized name. */
+    private fun downloadBitmap(url: String): Bitmap? {
+        return runCatching {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.setRequestProperty("User-Agent", BROWSER_UA)
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            conn.instanceFollowRedirects = true
+            conn.inputStream.use { BitmapFactory.decodeStream(it) }
+        }.getOrNull()
+    }
+
+    private fun renderBanner(left: Bitmap?, right: Bitmap?): Bitmap {
+        val w = 1280
+        val h = 720
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val grad = LinearGradient(
+            0f, 0f, w.toFloat(), h.toFloat(),
+            Color.parseColor("#3A0D0D"), Color.parseColor("#0D0303"),
+            Shader.TileMode.CLAMP,
+        )
+        c.drawRect(0f, 0f, w.toFloat(), h.toFloat(), Paint().apply { shader = grad })
+        // Soft center glow, like the reference banners.
+        c.drawCircle(
+            w / 2f, h / 2f, 150f,
+            Paint().apply { color = Color.argb(28, 255, 200, 200); isAntiAlias = true },
+        )
+        fun drawCrest(b: Bitmap?, cx: Float) {
+            if (b == null) return
+            val maxSide = 380
+            val scale = minOf(
+                maxSide / b.width.toFloat(),
+                maxSide / b.height.toFloat(),
+                3.5f,
+            )
+            val dw = (b.width * scale).toInt().coerceAtLeast(1)
+            val dh = (b.height * scale).toInt().coerceAtLeast(1)
+            val s = Bitmap.createScaledBitmap(b, dw, dh, true)
+            c.drawBitmap(
+                s, cx - dw / 2f, h / 2f - dh / 2f,
+                Paint().apply { isFilterBitmap = true; isAntiAlias = true },
+            )
+            if (s != b) s.recycle()
+        }
+        drawCrest(left, w * 0.22f)
+        drawCrest(right, w * 0.78f)
+        return bmp
+    }
+
+    /** Single horizontal channel row, deduped by normalized name. API logos as-is. */
     private suspend fun channelRow(title: String, channels: List<YacineChannel>): HomePageList? {
         val seen = linkedMapOf<String, YacineChannel>()
         channels.forEach { ch ->
@@ -396,7 +479,7 @@ class YacineTvProvider : MainAPI() {
         val items = seen.values.mapNotNull { ch ->
             val cid = ch.id ?: return@mapNotNull null
             val nm = ch.name?.trim() ?: return@mapNotNull null
-            val logo = logoFor(nm, ch.logo)
+            val logo = ch.logo?.takeIf { it.isNotBlank() }
             val data = LinkData(
                 kind = "channel",
                 ids = listOf(cid),
@@ -478,7 +561,7 @@ class YacineTvProvider : MainAPI() {
                 }
             }
             mergedHits.values.forEach { hit ->
-                val logo = logoFor(hit.name, hit.poster)
+                val logo = hit.poster?.takeIf { it.isNotBlank() }
                 val data = LinkData(
                     kind = "channel",
                     ids = hit.ids.toList(),
@@ -639,8 +722,11 @@ class YacineTvProvider : MainAPI() {
             val stream = ev.stream?.takeIf { it.isNotBlank() }
                 ?: ev.streamNoTimeshift?.takeIf { it.isNotBlank() }
                 ?: return false
+            // The CDN gates playlists (token_authentication): sign the URL
+            // first (token endpoint needs no auth). Unsigned -> 403.
+            val signed = signEasyBroadcast(stream, pageUrl) ?: return false
             callback.invoke(
-                newExtractorLink(this.name, "$channelName • SNRT", stream) {
+                newExtractorLink(this.name, "$channelName • SNRT", signed) {
                     this.headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl)
                     this.referer = pageUrl
                     this.quality = Qualities.Unknown.value
@@ -649,6 +735,24 @@ class YacineTvProvider : MainAPI() {
             )
             true
         } catch (_: Exception) { false }
+    }
+
+    /** Signs an EasyBroadcast CDN stream URL via the (unauthenticated)
+     * token endpoint. Returns null when signing fails (caller must drop
+     * the stream: the CDN answers 403 on unsigned URLs). */
+    private suspend fun signEasyBroadcast(streamUrl: String, pageUrl: String): String? {
+        return runCatching {
+            val q = URLEncoder.encode(streamUrl, "UTF-8")
+            val res = app.get(
+                "https://token.easybroadcast.io/all?url=$q",
+                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
+                timeout = 10,
+            ).text.trim()
+            // "token=...&token_path=...&expires=..."
+            if (!res.contains("token=") || !res.contains("expires=")) return@runCatching null
+            val sep = if ("?" in streamUrl) "&" else "?"
+            "$streamUrl$sep$res"
+        }.getOrNull()
     }
 
     private fun extractEasyBroadcastSlug(page: String): String? {
