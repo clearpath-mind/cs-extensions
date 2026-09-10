@@ -1436,11 +1436,17 @@ private suspend fun egydeadWebPost(
     if (activity != null) {
         if (!cfCookies(url).contains("cf_clearance")) cfSolve(url)
         val text = cfSolveLock.withLock { CloudflareSolver.postPage(activity, url, data, referer, CF_UA, timeout) }
-        if (!text.isNullOrBlank() && !isCfChallenge(text)) {
+        // A bare "{}" (Promise mis-fire) or any thin fragment carries no
+        // servers — fall through to OkHttp instead of parsing nothing.
+        val hasMarkers = text?.contains("serversList", ignoreCase = true) == true ||
+            text?.contains("data-link", ignoreCase = true) == true ||
+            text?.contains("<iframe", ignoreCase = true) == true
+        if (!text.isNullOrBlank() && !isCfChallenge(text) && (text.length > 1000 || hasMarkers)) {
             Log.d(EGYDEAD_TAG, "[webpost] ${text.length} chars from $url")
             return text
         }
-        Log.d(EGYDEAD_TAG, "[webpost] fallback to OkHttp for $url")
+        val snippet = text?.replace(Regex("\\s+"), " ")?.take(120).orEmpty()
+        Log.d(EGYDEAD_TAG, "[webpost] thin/invalid (${text?.length ?: -1} chars snippet='$snippet'), fallback to OkHttp for $url")
     }
     return cfPostText(
         url,
@@ -1675,55 +1681,68 @@ private suspend fun egydeadExtract(
     fun serverLabel(el: Element): String =
         el.selectFirst(".ser-name, p, .server-info")?.text()?.trim().orEmpty()
 
-    // Watch server lists (data-link carries the embed URL). Mirrors re-3arabi watchSelectors.
-    for (sel in listOf(
-        "ul.serversList li",
-        "ul.servers-list li",
-        "div.serversList li",
-        "div.servers-list li",
-    )) {
-        doc.select(sel).forEach { li ->
-            val dataLink = li.attr("data-link").takeIf { it.isNotBlank() }
-            val childDataLink = li.selectFirst("[data-link]")?.attr("data-link")
-            val hrefFromBtn = li.selectFirst("button[data-link]")?.attr("data-link")
-            val hrefFromA = li.selectFirst("a[href]")?.attr("href")
-            val link = dataLink ?: childDataLink ?: hrefFromBtn ?: hrefFromA ?: ""
-            if (link.startsWith("http")) watchEmbeds.add(link to serverLabel(li))
+    fun collect(d: Document) {
+        // Watch server lists (data-link carries the embed URL). Mirrors re-3arabi watchSelectors.
+        for (sel in listOf(
+            "ul.serversList li",
+            "ul.servers-list li",
+            "div.serversList li",
+            "div.servers-list li",
+        )) {
+            d.select(sel).forEach { li ->
+                val dataLink = li.attr("data-link").takeIf { it.isNotBlank() }
+                val childDataLink = li.selectFirst("[data-link]")?.attr("data-link")
+                val hrefFromBtn = li.selectFirst("button[data-link]")?.attr("data-link")
+                val hrefFromA = li.selectFirst("a[href]")?.attr("href")
+                val link = dataLink ?: childDataLink ?: hrefFromBtn ?: hrefFromA ?: ""
+                if (link.startsWith("http")) watchEmbeds.add(link to serverLabel(li))
+            }
+        }
+
+        // Generic: any <a> pointing at a player/embed/drive host.
+        val playerHostRegex = Regex("""(player|embed|drive|load|watch|wish|vid)\b""", RegexOption.IGNORE_CASE)
+        d.select("a[href]").forEach { a ->
+            val href = a.absUrl("href").ifEmpty { a.attr("href") }
+            if (href.startsWith("http") && playerHostRegex.containsMatchIn(href)) {
+                watchEmbeds.add(href to serverLabel(a))
+            }
+        }
+
+        // Download lists (multi-quality direct/file-host links).
+        for (sel in listOf(
+            "ul.donwload-servers-list li",
+            "ul.download-servers-list li",
+            "ul.donwload-servers-list > li",
+            "div.donwload-servers-list li",
+            "div.download-servers-list li",
+        )) {
+            d.select(sel).forEach { li ->
+                val link = li.selectFirst("a.ser-link")?.attr("href")
+                    ?: li.selectFirst("a[href]")?.attr("href")
+                    ?: li.attr("data-link")
+                if (!link.startsWith("http")) return@forEach
+                val quality = li.selectFirst(".server-info em")?.text()?.trim()
+                    ?: li.selectFirst("em")?.text()?.trim()
+                downloadCandidates.putIfAbsent(link, quality.orEmpty())
+            }
+        }
+
+        // Generic fallback: any remaining data-link carriers.
+        d.select("[data-link]").forEach { el ->
+            val link = el.attr("data-link")
+            if (link.startsWith("http")) watchEmbeds.add(link to serverLabel(el))
         }
     }
+    collect(doc)
 
-    // Generic: any <a> pointing at a player/embed/drive host.
-    val playerHostRegex = Regex("""(player|embed|drive|load|watch|wish|vid)\b""", RegexOption.IGNORE_CASE)
-    doc.select("a[href]").forEach { a ->
-        val href = a.absUrl("href").ifEmpty { a.attr("href") }
-        if (href.startsWith("http") && playerHostRegex.containsMatchIn(href)) {
-            watchEmbeds.add(href to serverLabel(a))
+    // POST can return a valid-but-serverless fragment while the watch page
+    // GET renders the lists — merge the GET fallback instead of emitting 0.
+    if (watchEmbeds.isEmpty() && downloadCandidates.isEmpty()) {
+        val fb = runCatching { egydeadWebText(watchPageUrl, referer = originalUrl, timeout = 45000) }.getOrNull()
+        if (!fb.isNullOrBlank() && !isCfChallenge(fb)) {
+            Log.d(EGYDEAD_TAG, "[watch  ] POST yielded nothing, GET fallback ${fb.length} chars")
+            collect(Jsoup.parse(fb, watchPageUrl))
         }
-    }
-
-    // Download lists (multi-quality direct/file-host links).
-    for (sel in listOf(
-        "ul.donwload-servers-list li",
-        "ul.download-servers-list li",
-        "ul.donwload-servers-list > li",
-        "div.donwload-servers-list li",
-        "div.download-servers-list li",
-    )) {
-        doc.select(sel).forEach { li ->
-            val link = li.selectFirst("a.ser-link")?.attr("href")
-                ?: li.selectFirst("a[href]")?.attr("href")
-                ?: li.attr("data-link")
-            if (!link.startsWith("http")) continue
-            val quality = li.selectFirst(".server-info em")?.text()?.trim()
-                ?: li.selectFirst("em")?.text()?.trim()
-            downloadCandidates.putIfAbsent(link, quality.orEmpty())
-        }
-    }
-
-    // Generic fallback: any remaining data-link carriers.
-    doc.select("[data-link]").forEach { el ->
-        val link = el.attr("data-link")
-        if (link.startsWith("http")) watchEmbeds.add(link to serverLabel(el))
     }
 
     val filteredWatch = watchEmbeds.filter { (embed, _) ->

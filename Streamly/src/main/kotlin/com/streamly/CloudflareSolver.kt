@@ -559,12 +559,30 @@ object CloudflareSolver {
                     val body = data.entries.joinToString("&") { (k, v) ->
                         "${java.net.URLEncoder.encode(k, "UTF-8")}=${java.net.URLEncoder.encode(v, "UTF-8")}"
                     }
-                    val js = """(function(){return fetch("${esc(url)}",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8","X-Requested-With":"XMLHttpRequest"},body:"${esc(body)}",credentials:"include"}).then(function(r){return r.text();}).then(function(t){return t.slice(0,500000);}).catch(function(e){return "__ERR__"+e;});})();"""
+                    // evaluateJavascript captures the *immediate* return value —
+                    // a fetch() Promise encodes as "{}" (the 2-char bug). Store
+                    // the resolved text on window and poll for it instead.
+                    val kick = """(function(){window.__postResult=null;window.__postError=null;fetch("${esc(url)}",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded;charset=UTF-8","X-Requested-With":"XMLHttpRequest"},body:"${esc(body)}",credentials:"include"}).then(function(r){return r.text();}).then(function(t){window.__postResult=t.slice(0,500000);}).catch(function(e){window.__postError="__ERR__"+e;});return "started";})();"""
                     try {
-                        webView.evaluateJavascript(js) { res -> cleanup(res) }
+                        webView.evaluateJavascript(kick, null)
                     } catch (_: Exception) {
                         cleanup(null)
+                        return
                     }
+                    fun pollPost() {
+                        if (done) return
+                        try {
+                            webView.evaluateJavascript("(window.__postResult!=null?window.__postResult:(window.__postError!=null?window.__postError:''))") { res ->
+                                if (done) return@evaluateJavascript
+                                val v = cleanJs(res)
+                                if (!v.isNullOrEmpty()) cleanup(v)
+                                else pollingHandler.postDelayed({ pollPost() }, 500)
+                            }
+                        } catch (_: Exception) {
+                            cleanup(null)
+                        }
+                    }
+                    pollingHandler.postDelayed({ pollPost() }, 800)
                 }
                 var waiting = false
                 fun startWaiting() {
