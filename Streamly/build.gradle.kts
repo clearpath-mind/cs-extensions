@@ -5,6 +5,7 @@ import org.jetbrains.kotlin.konan.properties.Properties
 version = 16
 
 android {
+    namespace = "com.streamly"
     buildFeatures {
         buildConfig = true
     }

@@ -1,0 +1,525 @@
+package com.yacin
+
+import android.util.Base64
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.newLiveSearchResponse
+import com.lagradost.cloudstream3.newMovieLoadResponse
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.getQualityFromName
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class YacineTvProvider : MainAPI() {
+    override var mainUrl = "https://def.ycnapi.com/api"
+    private val fallbackUrl = "https://deft.yacinelive.com/api"
+
+    override var name = "YacineTV"
+    override val hasMainPage = true
+    override var lang = "ar"
+    override val supportedTypes = setOf(TvType.Live)
+
+    private val baseKey = "c!xZj+N9&G@Ev@vw"
+
+    /** Categories merged into one beIN SPORTS row (one per quality upstream). */
+    private val beinQualityIds = setOf(4, 5, 6, 7)
+    private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
+
+    data class LinkData(
+        @JsonProperty("kind") val kind: String = "channel", // channel | event
+        @JsonProperty("ids") val ids: List<Int> = emptyList(), // merged channel ids
+        @JsonProperty("id") val id: Long? = null, // event id
+        @JsonProperty("name") val name: String = "",
+        @JsonProperty("poster") val poster: String? = null,
+        @JsonProperty("plot") val plot: String? = null,
+    )
+
+    private fun decrypt(encryptedText: String, tHeader: String): String {
+        return try {
+            val fullKey = baseKey + tHeader
+            val decoded = Base64.decode(encryptedText.trim(), Base64.DEFAULT)
+            val out = ByteArray(decoded.size)
+            for (i in decoded.indices) {
+                out[i] = (decoded[i].toInt() xor fullKey[i % fullKey.length].code).toByte()
+            }
+            String(out)
+        } catch (_: Exception) { "" }
+    }
+
+    private fun join(base: String, path: String): String {
+        val b = base.trimEnd('/')
+        val p = path.trimStart('/')
+        return "$b/$p"
+    }
+
+    private suspend fun getDecrypted(path: String): Pair<String, String>? {
+        for (base in listOf(mainUrl, fallbackUrl)) {
+            try {
+                val res = app.get(
+                    join(base, path),
+                    headers = mapOf("User-Agent" to "okhttp/4.12.0"),
+                    timeout = 10,
+                )
+                if (res.code == 200 && res.text.isNotBlank()) {
+                    val t = res.headers["t"] ?: ""
+                    return decrypt(res.text, t) to t
+                }
+            } catch (_: Exception) { continue }
+        }
+        return null
+    }
+
+    // Raw API models (categories + channels share id/name/logo shape).
+    // NOTE: /categories and /events have different data shapes, so each
+    // endpoint parses its own envelope (no generic shared response type).
+    data class YacineChannelResponse(
+        @JsonProperty("data") val data: List<YacineChannel>? = null,
+    )
+
+    data class YacineCategory(
+        @JsonProperty("id") val id: Int = 0,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("logo") val logo: String? = null,
+    )
+
+    data class YacineChannel(
+        @JsonProperty("id") val id: Int? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("logo") val logo: String? = null,
+    )
+
+    data class YacineEventResponse(
+        @JsonProperty("data") val data: List<YacineEvent>? = null,
+    )
+
+    data class YacineEvent(
+        @JsonProperty("id") val id: Long? = null,
+        @JsonProperty("champions") val champions: String? = null,
+        @JsonProperty("channel") val channel: String? = null,
+        @JsonProperty("commentary") val commentary: String? = null,
+        @JsonProperty("start_time") val startTime: Long? = null,
+        @JsonProperty("end_time") val endTime: Long? = null,
+        @JsonProperty("team_1") val team1: YacineTeam? = null,
+        @JsonProperty("team_2") val team2: YacineTeam? = null,
+    )
+
+    data class YacineTeam(
+        @JsonProperty("id") val id: Int? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("logo") val logo: String? = null,
+    )
+
+    data class YacineStreamResponse(
+        @JsonProperty("data") val data: List<YacineStream>? = null,
+    )
+
+    data class YacineStream(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("url") val url: String? = null,
+        @JsonProperty("referer") val referer: String? = null,
+        @JsonProperty("user_agent") val userAgent: String? = null,
+        @JsonProperty("headers") val headers: Map<String, Any?>? = null,
+    )
+
+    private suspend fun getCategories(): List<YacineCategory> {
+        val (json) = getDecrypted("categories") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
+
+    data class YacineCategoryEnvelope(
+        @JsonProperty("data") val data: List<YacineCategory>? = null,
+    )
+
+    private suspend fun getChannels(categoryId: Int): List<YacineChannel> {
+        val (json) = getDecrypted("categories/$categoryId/channels") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineChannelResponse>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
+
+    private suspend fun getEvents(): List<YacineEvent> {
+        val (json) = getDecrypted("events") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineEventResponse>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
+
+    private fun isBeinQuality(cat: YacineCategory): Boolean {
+        if (beinQualityIds.contains(cat.id)) return true
+        return cat.name?.let { beinQualityRegex.containsMatchIn(it) } == true
+    }
+
+    private fun qualityTag(cat: YacineCategory): String {
+        val m = cat.name?.let { Regex("""(\d+\s*P)""", RegexOption.IGNORE_CASE).find(it) }
+        if (m != null) return m.groupValues[1].replace(" ", "").uppercase()
+        return when (cat.id) {
+            4 -> "1080P"; 5 -> "720P"; 6 -> "360P"; 7 -> "244P"
+            else -> ""
+        }
+    }
+
+    private fun normalizeName(n: String): String {
+        return n.trim().lowercase()
+            .replace(Regex("""\s+"""), " ")
+            .replace(Regex("""[-_–—]+"""), " ")
+            .trim()
+    }
+
+    private fun cleanCategoryName(name: String?): String {
+        val n = (name ?: "أخرى").trim()
+        if (beinQualityRegex.containsMatchIn(n)) return "beIN SPORTS"
+        return n
+    }
+
+    private fun formatKickoff(epochSec: Long?): String {
+        if (epochSec == null || epochSec <= 0) return ""
+        return try {
+            val fmt = SimpleDateFormat("HH:mm - dd/MM", Locale("ar"))
+            fmt.format(Date(epochSec * 1000))
+        } catch (_: Exception) { "" }
+    }
+
+    private fun eventTitle(e: YacineEvent): String {
+        val t1 = e.team1?.name?.trim().orEmpty()
+        val t2 = e.team2?.name?.trim().orEmpty()
+        if (t1.isNotBlank() && t2.isNotBlank()) return "$t1 × $t2"
+        return e.champions?.trim().orEmpty().ifBlank { "مباراة" }
+    }
+
+    private fun eventPlot(e: YacineEvent): String {
+        val parts = mutableListOf<String>()
+        e.champions?.takeIf { it.isNotBlank() }?.let { parts.add("البطولة: $it") }
+        eventTitle(e).let { parts.add(it) }
+        e.channel?.takeIf { it.isNotBlank() }?.let { parts.add("القناة: $it") }
+        e.commentary?.takeIf { it.isNotBlank() }?.let { parts.add("التعليق: $it") }
+        formatKickoff(e.startTime).takeIf { it.isNotBlank() }?.let { parts.add("الموعد: $it") }
+        return parts.joinToString("\n")
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        return coroutineScope {
+            val eventsDeferred = async { getEvents() }
+            val categories = getCategories()
+
+            val beinCats = categories.filter { isBeinQuality(it) }
+            val otherCats = categories.filter { !isBeinQuality(it) }
+
+            // Fetch beIN quality groups in parallel, then merge by channel name.
+            val beinGroups = beinCats.map { cat ->
+                async {
+                    cat to getChannels(cat.id)
+                }
+            }.awaitAll()
+
+            val lists = mutableListOf<HomePageList>()
+
+            // 1) Matches first (horizontal cards).
+            val events = eventsDeferred.await()
+            if (events.isNotEmpty()) {
+                val matchItems = events.mapNotNull { e ->
+                    val id = e.id ?: return@mapNotNull null
+                    val title = eventTitle(e)
+                    val poster = e.team1?.logo?.takeIf { it.isNotBlank() }
+                        ?: e.team2?.logo?.takeIf { it.isNotBlank() }
+                    val data = LinkData(
+                        kind = "event",
+                        id = id,
+                        name = title,
+                        poster = poster,
+                        plot = eventPlot(e),
+                    ).toJson()
+                    newLiveSearchResponse(title, data, TvType.Live) {
+                        this.posterUrl = poster
+                    }
+                }
+                if (matchItems.isNotEmpty()) {
+                    lists.add(HomePageList("⚽ مباريات اليوم", matchItems, isHorizontalImages = true))
+                }
+            }
+
+            // 2) Single merged beIN SPORTS row (quality picked in player sources).
+            if (beinGroups.isNotEmpty()) {
+                val merged = linkedMapOf<String, MergedChannel>()
+                beinGroups.forEach { (cat, channels) ->
+                    val tag = qualityTag(cat)
+                    channels.forEach { ch ->
+                        val cid = ch.id ?: return@forEach
+                        val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
+                        val key = normalizeName(nm)
+                        val cur = merged[key]
+                        if (cur == null) {
+                            merged[key] = MergedChannel(nm, ch.logo, mutableListOf(cid to tag))
+                        } else {
+                            if (cur.ids.none { it.first == cid }) cur.ids.add(cid to tag)
+                            if (cur.logo.isNullOrBlank() && !ch.logo.isNullOrBlank()) cur.logo = ch.logo
+                        }
+                    }
+                }
+                val beinItems = merged.values.map { m ->
+                    val data = LinkData(
+                        kind = "channel",
+                        ids = m.ids.map { it.first }.distinct(),
+                        name = m.name,
+                        poster = m.logo,
+                        plot = "شاهد بث مباشر لقناة ${m.name}",
+                    ).toJson()
+                    newLiveSearchResponse(m.name, data, TvType.Live) {
+                        this.posterUrl = m.logo
+                    }
+                }
+                if (beinItems.isNotEmpty()) {
+                    lists.add(HomePageList("beIN SPORTS", beinItems, isHorizontalImages = true))
+                }
+            }
+
+            // 3) Remaining categories, each its own horizontal row.
+            val otherRows = otherCats.map { cat ->
+                async {
+                    val channels = getChannels(cat.id)
+                    if (channels.isEmpty()) return@async null
+                    val seen = linkedMapOf<String, YacineChannel>()
+                    channels.forEach { ch ->
+                        val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
+                        seen.putIfAbsent(normalizeName(nm), ch)
+                    }
+                    val items = seen.values.mapNotNull { ch ->
+                        val cid = ch.id ?: return@mapNotNull null
+                        val nm = ch.name?.trim() ?: return@mapNotNull null
+                        val data = LinkData(
+                            kind = "channel",
+                            ids = listOf(cid),
+                            name = nm,
+                            poster = ch.logo,
+                            plot = "شاهد بث مباشر لقناة $nm",
+                        ).toJson()
+                        newLiveSearchResponse(nm, data, TvType.Live) {
+                            this.posterUrl = ch.logo
+                        }
+                    }
+                    if (items.isEmpty()) return@async null
+                    HomePageList(cleanCategoryName(cat.name), items, isHorizontalImages = true)
+                }
+            }.awaitAll().filterNotNull()
+
+            lists.addAll(otherRows)
+            newHomePageResponse(lists)
+        }
+    }
+
+    private data class MergedChannel(
+        val name: String,
+        var logo: String?,
+        val ids: MutableList<Pair<Int, String>>,
+    )
+
+    private data class SearchHit(
+        val name: String,
+        var poster: String?,
+        val ids: MutableList<Int>,
+    )
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        if (query.isBlank()) return emptyList()
+        return coroutineScope {
+            val eventsDeferred = async { getEvents() }
+            val categories = getCategories()
+            val q = query.trim()
+
+            val channelDeferred = categories.map { cat ->
+                async {
+                    val tag = if (isBeinQuality(cat)) qualityTag(cat) else ""
+                    getChannels(cat.id).map { ch -> Triple(cat, ch, tag) }
+                }
+            }.awaitAll().flatten()
+
+            val out = mutableListOf<SearchResponse>()
+            // Merge hits by channel name so beIN search results keep all quality ids.
+            val mergedHits = linkedMapOf<String, SearchHit>()
+            channelDeferred.forEach { (_, ch, _) ->
+                val nm = ch.name?.trim() ?: return@forEach
+                if (!nm.contains(q, ignoreCase = true)) return@forEach
+                val cid = ch.id ?: return@forEach
+                val key = "c:${normalizeName(nm)}"
+                val cur = mergedHits[key]
+                if (cur == null) {
+                    mergedHits[key] = SearchHit(nm, ch.logo, mutableListOf(cid))
+                } else {
+                    if (!cur.ids.contains(cid)) cur.ids.add(cid)
+                    if (cur.poster.isNullOrBlank() && !ch.logo.isNullOrBlank()) cur.poster = ch.logo
+                }
+            }
+            mergedHits.values.forEach { hit ->
+                val data = LinkData(
+                    kind = "channel",
+                    ids = hit.ids.toList(),
+                    name = hit.name,
+                    poster = hit.poster,
+                    plot = "شاهد بث مباشر لقناة ${hit.name}",
+                ).toJson()
+                out.add(
+                    newLiveSearchResponse(hit.name, data, TvType.Live) {
+                        this.posterUrl = hit.poster
+                    }
+                )
+            }
+
+            eventsDeferred.await().forEach { e ->
+                val title = eventTitle(e)
+                val hay = listOfNotNull(title, e.champions, e.channel, e.team1?.name, e.team2?.name)
+                    .joinToString(" ")
+                if (!hay.contains(q, ignoreCase = true)) return@forEach
+                val id = e.id ?: return@forEach
+                val poster = e.team1?.logo ?: e.team2?.logo
+                val data = LinkData(
+                    kind = "event",
+                    id = id,
+                    name = title,
+                    poster = poster,
+                    plot = eventPlot(e),
+                ).toJson()
+                out.add(
+                    newLiveSearchResponse(title, data, TvType.Live) {
+                        this.posterUrl = poster
+                    }
+                )
+            }
+            out
+        }
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val data = parseJson<LinkData>(url)
+        val plot = data.plot
+            ?: if (data.kind == "event") "مباراة: ${data.name}"
+            else "شاهد بث مباشر لقناة ${data.name}"
+        return newMovieLoadResponse(data.name, url, TvType.Live, url) {
+            this.posterUrl = data.poster
+            this.plot = plot
+        }
+    }
+
+    private fun streamHeaders(s: YacineStream): Map<String, String> {
+        val out = mutableMapOf<String, String>()
+        s.headers?.forEach { (k, v) ->
+            val vs = when (v) {
+                is String -> v
+                is Number, is Boolean -> v.toString()
+                else -> null
+            }
+            if (!vs.isNullOrBlank()) out[k] = vs
+        }
+        val ua = s.userAgent?.takeIf { it.isNotBlank() }
+            ?: out["User-Agent"]?.takeIf { it.isNotBlank() }
+            ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+        out["User-Agent"] = ua
+        val ref = s.referer?.takeIf { it.isNotBlank() } ?: out["Referer"]
+        if (!ref.isNullOrBlank()) out["Referer"] = ref
+        return out
+    }
+
+    private suspend fun getChannelStreams(channelId: Int): List<YacineStream> {
+        val (json) = getDecrypted("channel/$channelId") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineStreamResponse>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
+
+    private suspend fun getEventStreams(eventId: Long): List<YacineStream> {
+        // /event/{id} and /event/{id}/servers return the same server list.
+        val (json) = getDecrypted("event/$eventId") ?: getDecrypted("event/$eventId/servers") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineStreamResponse>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
+
+    private fun qualityFor(label: String, url: String): Int {
+        val q = getQualityFromName("$label $url")
+        if (q != Qualities.Unknown.value) return q
+        val u = url.lowercase()
+        return when {
+            "1080" in label || "1080" in u -> Qualities.P1080.value
+            "720" in label || "720" in u -> Qualities.P720.value
+            "480" in label || "480" in u -> Qualities.P480.value
+            "360" in label || "360" in u -> Qualities.P360.value
+            label.equals("HD", ignoreCase = true) -> Qualities.P1080.value
+            label.equals("SD", ignoreCase = true) -> Qualities.P720.value
+            else -> Qualities.Unknown.value
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val info = parseJson<LinkData>(data)
+        var found = false
+        val seenUrls = mutableSetOf<String>()
+
+        fun emit(channelName: String, s: YacineStream) {
+            val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
+                ?: return
+            if (!seenUrls.add(raw)) return
+            val headers = streamHeaders(s)
+            val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
+            callback.invoke(
+                newExtractorLink(
+                    this.name,
+                    "$channelName • $serverName",
+                    raw,
+                ) {
+                    this.headers = headers
+                    this.referer = headers["Referer"] ?: ""
+                    this.quality = qualityFor("$channelName $serverName", raw)
+                    this.type = if (".m3u8" in raw) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                }
+            )
+            found = true
+        }
+
+        if (info.kind == "event" && info.id != null) {
+            val streams = getEventStreams(info.id)
+            streams.forEach { emit(info.name, it) }
+            return found
+        }
+
+        // Channel (possibly merged beIN ids across qualities).
+        val ids = info.ids.ifEmpty { emptyList() }
+        if (ids.isEmpty()) return false
+        val grouped = coroutineScope {
+            ids.map { cid ->
+                async { cid to getChannelStreams(cid) }
+            }.awaitAll()
+        }
+        grouped.forEach { (_, streams) ->
+            streams.forEach { emit(info.name, it) }
+        }
+        return found
+    }
+}
