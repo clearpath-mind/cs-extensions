@@ -1686,7 +1686,10 @@ private suspend fun faselHdExtractServers(
             resolvedIdx.add(idx)
             faselHdEmitResolved(m3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
         } else {
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms")
+            // Probe the token page size: a dead/rotated token serves a tiny
+            // or challenge page, a live-but-undecrypted player serves ~10k+.
+            val probe = runCatching { cfGetText(iframe, referer = postUrl, timeout = 15000) }.getOrNull()
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms playerPage=${probe?.length ?: -1}")
         }
     }
     // Pass 2 (fallback): cheap inline scan for the servers the WebView
@@ -1726,6 +1729,14 @@ private suspend fun faselHdExtractServers(
             continue
         }
         Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan miss enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+    }
+    // Servers neither pass resolved still go through the shared extractor
+    // registry — their token/player URL may match a known host there.
+    for ((idx, iframe) in iframes.withIndex()) {
+        if (idx in resolvedIdx) continue
+        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} unresolved, routing via EmbedRouter")
+        EmbedRouter.route(iframe, postUrl, subtitleCallback, callback, "FaselHD - Server ${idx + 1}")
+        found = true
     }
     Log.d(FASELHD_TAG, "[watch  ] resolve done in ${SystemClock.elapsedRealtime() - tWatch}ms resolved=$resolved")
 
@@ -2002,6 +2013,17 @@ private fun egBestScore(c: EgBestTitle, title: String, year: Int?): Int {
     return score
 }
 
+/** Link headers for the stream CDN: ExoPlayer uses these (not just the
+ *  referer field) for the playlist + every variant/segment request. */
+private fun egBestLinkHeaders(referer: String, src: String): Map<String, String> {
+    val origin = runCatching { URI(src).let { "${it.scheme}://${it.host}" } }.getOrDefault(EGBEST_MAIN_URL)
+    return mapOf(
+        "Referer" to referer,
+        "Origin" to origin,
+        "User-Agent" to CF_UA,
+    )
+}
+
 /** Resolve one video.src into a stream link. Embed pages carry an inline master m3u8. */
 private suspend fun egBestEmitVideo(
     src: String,
@@ -2016,6 +2038,7 @@ private suspend fun egBestEmitVideo(
                 this.referer = postUrl
                 this.quality = Qualities.Unknown.value
                 this.type = ExtractorLinkType.M3U8
+                this.headers = egBestLinkHeaders(postUrl, src)
             },
         )
         return true
@@ -2026,6 +2049,7 @@ private suspend fun egBestEmitVideo(
                 this.referer = postUrl
                 this.quality = getQualityFromName(src)
                 this.type = ExtractorLinkType.VIDEO
+                this.headers = egBestLinkHeaders(postUrl, src)
             },
         )
         return true
@@ -2040,6 +2064,7 @@ private suspend fun egBestEmitVideo(
                 this.referer = src
                 this.quality = Qualities.Unknown.value
                 this.type = ExtractorLinkType.M3U8
+                this.headers = egBestLinkHeaders(src, m3u8)
             },
         )
         return true
