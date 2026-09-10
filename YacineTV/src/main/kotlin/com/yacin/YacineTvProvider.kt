@@ -303,26 +303,31 @@ class YacineTvProvider : MainAPI() {
                 }
             }
 
-            // 3) Remaining categories, each its own horizontal row.
-            // Parent categories with no direct channels (e.g. ARABIC CHANNELS)
-            // expose country sub-categories via categories/{id} -> one row each.
-            val otherRows = otherCats.map { cat ->
+            // 3) Curated homepage rows only:
+            // Today's Matches, beIN SPORTS, Morocco, MBC CHANNELS, KIDS CHANNELS.
+            val wantedTopRows = setOf("mbc channels", "kids channels")
+            val otherRows = otherCats.mapNotNull { cat ->
+                val norm = normalizeName(cat.name ?: "")
+                when {
+                    norm == "arabic channels" || cat.id == 9 -> cat to true // parent
+                    wantedTopRows.contains(norm) -> cat to false
+                    else -> null // dropped: entertainment, france, turkish, weyyak, shahid, other countries
+                }
+            }.map { (cat, isParent) ->
                 async {
-                    val channels = getChannels(cat.id)
-                    if (channels.isNotEmpty()) {
+                    if (!isParent) {
+                        val channels = getChannels(cat.id)
+                        if (channels.isEmpty()) return@async emptyList()
                         return@async listOfNotNull(channelRow(cleanCategoryName(cat.name), channels))
                     }
+                    // Morocco only (id 15) from the ARABIC parent.
                     val subs = getSubcategories(cat.id)
-                    if (subs.isEmpty()) return@async emptyList()
-                    subs.map { sub ->
-                        async {
-                            val subChannels = getChannels(sub.id)
-                            if (subChannels.isEmpty()) return@async null
-                            val title = sub.name?.trim()?.takeIf { it.isNotBlank() }
-                                ?: cleanCategoryName(cat.name)
-                            channelRow(title, subChannels)
-                        }
-                    }.awaitAll().filterNotNull()
+                    val morocco = subs.firstOrNull {
+                        it.id == 15 || normalizeName(it.name ?: "") == "morocco"
+                    } ?: return@async emptyList()
+                    val subChannels = getChannels(morocco.id)
+                    if (subChannels.isEmpty()) return@async emptyList()
+                    listOfNotNull(channelRow("Morocco", subChannels))
                 }
             }.awaitAll().flatten()
 
@@ -383,14 +388,25 @@ class YacineTvProvider : MainAPI() {
             val categories = getCategories()
             val q = query.trim()
 
-            val channelDeferred = categories.map { cat ->
+            // Search mirrors the curated homepage: beIN qualities, Morocco,
+            // MBC CHANNELS, KIDS CHANNELS (+ events below).
+            val wantedTopRows = setOf("mbc channels", "kids channels")
+            val channelDeferred = categories.mapNotNull { cat ->
+                if (isBeinQuality(cat)) return@mapNotNull cat to false
+                val norm = normalizeName(cat.name ?: "")
+                when {
+                    norm == "arabic channels" || cat.id == 9 -> cat to true // parent
+                    wantedTopRows.contains(norm) -> cat to false
+                    else -> null
+                }
+            }.map { (cat, isParent) ->
                 async {
-                    val direct = getChannels(cat.id)
-                    if (direct.isNotEmpty()) return@async direct
-                    // Parent category (e.g. ARABIC CHANNELS): search inside countries.
-                    getSubcategories(cat.id).map { sub ->
-                        async { getChannels(sub.id) }
-                    }.awaitAll().flatten()
+                    if (!isParent) return@async getChannels(cat.id)
+                    val subs = getSubcategories(cat.id)
+                    val morocco = subs.firstOrNull {
+                        it.id == 15 || normalizeName(it.name ?: "") == "morocco"
+                    } ?: return@async emptyList()
+                    getChannels(morocco.id)
                 }
             }.awaitAll().flatten()
 
