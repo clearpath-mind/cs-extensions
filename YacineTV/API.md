@@ -87,7 +87,18 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
 }]}
 ```
 
+## Provider-side fallbacks (not API)
+
+- **Morocco/SNRT** (`snrtlive.ma` pages, `url_type` 5): page HTML contains
+  `snrt.player.easybroadcast.io/events/{slug}` iframe;
+  `GET https://snrt.player.easybroadcast.io/api/events/{slug}` returns
+  `{"stream": "...playlist_dvr.m3u8", "stream_no_timeshift": "...playlist.m3u8"}`.
+- **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
+  falls back to verified iptv-org EdgeNext CDN streams
+  (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`). No public stream
+  exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
+
 
 ```json
 {"data": [
@@ -111,3 +122,17 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"}
 ]}
 ```
+
+## Provider-side fallbacks (not API)
+
+- **Morocco/SNRT** (`snrtlive.ma` pages, `url_type` 5): page HTML contains
+  `snrt.player.easybroadcast.io/events/{slug}` iframe;
+  `GET https://snrt.player.easybroadcast.io/api/events/{slug}` returns
+  `{"stream": "...playlist_dvr.m3u8", "stream_no_timeshift": "...playlist.m3u8"}`.
+- **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
+  falls back to verified iptv-org EdgeNext CDN streams
+  (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`). No public stream
+  exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
+- **Logos**: `YacineTV/logos.json` (normalized name -> logo URL, iptv-org
+  database) overrides dead/square API logos at runtime; missing keys fall
+  back to the API logo.

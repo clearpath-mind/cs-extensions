@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.parsedSafe
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newLiveSearchResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
@@ -39,6 +40,7 @@ class YacineTvProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Live)
 
     private val baseKey = "c!xZj+N9&G@Ev@vw"
+    private val BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 
     /** Categories merged into one beIN SPORTS row (one per quality upstream). */
     private val beinQualityIds = setOf(4, 5, 6, 7)
@@ -289,15 +291,16 @@ class YacineTvProvider : MainAPI() {
                     }
                 }
                 val beinItems = merged.values.map { m ->
+                    val logo = logoFor(m.name, m.logo)
                     val data = LinkData(
                         kind = "channel",
                         ids = m.ids.map { it.first }.distinct(),
                         name = m.name,
-                        poster = m.logo,
+                        poster = logo,
                         plot = "شاهد بث مباشر لقناة ${m.name}",
                     ).toJson()
                     newLiveSearchResponse(m.name, data, TvType.Live) {
-                        this.posterUrl = m.logo
+                        this.posterUrl = logo
                     }
                 }
                 if (beinItems.isNotEmpty()) {
@@ -338,8 +341,30 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
+    /** Curated logo overrides (YacineTV/logos.json in this repo). Keys are
+     * normalized channel names. Fixes dead API logos and upgrades squares to
+     * wide banners that fill the horizontal cards. Fetched once, cached. */
+    private var logoOverrides: Map<String, String>? = null
+
+    private suspend fun logoOverridesMap(): Map<String, String> {
+        logoOverrides?.let { return it }
+        val loaded = runCatching {
+            app.get(
+                "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/logos.json",
+                timeout = 8000,
+            ).parsedSafe<Map<String, String>>()
+        }.getOrNull() ?: emptyMap()
+        logoOverrides = loaded
+        return loaded
+    }
+
+    private suspend fun logoFor(name: String, apiLogo: String?): String? {
+        logoOverridesMap()[normalizeName(name)]?.takeIf { it.isNotBlank() }?.let { return it }
+        return apiLogo?.takeIf { it.isNotBlank() }
+    }
+
     /** Single horizontal channel row, deduped by normalized name. */
-    private fun channelRow(title: String, channels: List<YacineChannel>): HomePageList? {
+    private suspend fun channelRow(title: String, channels: List<YacineChannel>): HomePageList? {
         val seen = linkedMapOf<String, YacineChannel>()
         channels.forEach { ch ->
             val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
@@ -348,15 +373,16 @@ class YacineTvProvider : MainAPI() {
         val items = seen.values.mapNotNull { ch ->
             val cid = ch.id ?: return@mapNotNull null
             val nm = ch.name?.trim() ?: return@mapNotNull null
+            val logo = logoFor(nm, ch.logo)
             val data = LinkData(
                 kind = "channel",
                 ids = listOf(cid),
                 name = nm,
-                poster = ch.logo,
+                poster = logo,
                 plot = "شاهد بث مباشر لقناة $nm",
             ).toJson()
             newLiveSearchResponse(nm, data, TvType.Live) {
-                this.posterUrl = ch.logo
+                this.posterUrl = logo
             }
         }
         if (items.isEmpty()) return null
@@ -429,16 +455,17 @@ class YacineTvProvider : MainAPI() {
                 }
             }
             mergedHits.values.forEach { hit ->
+                val logo = logoFor(hit.name, hit.poster)
                 val data = LinkData(
                     kind = "channel",
                     ids = hit.ids.toList(),
                     name = hit.name,
-                    poster = hit.poster,
+                    poster = logo,
                     plot = "شاهد بث مباشر لقناة ${hit.name}",
                 ).toJson()
                 out.add(
                     newLiveSearchResponse(hit.name, data, TvType.Live) {
-                        this.posterUrl = hit.poster
+                        this.posterUrl = logo
                     }
                 )
             }
@@ -538,6 +565,65 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
+    /** Verified direct EdgeNext CDN streams (iptv-org) used when the API has
+     * nothing playable for an MBC channel (empty data or dead embeds).
+     * Keys are normalized channel names. */
+    private val mbcFallbacks = mapOf(
+        "mbc 1" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-1/15cf99af5de54063fdabfefe66adc075/index.m3u8",
+        "mbc 4" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-4/24f134f1cd63db9346439e96b86ca6ed/index.m3u8",
+        "mbc 5" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-5/ee6b000cee0629411b666ab26cb13e9b/index.m3u8",
+        "mbc bollywood" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-bollywood/546eb40d7dcf9a209255dd2496903764/index.m3u8",
+        "mbc drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-drama/2c28a458e2f3253e678b07ac7d13fe71/index.m3u8",
+        "mbc fm" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-fm/3f36f7db6086acf058dc51681c87f8ad/index.m3u8",
+        "mbc masr" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr/956eac069c78a35d47245db6cdbb1575/index.m3u8",
+        "mbc maser" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr/956eac069c78a35d47245db6cdbb1575/index.m3u8",
+        "mbc masr 2" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-2/754931856515075b0aabf0e583495c68/index.m3u8",
+        "mbc masr drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-drama/567b703c19ede6598222de81b0e4508b/index.m3u8",
+        "mbc maser drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-drama/567b703c19ede6598222de81b0e4508b/index.m3u8",
+        "mbc drama +" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-plus-drama/e37251ec2aac8f6c98f75cd0fa37cd28/index.m3u8",
+        "wanasah" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-wanasah/13e82ea6232fa647c43b26e8a41f173d/index.m3u8",
+    )
+
+    data class EasyBroadcastEvent(
+        @JsonProperty("stream") val stream: String? = null,
+        @JsonProperty("stream_no_timeshift") val streamNoTimeshift: String? = null,
+    )
+
+    /** SNRT channels point at snrtlive.ma pages (no extractor). Resolve via the
+     * EasyBroadcast iframe slug -> player API -> direct m3u8. Returns true if emitted. */
+    private suspend fun emitSnrt(
+        channelName: String,
+        pageUrl: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
+            val page = app.get(
+                pageUrl,
+                headers = mapOf("User-Agent" to BROWSER_UA),
+                timeout = 12,
+            ).text
+            val slug = Regex("""snrt\.player\.easybroadcast\.io/events/([A-Za-z0-9_-]+)""").find(page)
+                ?.groupValues?.getOrNull(1) ?: return false
+            val ev = app.get(
+                "https://snrt.player.easybroadcast.io/api/events/$slug",
+                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
+                timeout = 12,
+            ).parsedSafe<EasyBroadcastEvent>() ?: return false
+            val stream = ev.stream?.takeIf { it.isNotBlank() }
+                ?: ev.streamNoTimeshift?.takeIf { it.isNotBlank() }
+                ?: return false
+            callback.invoke(
+                newExtractorLink(this.name, "$channelName • SNRT", stream) {
+                    this.headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl)
+                    this.referer = pageUrl
+                    this.quality = Qualities.Unknown.value
+                    this.type = ExtractorLinkType.M3U8
+                }
+            )
+            true
+        } catch (_: Exception) { false }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -548,10 +634,18 @@ class YacineTvProvider : MainAPI() {
         var found = false
         val seenUrls = mutableSetOf<String>()
 
-        suspend fun emit(channelName: String, s: YacineStream) {
+        suspend fun emit(channelName: String, s: YacineStream): Boolean {
             val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
-                ?: return
-            if (!seenUrls.add(raw)) return
+                ?: return false
+            if (!seenUrls.add(raw)) return false
+            // SNRT pages need one extra resolution hop (no extractor exists).
+            if ("snrtlive.ma" in raw.lowercase()) {
+                if (emitSnrt(channelName, raw, callback)) {
+                    found = true
+                    return true
+                }
+                return false
+            }
             val headers = streamHeaders(s)
             val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
             val lower = raw.lowercase()
@@ -564,7 +658,7 @@ class YacineTvProvider : MainAPI() {
                 val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
                 runCatching { loadExtractor(raw, headers["Referer"], subtitleCallback, countCb) }
                 if (resolved) found = true
-                return
+                return resolved
             }
             callback.invoke(
                 newExtractorLink(
@@ -579,6 +673,7 @@ class YacineTvProvider : MainAPI() {
                 }
             )
             found = true
+            return true
         }
 
         if (info.kind == "event" && info.id != null) {
@@ -623,8 +718,25 @@ class YacineTvProvider : MainAPI() {
                 async { cid to getChannelStreams(cid) }
             }.awaitAll()
         }
+        var emitted = false
         grouped.forEach { (_, streams) ->
-            streams.forEach { emit(info.name, it) }
+            streams.forEach { if (emit(info.name, it)) emitted = true }
+        }
+        // Last resort: verified iptv-org direct stream when the API has nothing playable.
+        if (!emitted) {
+            mbcFallbacks[normalizeName(info.name)]?.let { url ->
+                if (seenUrls.add(url)) {
+                    callback.invoke(
+                        newExtractorLink(this.name, "${info.name} • IPTV", url) {
+                            this.headers = mapOf("User-Agent" to BROWSER_UA)
+                            this.referer = ""
+                            this.quality = Qualities.P1080.value
+                            this.type = ExtractorLinkType.M3U8
+                        }
+                    )
+                    found = true
+                }
+            }
         }
         return found
     }
