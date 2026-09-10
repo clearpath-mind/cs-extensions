@@ -1401,12 +1401,35 @@ private suspend fun egydeadExtract(
     postUrl: String,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
+    title: String? = null,
+    year: Int? = null,
+    depth: Int = 0,
 ): Boolean = coroutineScope {
     // Mirrors re-3arabi EgyDead: priming GET, then POST to ?view=watch with View=1 + X-Requested-With,
     // fallback to GET if POST fails. See /tmp/re-3arabi/Egydead/src/main/kotlin/com/egydead/egydeadProvider.kt:718
     val originalUrl = postUrl
     val watchPageUrl = if (!postUrl.contains("?view=watch")) "$postUrl?view=watch" else postUrl
-    try { cfGetDoc(originalUrl, timeout = 15000) } catch (_: Exception) {}
+    val primeDoc = try { cfGetDoc(originalUrl, timeout = 15000) } catch (_: Exception) { null }
+    // Collection pages (/assembly/…, franchise hubs) carry no watch servers:
+    // they list the films in div.salery-list (upstream load() pattern).
+    // Descend into the best /film/ item instead of failing with no servers.
+    if (depth == 0 && primeDoc != null) {
+        val films = primeDoc.select("div.salery-list ul li.movieItem a[href]")
+            .mapNotNull { a ->
+                val href = a.absUrl("href").ifEmpty { a.attr("href").trim() }
+                if (!href.startsWith("http") || !href.contains("/film/")) return@mapNotNull null
+                val slug = decodeSlug(href)
+                Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            }
+        if (films.isNotEmpty() && title != null) {
+            val bestFilm = films.map { it to scoreCandidate(it, title, year) }
+                .maxByOrNull { it.second }
+            Log.d(EGYDEAD_TAG, "[collect] ${films.size} films on $postUrl best=${bestFilm?.first?.url} score=${bestFilm?.second}")
+            if (bestFilm != null && bestFilm.second >= MIN_SCORE_MOVIE) {
+                return@coroutineScope egydeadExtract(bestFilm.first.url, subtitleCallback, callback, title, year, depth = 1)
+            }
+        }
+    }
     val html = try {
         cfPostText(
             watchPageUrl,
@@ -1570,15 +1593,23 @@ private suspend fun egydeadResolveMovie(
     scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
         Log.d(EGYDEAD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} ${c.url}")
     }
-    val best = scored
-        .filter { (c, s) -> !c.url.contains("/episode/") && s >= MIN_SCORE_MOVIE }
+    // Collection hubs (/assembly/…) outscore the film itself (bare latin title,
+    // no year penalty) but carry no servers — only consider them as fallback,
+    // egydeadExtract descends into their best /film/ item.
+    val direct = scored.filter { (c, _) ->
+        !c.url.contains("/episode/") && !c.url.contains("/assembly/") &&
+            !c.url.contains("/season/") && !c.url.contains("/serie")
+    }
+    val best = direct.filter { it.second >= MIN_SCORE_MOVIE }
         .maxByOrNull { it.second }?.first
+        ?: scored.filter { it.second >= MIN_SCORE_MOVIE }
+            .maxByOrNull { it.second }?.first
     if (best == null) {
         Log.d(EGYDEAD_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
         return false
     }
     Log.d(EGYDEAD_TAG, "[match  ] WINNER ${best.url}")
-    return egydeadExtract(best.url, subtitleCallback, callback)
+    return egydeadExtract(best.url, subtitleCallback, callback, title, year)
 }
 
 private suspend fun egydeadResolveEpisode(
@@ -1609,7 +1640,7 @@ private suspend fun egydeadResolveEpisode(
             val slugSeason = egydeadSeasonFromSlug(slug)
             if (slugSeason != -1 && slugSeason != season) continue
             Log.d(EGYDEAD_TAG, "[match  ] WINNER S${season}E${episode} $href")
-            return egydeadExtract(href, subtitleCallback, callback)
+            return egydeadExtract(href, subtitleCallback, callback, title, year)
         }
         Log.d(EGYDEAD_TAG, "[match  ] E$episode not on S$season page")
         return false
@@ -1632,7 +1663,7 @@ private suspend fun egydeadResolveEpisode(
         return false
     }
     Log.d(EGYDEAD_TAG, "[match  ] WINNER ${match.url}")
-    return egydeadExtract(match.url, subtitleCallback, callback)
+    return egydeadExtract(match.url, subtitleCallback, callback, title, year)
 }
 
 // ===========================================================================
