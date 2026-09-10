@@ -482,7 +482,7 @@ class YacineTvProvider : MainAPI() {
         var found = false
         val seenUrls = mutableSetOf<String>()
 
-        fun emit(channelName: String, s: YacineStream) {
+        suspend fun emit(channelName: String, s: YacineStream) {
             val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
                 ?: return
             if (!seenUrls.add(raw)) return
