@@ -2,14 +2,14 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
         "status": 1,
-        "version": 14,
+        "version": 15,
         "name": "Streamly",
         "internalName": "Streamly",
         "authors": [
             "clearpath-mind"
         ],
         "description": "Streamly - Watch movies and series with Arabic subtitles",
-        "fileSize": 204048,
+        "fileSize": 205366,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -17,6 +17,6 @@
             "TvSeries"
         ],
         "apiVersion": 1,
-        "fileHash": "sha256-474486a3fa5a8447a17d488d6c59fbc18c75d6f170e169eaa49dcf048c3d2ab9"
+        "fileHash": "sha256-09d0b87cd0514dcc5d5d61dc7c5b286bb1bd6793fd15f335d369cd634378cfb5"
     }
 ]
