@@ -17,8 +17,9 @@ import android.webkit.WebViewClient
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
-/** Clearance result: final URL (follows mirror rotations) + cookies for that URL. */
-data class SolverResult(val finalUrl: String, val cookies: String?)
+/** Clearance result: final URL (follows mirror rotations) + cookies for that URL
+ *  + the solved page's rendered HTML (avoids a redundant refetch). */
+data class SolverResult(val finalUrl: String, val cookies: String?, val html: String? = null)
 
 object CloudflareSolver {
     private const val TAG = "CF_Solver_Hidden"
@@ -74,23 +75,42 @@ object CloudflareSolver {
                 val pollingHandler = Handler(Looper.getMainLooper())
 
                 fun finishSuccess(finalUrl: String, reason: String = "unknown") {
-                    if (!isSolved) {
-                        isSolved = true
-                        Log.i(TAG, "solved | reason: $reason | finalUrl: $finalUrl")
+                    if (isSolved) return
+                    isSolved = true
+                    Log.i(TAG, "solved | reason: $reason | finalUrl: $finalUrl")
 
-                        cookieManager.flush()
-                        val finalCookies = cookieManager.getCookie(finalUrl)
+                    cookieManager.flush()
+                    // The WebView already holds the cleared page: capture its DOM so
+                    // callers don't need a redundant OkHttp refetch (whose bridged
+                    // clearance Cloudflare may reject).
+                    pollingHandler.removeCallbacksAndMessages(null)
+                    var delivered = false
+                    fun deliver(html: String?) {
+                        if (delivered) return
+                        delivered = true
+                        var cleanHtml = html?.removeSurrounding("\"")
+                            ?.replace("\\u003C", "<")
+                            ?.replace("\\u003E", ">")
+                            ?.replace("\\\"", "\"")
+                            ?.replace("\\\\", "\\")
+                        val finalCookies = runCatching { cookieManager.getCookie(finalUrl) }.getOrNull()
                         if (finalCookies.isNullOrBlank()) {
                             Log.w(TAG, "finished without cookies for $finalUrl")
                         }
-
                         try {
-                            pollingHandler.removeCallbacksAndMessages(null)
                             rootView.removeView(webView)
                             webView.destroy()
                         } catch (e: Exception) {}
 
-                        continuation.resume(SolverResult(finalUrl, finalCookies))
+                        continuation.resume(SolverResult(finalUrl, finalCookies, cleanHtml))
+                    }
+                    pollingHandler.postDelayed({ deliver(null) }, 8000)
+                    try {
+                        webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
+                            deliver(html)
+                        }
+                    } catch (e: Exception) {
+                        deliver(null)
                     }
                 }
 

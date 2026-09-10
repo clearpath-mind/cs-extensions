@@ -447,6 +447,23 @@ private fun cfHeaders(
     if (referer != null) put("Referer", referer)
 }
 
+/** Use the solver's rendered DOM when it solved this exact page (avoids a
+ *  redundant OkHttp round-trip whose bridged clearance CF may reject). */
+private fun takeSolverHtml(solved: SolverResult, url: String): String? {
+    val html = solved.html
+    if (html.isNullOrBlank() || isCfChallenge(html)) return null
+    val same = runCatching {
+        val a = java.net.URI(solved.finalUrl)
+        val b = java.net.URI(url)
+        a.host.equals(b.host, ignoreCase = true) && (a.path ?: "") == (b.path ?: "")
+    }.getOrDefault(false)
+    if (!same) {
+        Log.d(TAG, "[cfGet  ] solved page differs ($url vs ${solved.finalUrl}), refetching")
+        return null
+    }
+    return html
+}
+
 private suspend fun cfGetDoc(
     url: String,
     referer: String? = null,
@@ -460,11 +477,22 @@ private suspend fun cfGetDoc(
         return first.document
     }
     Log.d(TAG, "[cfGet  ] wall ($url code=${first?.code}), solving…")
-    cfSolve(url) ?: return first?.document ?: Jsoup.parse("", url)
+    val solved = cfSolve(url)
+    if (solved != null) {
+        takeSolverHtml(solved, url)?.let { html ->
+            Log.d(TAG, "[cfGet  ] solved-page DOM for $url (${html.length} chars)")
+            return Jsoup.parse(html, url)
+        }
+    } else if (first != null) {
+        return first.document
+    }
     val retryUrl = swapEgydeadMirror(url)
-    return runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true).document
-    }.getOrNull() ?: first?.document ?: Jsoup.parse("", retryUrl)
+    val ck = cfCookies(retryUrl)
+    val second = runCatching {
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
+    }.getOrNull()
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
+    return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
 }
 
 private suspend fun cfGetText(
@@ -480,11 +508,28 @@ private suspend fun cfGetText(
         return first.text
     }
     Log.d(TAG, "[cfGet  ] wall ($url code=${first?.code}), solving…")
-    cfSolve(url) ?: return first?.text ?: ""
+    val solved = cfSolve(url)
+    if (solved != null) {
+        takeSolverHtml(solved, url)?.let { html ->
+            Log.d(TAG, "[cfGet  ] solved-page DOM for $url (${html.length} chars)")
+            return html
+        }
+    } else if (first != null) {
+        // Explicit String? type: app response accessors carry a jspecify
+        // @Nullable annotation that isn't on the compile classpath.
+        val t: String? = first.text
+        return t ?: ""
+    }
     val retryUrl = swapEgydeadMirror(url)
-    return runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true).text
-    }.getOrNull() ?: first?.text ?: ""
+    val ck = cfCookies(retryUrl)
+    // Explicit String? type: app response accessors carry a jspecify
+    // @Nullable annotation that isn't on the compile classpath.
+    val secondResp = runCatching {
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
+    }.getOrNull()
+    val second: String? = secondResp?.text
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
+    return second ?: first?.text ?: ""
 }
 
 private suspend fun cfPostText(
@@ -505,11 +550,14 @@ private suspend fun cfPostText(
     Log.d(TAG, "[cfPost ] wall ($url), solving…")
     cfSolve(url)
     val retryUrl = swapEgydeadMirror(url)
+    val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
-    val retry: String? = runCatching {
-        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = timeout).text
+    val secondResp = runCatching {
+        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = timeout)
     }.getOrNull()
+    val retry: String? = secondResp?.text
+    Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
     return retry ?: first ?: ""
 }
 
