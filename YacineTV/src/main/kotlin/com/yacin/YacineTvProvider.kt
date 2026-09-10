@@ -11,7 +11,6 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.parsedSafe
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newLiveSearchResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
@@ -349,10 +348,12 @@ class YacineTvProvider : MainAPI() {
     private suspend fun logoOverridesMap(): Map<String, String> {
         logoOverrides?.let { return it }
         val loaded = runCatching {
-            app.get(
-                "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/logos.json",
-                timeout = 8000,
-            ).parsedSafe<Map<String, String>>()
+            parseJson<Map<String, String>>(
+                app.get(
+                    "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/logos.json",
+                    timeout = 8000,
+                ).text
+            )
         }.getOrNull() ?: emptyMap()
         logoOverrides = loaded
         return loaded
@@ -604,11 +605,15 @@ class YacineTvProvider : MainAPI() {
             ).text
             val slug = Regex("""snrt\.player\.easybroadcast\.io/events/([A-Za-z0-9_-]+)""").find(page)
                 ?.groupValues?.getOrNull(1) ?: return false
-            val ev = app.get(
-                "https://snrt.player.easybroadcast.io/api/events/$slug",
-                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
-                timeout = 12,
-            ).parsedSafe<EasyBroadcastEvent>() ?: return false
+            val ev = runCatching {
+                parseJson<EasyBroadcastEvent>(
+                    app.get(
+                        "https://snrt.player.easybroadcast.io/api/events/$slug",
+                        headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
+                        timeout = 12,
+                    ).text
+                )
+            }.getOrNull() ?: return false
             val stream = ev.stream?.takeIf { it.isNotBlank() }
                 ?: ev.streamNoTimeshift?.takeIf { it.isNotBlank() }
                 ?: return false
