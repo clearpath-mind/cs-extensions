@@ -475,11 +475,11 @@ open class Streamly : MainAPI() {
             Log.d(TAG, "$broken slow/failing link sources moved to end of queue")
         }
 
-        // Global dedup across all providers (re-3arabi EgyDead style): same URL from
+        // Global dedup across all providers: same URL from
         // multiple sites (e.g. vidtube on TopCinema + Wecima) must not duplicate.
         val seenLinks = ConcurrentHashMap.newKeySet<String>()
         val seenSubs = ConcurrentHashMap.newKeySet<String>()
-        // Quality specific like re-3arabi: dedup by normalized final URL only (like EgyDead allSeenLinks).
+        // Dedup by normalized final URL only (allSeenLinks style).
         // Same host different quality with distinct variant URLs stays distinct (quality-specific),
         // same URL appearing via multiple providers (WeCima cinemm x2) collapses.
         val dedupCallback: (ExtractorLink) -> Unit = { link ->

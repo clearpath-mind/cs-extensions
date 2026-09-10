@@ -67,7 +67,7 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, WeCima, EgyDead, FaselHD. One adaptive link is
+// Currently: TopCinema, WeCima, FaselHD. One adaptive link is
 // emitted per server (no per-quality lists); ExoPlayer adapts itself.
 // ---------------------------------------------------------------------------
 
@@ -388,9 +388,6 @@ internal const val CF_UA =
 /** HTTP codes that mean Cloudflare / rate-limit wall (re-3arabi httpGet pattern). */
 private val CF_BLOCK_CODES = listOf(403, 503, 429)
 
-/** EgyDead rotates mirrors; updated from the solver's final URL (re-3arabi mainUrl pattern). */
-private var egydeadLiveBase: String? = null
-
 private fun cfCookies(url: String): String =
     runCatching { CookieManager.getInstance().getCookie(url).orEmpty() }.getOrDefault("")
 
@@ -398,29 +395,6 @@ private fun isCfChallenge(text: String): Boolean =
     text.contains("just a moment", ignoreCase = true) ||
         text.contains("checking your browser", ignoreCase = true) ||
         text.contains("verify you are human", ignoreCase = true)
-
-/** Adopt the solver's final URL so mirror rotations stick for later calls. */
-private fun adoptSolverMirror(requestUrl: String, result: SolverResult) {
-    val newHost = runCatching { java.net.URI(result.finalUrl).host }.getOrNull()
-    val oldHost = runCatching { java.net.URI(requestUrl).host }.getOrNull()
-    if (newHost.isNullOrBlank() || newHost.equals(oldHost, ignoreCase = true)) return
-    if (oldHost?.contains("egydead", ignoreCase = true) != true &&
-        !newHost.contains("egydead", ignoreCase = true)
-    ) return
-    val scheme = runCatching { java.net.URI(result.finalUrl).scheme }.getOrDefault("https")
-    egydeadLiveBase = "$scheme://$newHost"
-    originCache[EGYDEAD_ENTRY_URL] = egydeadLiveBase!!
-    Log.d("StreamlyMirror", "cfSolve mirror $oldHost -> $newHost clearance=${!result.cookies.isNullOrBlank()}")
-}
-
-/** Swap a stale EgyDead base for the live mirror inside an already-built URL. */
-private fun swapEgydeadMirror(url: String): String {
-    val live = egydeadLiveBase ?: return url
-    val base = getBaseUrl(url)
-    if (!base.contains("egydead", ignoreCase = true)) return url
-    if (base.equals(live, ignoreCase = true)) return url
-    return url.replace(base, live)
-}
 
 /** Solve a CloudFlare challenge via the WebView solver, sharing one lock so
  *  only a single solve runs at a time. Cookies land in the shared
@@ -431,9 +405,7 @@ private suspend fun cfSolve(url: String): SolverResult? {
         Log.w(TAG, "[cf     ] no Activity context available, skipping WebView solver for $url")
         return null
     }
-    val result = cfSolveLock.withLock { CloudflareSolver.solve(activity, url, CF_UA) }
-    if (result != null) adoptSolverMirror(url, result)
-    return result
+    return cfSolveLock.withLock { CloudflareSolver.solve(activity, url, CF_UA) }
 }
 
 private fun cfHeaders(
@@ -492,13 +464,12 @@ private suspend fun cfGetDoc(
     } else if (first != null) {
         return first.document
     }
-    val retryUrl = swapEgydeadMirror(url)
-    val ck = cfCookies(retryUrl)
+    val ck = cfCookies(url)
     val second = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
     }.getOrNull()
-    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
-    return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
+    Log.d(TAG, "[cfGet  ] retry $url code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
+    return second?.document ?: first?.document ?: Jsoup.parse("", url)
 }
 
 private suspend fun cfGetText(
@@ -526,15 +497,14 @@ private suspend fun cfGetText(
         val t: String? = first.text
         return t ?: ""
     }
-    val retryUrl = swapEgydeadMirror(url)
-    val ck = cfCookies(retryUrl)
+    val ck = cfCookies(url)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
     }.getOrNull()
     val second: String? = secondResp?.text
-    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
+    Log.d(TAG, "[cfGet  ] retry $url code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
     return second ?: first?.text ?: ""
 }
 
@@ -555,15 +525,14 @@ private suspend fun cfPostText(
     // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
     Log.d(TAG, "[cfPost ] wall ($url), solving…")
     cfSolve(url)
-    val retryUrl = swapEgydeadMirror(url)
-    val ck = cfCookies(retryUrl)
+    val ck = cfCookies(url)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = timeout)
+        app.post(url, data = data, referer = referer, headers = cfHeaders(url, referer, baseHeaders), timeout = timeout)
     }.getOrNull()
     val retry: String? = secondResp?.text
-    Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
+    Log.d(TAG, "[cfPost ] retry $url code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
     return retry ?: first ?: ""
 }
 
@@ -1339,575 +1308,6 @@ private fun wecimaExactEpisode(scope: Document, episode: Int): String? {
     return null
 }
 
-// ---------------------------------------------------------------------------
-// EgyDead (egydead.skin, currently serving from tvN.egydead.live) link source.
-//
-// Search returns movie posts ({title}-{year}-{quality}) and per-episode posts
-// (/episode/{slug}-sXXeXX). Watch servers are NOT in the static HTML: they
-// appear after re-POSTing the post URL with `View=1`, as
-// `ul.serversList li[data-link]` embeds.
-// ---------------------------------------------------------------------------
-
-private const val EGYDEAD_ENTRY_URL = "https://egydead.beer"
-/** Last confirmed-live mirror (search-indexed); fallback when the entry seed is blocked. */
-private const val EGYDEAD_KNOWN_MIRROR = "https://tv10.egydead.live"
-private const val EGYDEAD_TAG = "EgyDead"
-private val EGYDEAD_EPISODE_URL_REGEX = Regex("""-s(\d{1,2})e(\d{1,3})""", RegexOption.IGNORE_CASE)
-
-/** EgyDead redirects to a rotating mirror; reuse the solver-discovered origin when known. */
-private suspend fun egydeadBase(): String {
-    egydeadLiveBase?.let { return it }
-    return resolveOrigin(EGYDEAD_ENTRY_URL)
-}
-
-/** Arabic ordinal season words, alef-normalized matching. */
-private val ARABIC_ORDINALS = linkedMapOf(
-    "الاول" to 1, "اول" to 1,
-    "الثاني" to 2, "ثاني" to 2,
-    "الثالث" to 3, "ثالث" to 3,
-    "الرابع" to 4, "رابع" to 4,
-    "الخامس" to 5, "خامس" to 5,
-    "السادس" to 6, "سادس" to 6,
-    "السابع" to 7, "سابع" to 7,
-    "الثامن" to 8, "ثامن" to 8,
-    "التاسع" to 9, "تاسع" to 9,
-    "العاشر" to 10, "عاشر" to 10,
-)
-
-/**
- * Extracts the season number from an EgyDead slug. Handles digit seasons
- * (الموسم-4) and Arabic ordinals (الموسم-الرابع); returns -1 when absent.
- */
-private fun egydeadSeasonFromSlug(slug: String): Int {
-    SEASON_DIGIT_REGEX.find(slug)?.groupValues?.get(1)?.toIntOrNull()?.let { return it }
-    val normalized = slug.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
-    for ((word, num) in ARABIC_ORDINALS) {
-        if (normalized.contains("الموسم-$word") || normalized.contains("موسم-$word") ||
-            normalized.contains("الموسم-$word-") || normalized.contains("موسم-$word-")
-        ) return num
-    }
-    return -1
-}
-
-/** URLs that are ads/trackers, never players. */
-private val BLOCKED_EMBED_KEYWORDS = listOf(
-    "recaptcha", "googlesyndication", "googletagmanager", "google-analytics",
-)
-
-/** Stage diagnostics surfaced via StreamlyDiag (logcat only; toasts removed). */
-private fun egydeadStage(msg: String) {
-    StreamlyDiag.lastStage = "EgyDead: $msg"
-}
-
-private fun egydeadActivity(): android.app.Activity? =
-    StreamlyRuntime.context as? android.app.Activity
-
-/**
- * WebView-native GET for EgyDead: its edge re-challenges OkHttp even with
- * valid clearance (TLS fingerprint wall), so page loads go through a hidden
- * WebView that shares the cleared cookie store. Falls back to OkHttp.
- */
-private suspend fun egydeadWebText(
-    url: String,
-    referer: String? = null,
-    timeout: Long = 45000,
-): String {
-    val activity = egydeadActivity()
-    if (activity != null) {
-        if (!cfCookies(url).contains("cf_clearance")) cfSolve(url)
-        val html = cfSolveLock.withLock { CloudflareSolver.fetchPage(activity, url, CF_UA, timeout) }
-        if (!html.isNullOrBlank() && !isCfChallenge(html)) {
-            Log.d(EGYDEAD_TAG, "[webget ] DOM for $url (${html.length} chars)")
-            return html
-        }
-        Log.d(EGYDEAD_TAG, "[webget ] fallback to OkHttp for $url")
-    }
-    return cfGetText(url, referer = referer, timeout = 15000)
-}
-
-/** WebView-native POST for EgyDead's ?view=watch View=1 endpoint. */
-private suspend fun egydeadWebPost(
-    url: String,
-    data: Map<String, String>,
-    referer: String?,
-    timeout: Long = 45000,
-): String {
-    val activity = egydeadActivity()
-    if (activity != null) {
-        if (!cfCookies(url).contains("cf_clearance")) cfSolve(url)
-        val text = cfSolveLock.withLock { CloudflareSolver.postPage(activity, url, data, referer, CF_UA, timeout) }
-        // A bare "{}" (Promise mis-fire) or any thin fragment carries no
-        // servers — fall through to OkHttp instead of parsing nothing.
-        val hasMarkers = text?.contains("serversList", ignoreCase = true) == true ||
-            text?.contains("data-link", ignoreCase = true) == true ||
-            text?.contains("<iframe", ignoreCase = true) == true
-        if (!text.isNullOrBlank() && !isCfChallenge(text) && (text.length > 1000 || hasMarkers)) {
-            Log.d(EGYDEAD_TAG, "[webpost] ${text.length} chars from $url")
-            return text
-        }
-        val snippet = text?.replace(Regex("\\s+"), " ")?.take(120).orEmpty()
-        Log.d(EGYDEAD_TAG, "[webpost] thin/invalid (${text?.length ?: -1} chars snippet='$snippet'), fallback to OkHttp for $url")
-    }
-    return cfPostText(
-        url,
-        data = data,
-        referer = referer,
-        headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-        timeout = 20000,
-    )
-}
-
-suspend fun invokeEgydead(
-    res: LinkData,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit,
-): Boolean {
-    val title = res.title?.trim().orEmpty()
-    Log.d(EGYDEAD_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
-    egydeadStage("start")
-    if (title.isEmpty()) return false
-
-    var emitted = 0
-    val countingCallback: (ExtractorLink) -> Unit = { emitted++; callback(it) }
-
-    return try {
-        val ok = if (res.isMovie) {
-            egydeadResolveMovie(title, res.year, subtitleCallback, countingCallback)
-        } else {
-            egydeadResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, countingCallback)
-        }
-        Log.d(EGYDEAD_TAG, "[done  ] emitted=$emitted")
-        egydeadStage(if (emitted > 0) "ok ($emitted links)" else "no links")
-        ok || emitted > 0
-    } catch (e: Exception) {
-        Log.e(EGYDEAD_TAG, "[invoke] failed: ${e.message}")
-        egydeadStage("error ${e.message}")
-        emitted > 0
-    }
-}
-
-/**
- * Searches up to [maxPages] result pages. The entry domain redirects to the
- * current mirror; subsequent pages reuse the discovered origin.
- */
-private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candidate> {
-    val out = ArrayList<Candidate>()
-    val encoded = URLEncoder.encode(query, "UTF-8")
-    // Entry seed first, then the last known-good mirror: entry domains get
-    // blocked while mirrors serve fine (and mirrors rotate over time).
-    val seeds = linkedSetOf(egydeadBase(), EGYDEAD_KNOWN_MIRROR)
-    for (seed in seeds) {
-    val base = seed
-    for (page in 1..maxPages) {
-        val url = if (page == 1) "$base/?s=$encoded" else "$base/page/$page/?s=$encoded"
-        try {
-            val html = egydeadWebText(url, timeout = 45000)
-            if (html.isBlank() || isCfChallenge(html)) {
-                val host = runCatching { java.net.URI(url).host }.getOrDefault("?")
-                Log.w(EGYDEAD_TAG, "[search ] page $page CF challenge / empty for $url")
-                egydeadStage("cf challenge @ $host")
-                break
-            }
-            val doc = Jsoup.parse(html, url)
-            var added = 0
-            // Primary: upstream selector (re-3arabi Egydead search():
-            // ul.posts-list li.movieItem, title in h1.BottomTitle).
-            val cards = doc.select("ul.posts-list li.movieItem")
-            Log.d(EGYDEAD_TAG, "[search ] page $page cards=${cards.size} url=$url")
-            for (card in cards) {
-                val a = card.selectFirst("a[href]") ?: continue
-                var href = a.absUrl("href").ifEmpty { a.attr("href").trim() }
-                if (href.isBlank()) continue
-                if (!href.startsWith("http")) href = fixUrl(href, url)
-                if (!href.startsWith("http")) continue
-                if (Regex("""/(category|tag|page|quality|type|language|series-category|episode)/?$""").containsMatchIn(href)) continue
-                val slug = decodeSlug(href)
-                if (slug.isBlank()) continue
-                val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-                if (candidate.latinTitle.isBlank()) continue
-                if (out.any { it.url == href }) continue
-                out.add(candidate)
-                added++
-            }
-            // Fallback: generic anchors (old behavior) only when the site
-            // markup drifted and no cards matched. Host check dropped:
-            // mirrors/cdn subdomains failed exact equality and wiped results.
-            if (added == 0) {
-                val host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty()
-                for (a in doc.select("a[href]")) {
-                    var href = a.absUrl("href").ifEmpty { a.attr("href").trim() }
-                    if (href.isBlank()) continue
-                    if (!href.startsWith("http")) href = fixUrl(href, url)
-                    if (!href.startsWith("http")) continue
-                    val hrefHost = runCatching { java.net.URI(href).host }.getOrNull() ?: continue
-                    if (!hrefHost.equals(host, ignoreCase = true) && !hrefHost.contains("egydead", ignoreCase = true)) continue
-                    if (Regex("""/(category|tag|page|quality|type|language|series-category|episode)/?$""").containsMatchIn(href)) continue
-                    val slug = decodeSlug(href)
-                    if (slug.isBlank()) continue
-                    val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-                    if (candidate.latinTitle.isBlank()) continue
-                    if (out.any { it.url == href }) continue
-                    out.add(candidate)
-                    added++
-                }
-            }
-            Log.d(EGYDEAD_TAG, "[search ] page $page -> +$added (${out.size} total)")
-            if (added == 0) break
-        } catch (e: Exception) {
-            Log.e(EGYDEAD_TAG, "[search ] page $page failed: ${e.message}")
-            egydeadStage("search failed: ${e.message}")
-            break
-        }
-        } // pages
-        if (out.isNotEmpty()) {
-            if (seed != seeds.first()) {
-                egydeadLiveBase = seed
-                originCache[EGYDEAD_ENTRY_URL] = seed
-                Log.d("StreamlyMirror", "egydeadSearch working base: $seed")
-            }
-            break
-        }
-        Log.d(EGYDEAD_TAG, "[search ] seed $seed yielded nothing, trying next")
-    } // seeds
-    if (out.isEmpty()) egydeadStage("search empty")
-    return out
-}
-
-/**
- * EgyDead WordPress REST discovery: /wp-json/wp/v2/search returns exact
- * post URLs + Arabic titles (e.g. moana-2026-1080p-web-dl). Fetched through
- * the WebView transport like everything else EgyDead. Merged with the HTML
- * search pool; HTML stays as fallback.
- */
-private suspend fun egydeadApiSearch(query: String): List<Candidate> {
-    val out = ArrayList<Candidate>()
-    val encoded = URLEncoder.encode(query, "UTF-8")
-    val seeds = linkedSetOf(egydeadBase(), EGYDEAD_KNOWN_MIRROR)
-    for (seed in seeds) {
-        val endpoint = "$seed/wp-json/wp/v2/search?search=$encoded&per_page=100"
-        try {
-            val html = egydeadWebText(endpoint, timeout = 45000)
-            val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
-            if (jsonText.isBlank()) continue
-            val arr = org.json.JSONArray("[$jsonText]")
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                var href = o.optString("url").trim()
-                if (href.isBlank()) continue
-                if (!href.startsWith("http")) href = fixUrl(href, seed)
-                if (!href.startsWith("http")) continue
-                val slug = decodeSlug(href)
-                if (slug.isBlank()) continue
-                val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-                if (candidate.latinTitle.isBlank()) continue
-                if (out.any { it.url == href }) continue
-                out.add(candidate)
-            }
-            Log.d(EGYDEAD_TAG, "[api    ] $endpoint -> ${out.size} total")
-            if (out.isNotEmpty()) break
-        } catch (e: Exception) {
-            Log.e(EGYDEAD_TAG, "[api    ] $endpoint failed: ${e.message}")
-        }
-    }
-    return out
-}
-
-/** Shared fuzzy score plus EgyDead slug preferences: dubbed posts sink,
- *  subtitled (مترجم) posts get a nudge. */
-private fun egydeadScore(candidate: Candidate, title: String, year: Int?): Int {
-    var score = scoreCandidate(candidate, title, year)
-    if (candidate.slug.contains("مدبلج")) score -= 10
-    else if (candidate.slug.contains("مترجم")) score += 5
-    return score
-}
-
-private suspend fun egydeadExtract(
-    postUrl: String,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit,
-    title: String? = null,
-    year: Int? = null,
-    depth: Int = 0,
-): Boolean = coroutineScope {
-    // Mirrors re-3arabi EgyDead: priming GET, then POST to ?view=watch with View=1 + X-Requested-With,
-    // fallback to GET if POST fails. See Egydead egydeadProvider.kt loadLinks.
-    val originalUrl = postUrl
-    val watchPageUrl = if (!postUrl.contains("?view=watch")) "$postUrl?view=watch" else postUrl
-    val primeDoc = runCatching { Jsoup.parse(egydeadWebText(originalUrl, timeout = 45000), originalUrl) }.getOrNull()
-    // Collection pages (/assembly/…, franchise hubs) carry no watch servers:
-    // they list the films in div.salery-list (upstream load() pattern).
-    // Descend into the best /film/ item instead of failing with no servers.
-    if (depth == 0 && primeDoc != null) {
-        val films = primeDoc.select("div.salery-list ul li.movieItem a[href]")
-            .mapNotNull { a ->
-                val href = a.absUrl("href").ifEmpty { a.attr("href").trim() }
-                if (!href.startsWith("http") || !href.contains("/film/")) return@mapNotNull null
-                val slug = decodeSlug(href)
-                Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
-            }
-        if (films.isNotEmpty() && title != null) {
-            val bestFilm = films.map { it to egydeadScore(it, title, year) }
-                .maxByOrNull { it.second }
-            Log.d(EGYDEAD_TAG, "[collect] ${films.size} films on $postUrl best=${bestFilm?.first?.url} score=${bestFilm?.second}")
-            if (bestFilm != null && bestFilm.second >= MIN_SCORE_MOVIE) {
-                return@coroutineScope egydeadExtract(bestFilm.first.url, subtitleCallback, callback, title, year, depth = 1)
-            }
-        }
-    }
-    val html = try {
-        egydeadWebPost(
-            watchPageUrl,
-            data = mapOf("View" to "1"),
-            referer = originalUrl,
-            timeout = 45000
-        )
-    } catch (e: Exception) {
-        Log.e(EGYDEAD_TAG, "[watch  ] View=1 POST failed: ${e.message}, trying fallback GET $watchPageUrl")
-        try {
-            egydeadWebText(watchPageUrl, referer = originalUrl, timeout = 45000)
-        } catch (e2: Exception) {
-            Log.e(EGYDEAD_TAG, "[watch  ] fallback GET failed: ${e2.message}")
-            ""
-        }
-    }
-    if (html.isBlank()) return@coroutineScope false
-
-    val doc = Jsoup.parse(html, watchPageUrl)
-    // url -> server label (so we can special-case EarnVids/StreamHG)
-    val watchEmbeds = LinkedHashSet<Pair<String, String>>()
-    // download URL -> quality label from the site's <em>1080p</em> markers
-    val downloadCandidates = LinkedHashMap<String, String>()
-
-    fun serverLabel(el: Element): String =
-        el.selectFirst(".ser-name, p, .server-info")?.text()?.trim().orEmpty()
-
-    fun collect(d: Document) {
-        // Watch server lists (data-link carries the embed URL). Mirrors re-3arabi watchSelectors.
-        for (sel in listOf(
-            "ul.serversList li",
-            "ul.servers-list li",
-            "div.serversList li",
-            "div.servers-list li",
-        )) {
-            d.select(sel).forEach { li ->
-                val dataLink = li.attr("data-link").takeIf { it.isNotBlank() }
-                val childDataLink = li.selectFirst("[data-link]")?.attr("data-link")
-                val hrefFromBtn = li.selectFirst("button[data-link]")?.attr("data-link")
-                val hrefFromA = li.selectFirst("a[href]")?.attr("href")
-                val link = dataLink ?: childDataLink ?: hrefFromBtn ?: hrefFromA ?: ""
-                if (link.startsWith("http")) watchEmbeds.add(link to serverLabel(li))
-            }
-        }
-
-        // Generic: any <a> pointing at a player/embed/drive host.
-        val playerHostRegex = Regex("""(player|embed|drive|load|watch|wish|vid)\b""", RegexOption.IGNORE_CASE)
-        d.select("a[href]").forEach { a ->
-            val href = a.absUrl("href").ifEmpty { a.attr("href") }
-            if (href.startsWith("http") && playerHostRegex.containsMatchIn(href)) {
-                watchEmbeds.add(href to serverLabel(a))
-            }
-        }
-
-        // Download lists (multi-quality direct/file-host links).
-        for (sel in listOf(
-            "ul.donwload-servers-list li",
-            "ul.download-servers-list li",
-            "ul.donwload-servers-list > li",
-            "div.donwload-servers-list li",
-            "div.download-servers-list li",
-        )) {
-            d.select(sel).forEach { li ->
-                val link = li.selectFirst("a.ser-link")?.attr("href")
-                    ?: li.selectFirst("a[href]")?.attr("href")
-                    ?: li.attr("data-link")
-                if (!link.startsWith("http")) return@forEach
-                val quality = li.selectFirst(".server-info em")?.text()?.trim()
-                    ?: li.selectFirst("em")?.text()?.trim()
-                downloadCandidates.putIfAbsent(link, quality.orEmpty())
-            }
-        }
-
-        // Generic fallback: any remaining data-link carriers.
-        d.select("[data-link]").forEach { el ->
-            val link = el.attr("data-link")
-            if (link.startsWith("http")) watchEmbeds.add(link to serverLabel(el))
-        }
-    }
-    collect(doc)
-
-    // POST can return a valid-but-serverless fragment while the watch page
-    // GET renders the lists — merge the GET fallback instead of emitting 0.
-    if (watchEmbeds.isEmpty() && downloadCandidates.isEmpty()) {
-        val fb = runCatching { egydeadWebText(watchPageUrl, referer = originalUrl, timeout = 45000) }.getOrNull()
-        if (!fb.isNullOrBlank() && !isCfChallenge(fb)) {
-            Log.d(EGYDEAD_TAG, "[watch  ] POST yielded nothing, GET fallback ${fb.length} chars")
-            collect(Jsoup.parse(fb, watchPageUrl))
-        }
-    }
-
-    val filteredWatch = watchEmbeds.filter { (embed, _) ->
-        BLOCKED_EMBED_KEYWORDS.none { embed.contains(it, ignoreCase = true) }
-    }
-
-    // Cross-section dedup: download list often repeats watch embeds.
-    val watchUrls = filteredWatch.map { it.first }.toSet()
-    val filteredDownloads = downloadCandidates.filterKeys { it !in watchUrls }
-
-    Log.d(EGYDEAD_TAG, "[watch  ] ${filteredWatch.size} embeds + ${filteredDownloads.size} download links on $postUrl (deduped ${downloadCandidates.size - filteredDownloads.size})")
-    if (filteredWatch.isEmpty() && filteredDownloads.isEmpty()) {
-        egydeadStage("no servers on page")
-    }
-
-    val jobs = ArrayList<suspend () -> Unit>(filteredWatch.size + filteredDownloads.size)
-    filteredWatch.forEach { (embed, label) ->
-        if (label.contains("earnvids", true) || label.contains("streamhg", true)) {
-            // Custom HLS resolver for EarnVids/StreamHG (packed player, enc m3u8).
-            jobs += suspend {
-                val m3u8 = ExternalEarnVidsExtractor.extract(embed, postUrl)
-                if (!m3u8.isNullOrBlank()) {
-                    // Single adaptive link — no quality list.
-                    callback(
-                        newExtractorLink("EgyDead - $label", "EgyDead - $label", url = m3u8) {
-                            this.referer = embed
-                            this.quality = Qualities.Unknown.value
-                            this.type = ExtractorLinkType.M3U8
-                        },
-                    )
-                } else {
-                    EmbedRouter.route(embed, postUrl, subtitleCallback, callback, "EgyDead")
-                }
-            }
-        } else {
-            jobs += suspend { EmbedRouter.route(embed, postUrl, subtitleCallback, callback, "EgyDead") }
-        }
-    }
-    // Download links: raw video files (.mp4/.mkv) are emitted directly with
-    // their quality label; everything else (file-lockers) only counts if an
-    // extractor can resolve it (shared plugin registry: Dood/EarnVids/etc.).
-    val directFileRegex = Regex("""\.(mp4|mkv)([?#].*)?$""", RegexOption.IGNORE_CASE)
-    filteredDownloads.forEach { (link, quality) ->
-        if (directFileRegex.containsMatchIn(link)) {
-            jobs += suspend {
-                val label = buildString {
-                    append("EgyDead")
-                    if (quality.isNotBlank()) append(" - $quality")
-                }
-                callback(newExtractorLink(label, label, url = link) {
-                    this.referer = postUrl
-                    this.quality = getQualityFromName(link)
-                    this.type = ExtractorLinkType.VIDEO
-                })
-            }
-        } else {
-            jobs += suspend {
-                runCatching {
-                    // Single simple link per locker: keep the first built-in
-                    // result, drop per-quality repeats.
-                    var emittedLink = false
-                    loadExtractor(link, postUrl, subtitleCallback, { l ->
-                        if (!emittedLink) {
-                            emittedLink = true
-                            callback(relabelLink(l, "EgyDead"))
-                        }
-                    })
-                }
-            }
-        }
-    }
-
-    jobs.amap { job -> async { job() } }.awaitAll()
-    filteredWatch.isNotEmpty() || downloadCandidates.isNotEmpty()
-}
-
-private suspend fun egydeadResolveMovie(
-    title: String,
-    year: Int?,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit,
-): Boolean {
-    val pool = (egydeadSearch(title) + egydeadApiSearch(title)).distinctBy { it.url }
-    val scored = pool.map { it to egydeadScore(it, title, year) }
-    Log.d(EGYDEAD_TAG, "[search ] movie '$title' year=$year -> ${scored.size} candidates")
-    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
-        Log.d(EGYDEAD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} ${c.url}")
-    }
-    // Collection hubs (/assembly/…) outscore the film itself (bare latin title,
-    // no year penalty) but carry no servers — only consider them as fallback,
-    // egydeadExtract descends into their best /film/ item.
-    val direct = scored.filter { (c, _) ->
-        !c.url.contains("/episode/") && !c.url.contains("/assembly/") &&
-            !c.url.contains("/season/") && !c.url.contains("/serie")
-    }
-    val best = direct.filter { it.second >= MIN_SCORE_MOVIE }
-        .maxByOrNull { it.second }?.first
-        ?: scored.filter { it.second >= MIN_SCORE_MOVIE }
-            .maxByOrNull { it.second }?.first
-    if (best == null) {
-        val top = scored.maxByOrNull { it.second }
-        Log.d(EGYDEAD_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
-        egydeadStage("no match (${scored.size} cands, best ${top?.second})")
-        return false
-    }
-    Log.d(EGYDEAD_TAG, "[match  ] WINNER ${best.url}")
-    return egydeadExtract(best.url, subtitleCallback, callback, title, year)
-}
-
-private suspend fun egydeadResolveEpisode(
-    title: String,
-    season: Int,
-    episode: Int,
-    year: Int?,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit,
-): Boolean {
-    // Preferred path: search results include per-season pages
-    // (/season/…الموسم-N…) that list every episode with الحلقة-N numbering.
-    val results = (egydeadSearch(title) + egydeadApiSearch(title)).distinctBy { it.url }
-    val seasonPage = results
-        .filter { it.url.contains("/season/") }
-        .map { it to egydeadSeasonFromSlug(it.slug) }
-        .firstOrNull { (_, s) -> s == season }?.first
-
-    if (seasonPage != null) {
-        Log.d(EGYDEAD_TAG, "[season ] page ${seasonPage.url}")
-        val doc = Jsoup.parse(egydeadWebText(seasonPage.url, timeout = 45000), seasonPage.url)
-        for (a in doc.select("a[href]")) {
-            val href = a.absUrl("href").ifEmpty { a.attr("href") }
-            if (!href.contains("/episode/")) continue
-            val slug = decodeSlug(href)
-            val ep = EPISODE_REGEX.find(slug)?.groupValues?.get(1)?.toIntOrNull() ?: continue
-            if (ep != episode) continue
-            val slugSeason = egydeadSeasonFromSlug(slug)
-            if (slugSeason != -1 && slugSeason != season) continue
-            Log.d(EGYDEAD_TAG, "[match  ] WINNER S${season}E${episode} $href")
-            return egydeadExtract(href, subtitleCallback, callback, title, year)
-        }
-        Log.d(EGYDEAD_TAG, "[match  ] E$episode not on S$season page")
-        egydeadStage("ep $episode missing on S$season page")
-        return false
-    }
-
-    // Fallback: shows using Latin -sXXeXX episode slugs.
-    val match = results
-        .filter { EGYDEAD_EPISODE_URL_REGEX.containsMatchIn(decodeSlug(it.url)) }
-        .mapNotNull { c ->
-            val m = EGYDEAD_EPISODE_URL_REGEX.find(decodeSlug(c.url)) ?: return@mapNotNull null
-            val s = m.groupValues[1].toIntOrNull() ?: return@mapNotNull null
-            val e = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
-            val score = egydeadScore(c, title, year)
-            Triple(c, s to e, score)
-        }
-        .filter { (_, se, score) -> se.first == season && se.second == episode && score >= MIN_SCORE_SERIES }
-        .maxByOrNull { it.third }?.first
-    if (match == null) {
-        Log.d(EGYDEAD_TAG, "[match  ] S${season}E$episode not found in search results")
-        egydeadStage("S${season}E$episode not found (${results.size} cands)")
-        return false
-    }
-    Log.d(EGYDEAD_TAG, "[match  ] WINNER ${match.url}")
-    return egydeadExtract(match.url, subtitleCallback, callback, title, year)
-}
-
 // ===========================================================================
 // FaselHD (fasel-hd.co) link source.
 //
@@ -2164,6 +1564,7 @@ private suspend fun faselHdEmitResolved(
     iframe: String,
     base: String,
     callback: (ExtractorLink) -> Unit,
+    label: String = "FaselHD",
 ) {
     if (m3u8.contains("master.m3u8", ignoreCase = true)) {
         // Emit the adaptive master only. Expanding it via generateM3u8
@@ -2175,7 +1576,7 @@ private suspend fun faselHdEmitResolved(
         // lets ExoPlayer adapt and cuts preview fetches to one.
         Log.d(FASELHD_TAG, "[watch  ] master playlist, emitting single adaptive link")
         callback(
-            newExtractorLink("FaselHD", "FaselHD", url = m3u8) {
+            newExtractorLink(label, label, url = m3u8) {
                 this.referer = iframe
                 this.quality = Qualities.Unknown.value
                 this.type = ExtractorLinkType.M3U8
@@ -2188,7 +1589,7 @@ private suspend fun faselHdEmitResolved(
         )
     } else {
         generateM3u8(
-            "FaselHD",
+            label,
             m3u8,
             referer = iframe,
             headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
@@ -2271,7 +1672,10 @@ private suspend fun faselHdExtractServers(
     Log.d(FASELHD_TAG, "[watch  ] ${iframes.size} iframes hosts=$iframeHosts on $postUrl")
     if (iframes.isEmpty()) StreamlyDiag.lastStage = "FaselHD: 0 iframes"
     var resolved = false
-    // Pass 1: WebView resolve (handles enc: payloads).
+    val resolvedIdx = HashSet<Int>()
+    // Pass 1: WebView resolve (handles enc: payloads). Every watch server
+    // (سيرفر المشاهدة #01/#02 → distinct player_tokens) is resolved on its
+    // own and emitted with its server label — no early break.
     for ((idx, iframe) in iframes.withIndex()) {
         val t0 = SystemClock.elapsedRealtime()
         val m3u8 = faselHdResolveWebView(iframe, postUrl)
@@ -2279,49 +1683,49 @@ private suspend fun faselHdExtractServers(
             Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
             found = true
             resolved = true
-            faselHdEmitResolved(m3u8, iframe, base, callback)
-            break // first working server is enough
+            resolvedIdx.add(idx)
+            faselHdEmitResolved(m3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
+        } else {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms")
         }
-        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms")
     }
-    // Pass 2 (fallback): cheap inline scan across all iframes for
-    // non-encrypted embeds. Also reports enc: presence: the decryptor keys
+    // Pass 2 (fallback): cheap inline scan for the servers the WebView
+    // missed (non-encrypted embeds). Also reports enc: presence: the decryptor keys
     // are already ported into the WebView strategy JS, so a static enc: blob
     // here would mean the WebView (~10s) can be replaced with plain HTTP.
-    if (!resolved) {
-        for ((idx, iframe) in iframes.withIndex()) {
-            val t0 = SystemClock.elapsedRealtime()
-            val scanned = try {
-                cfGetText(iframe, referer = postUrl, timeout = 15000)
-                    .replace(Regex("""['"]\s*\+\s*['"]"""), "")
-            } catch (_: Exception) {
-                ""
-            }
-            val encCount = Regex("""enc:""").findAll(scanned).count()
-            val fastM3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(scanned)?.value
-            if (!fastM3u8.isNullOrBlank()) {
-                Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan HIT enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
-                found = true
-                resolved = true
-                faselHdEmitResolved(fastM3u8, iframe, base, callback)
-                break
-            }
-            val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
-            if (!fastMp4.isNullOrBlank()) {
-                Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan MP4 enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
-                found = true
-                resolved = true
-                callback(
-                    newExtractorLink("FaselHD MP4", "FaselHD MP4", fastMp4) {
-                        this.referer = iframe
-                        this.quality = getQualityFromName(fastMp4)
-                        this.type = ExtractorLinkType.VIDEO
-                    },
-                )
-                break
-            }
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan miss enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+    for ((idx, iframe) in iframes.withIndex()) {
+        if (idx in resolvedIdx) continue
+        val t0 = SystemClock.elapsedRealtime()
+        val scanned = try {
+            cfGetText(iframe, referer = postUrl, timeout = 15000)
+                .replace(Regex("""['"]\s*\+\s*['"]"""), "")
+        } catch (_: Exception) {
+            ""
         }
+        val encCount = Regex("""enc:""").findAll(scanned).count()
+        val fastM3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(scanned)?.value
+        if (!fastM3u8.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan HIT enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+            found = true
+            resolved = true
+            faselHdEmitResolved(fastM3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
+            continue
+        }
+        val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
+        if (!fastMp4.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan MP4 enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+            found = true
+            resolved = true
+            callback(
+                newExtractorLink("FaselHD - Server ${idx + 1} MP4", "FaselHD - Server ${idx + 1} MP4", fastMp4) {
+                    this.referer = iframe
+                    this.quality = getQualityFromName(fastMp4)
+                    this.type = ExtractorLinkType.VIDEO
+                },
+            )
+            continue
+        }
+        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan miss enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
     }
     Log.d(FASELHD_TAG, "[watch  ] resolve done in ${SystemClock.elapsedRealtime() - tWatch}ms resolved=$resolved")
 
