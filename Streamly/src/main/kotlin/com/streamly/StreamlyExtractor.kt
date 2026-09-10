@@ -1305,14 +1305,23 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
         val url = if (page == 1) "$base/?s=$encoded" else "$base/page/$page/?s=$encoded"
         try {
             val html = cfGetText(url, timeout = 15000)
+            if (html.isBlank() || isCfChallenge(html)) {
+                Log.w(EGYDEAD_TAG, "[search ] page $page CF challenge / empty for $url")
+                StreamlyDiag.lastStage = "EgyDead: cf challenge"
+                break
+            }
             val doc = Jsoup.parse(html, url)
-            val host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty()
-            val anchors = doc.select("a[href]")
             var added = 0
-            for (a in anchors) {
-                val href = a.absUrl("href").ifEmpty { a.attr("href") }
-                val hrefHost = runCatching { java.net.URI(href).host }.getOrNull()
-                if (hrefHost == null || !hrefHost.equals(host, ignoreCase = true)) continue
+            // Primary: upstream selector (re-3arabi Egydead search():
+            // ul.posts-list li.movieItem, title in h1.BottomTitle).
+            val cards = doc.select("ul.posts-list li.movieItem")
+            Log.d(EGYDEAD_TAG, "[search ] page $page cards=${cards.size} url=$url")
+            for (card in cards) {
+                val a = card.selectFirst("a[href]") ?: continue
+                var href = a.absUrl("href").ifEmpty { a.attr("href").trim() }
+                if (href.isBlank()) continue
+                if (!href.startsWith("http")) href = fixUrl(href, url)
+                if (!href.startsWith("http")) continue
                 if (Regex("""/(category|tag|page|quality|type|language|series-category|episode)/?$""").containsMatchIn(href)) continue
                 val slug = decodeSlug(href)
                 if (slug.isBlank()) continue
@@ -1321,6 +1330,28 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
                 if (out.any { it.url == href }) continue
                 out.add(candidate)
                 added++
+            }
+            // Fallback: generic anchors (old behavior) only when the site
+            // markup drifted and no cards matched. Host check dropped:
+            // mirrors/cdn subdomains failed exact equality and wiped results.
+            if (added == 0) {
+                val host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty()
+                for (a in doc.select("a[href]")) {
+                    var href = a.absUrl("href").ifEmpty { a.attr("href").trim() }
+                    if (href.isBlank()) continue
+                    if (!href.startsWith("http")) href = fixUrl(href, url)
+                    if (!href.startsWith("http")) continue
+                    val hrefHost = runCatching { java.net.URI(href).host }.getOrNull() ?: continue
+                    if (!hrefHost.equals(host, ignoreCase = true) && !hrefHost.contains("egydead", ignoreCase = true)) continue
+                    if (Regex("""/(category|tag|page|quality|type|language|series-category|episode)/?$""").containsMatchIn(href)) continue
+                    val slug = decodeSlug(href)
+                    if (slug.isBlank()) continue
+                    val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+                    if (candidate.latinTitle.isBlank()) continue
+                    if (out.any { it.url == href }) continue
+                    out.add(candidate)
+                    added++
+                }
             }
             Log.d(EGYDEAD_TAG, "[search ] page $page -> +$added (${out.size} total)")
             if (added == 0) break
@@ -1502,7 +1533,12 @@ private suspend fun egydeadResolveMovie(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val best = egydeadSearch(title).map { it to scoreCandidate(it, title, year) }
+    val scored = egydeadSearch(title).map { it to scoreCandidate(it, title, year) }
+    Log.d(EGYDEAD_TAG, "[search ] movie '$title' year=$year -> ${scored.size} candidates")
+    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
+        Log.d(EGYDEAD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} ${c.url}")
+    }
+    val best = scored
         .filter { (c, s) -> !c.url.contains("/episode/") && s >= MIN_SCORE_MOVIE }
         .maxByOrNull { it.second }?.first
     if (best == null) {
