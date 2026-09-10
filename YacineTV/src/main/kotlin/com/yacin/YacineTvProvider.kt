@@ -379,7 +379,7 @@ class YacineTvProvider : MainAPI() {
                     } ?: return@async emptyList()
                     val subChannels = getChannels(morocco.id)
                     if (subChannels.isEmpty()) return@async emptyList()
-                    listOfNotNull(channelRow("Morocco", subChannels))
+                    listOfNotNull(channelRow("Morocco", subChannels, moroccoThumbs))
                 }
             }.awaitAll().flatten()
 
@@ -491,8 +491,28 @@ class YacineTvProvider : MainAPI() {
         return bmp
     }
 
+    /** Official snrtlive.ma vignette arts for the SNRT channels
+     * (verified 200; ~5-7 KB each). Other Morocco entries (2M, Medi 1,
+     * Télé Maroc) keep API logos. Keys are normalized channel names. */
+    private val moroccoThumbs = mapOf(
+        "al aoula" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-03/alaoula-16x9.jpeg",
+        "laayoune" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/laayoune-16x9.jpeg",
+        "arryadia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/arriyadia-16x9.jpeg",
+        "arryadia tv" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/arriyadia-16x9.jpeg",
+        "athaqafia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/attakafiya-16x9.jpeg",
+        "athaqafia tv" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/attakafiya-16x9.jpeg",
+        "al maghribia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/almaghribia-16x9.jpeg",
+        "assadissa" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/assadissa-16x9.jpeg",
+        "tamazight" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/tamazight-16x9.jpeg",
+        "tamazight tv" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/tamazight-16x9.jpeg",
+    )
+
     /** Single horizontal channel row, deduped by normalized name. API logos as-is. */
-    private suspend fun channelRow(title: String, channels: List<YacineChannel>): HomePageList? {
+    private suspend fun channelRow(
+        title: String,
+        channels: List<YacineChannel>,
+        thumbOverrides: Map<String, String>? = null,
+    ): HomePageList? {
         val seen = linkedMapOf<String, YacineChannel>()
         channels.forEach { ch ->
             val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
@@ -501,7 +521,8 @@ class YacineTvProvider : MainAPI() {
         val items = seen.values.mapNotNull { ch ->
             val cid = ch.id ?: return@mapNotNull null
             val nm = ch.name?.trim() ?: return@mapNotNull null
-            val logo = ch.logo?.takeIf { it.isNotBlank() }
+            val logo = thumbOverrides?.get(normalizeName(nm))?.takeIf { it.isNotBlank() }
+                ?: ch.logo?.takeIf { it.isNotBlank() }
             val data = LinkData(
                 kind = "channel",
                 ids = listOf(cid),
@@ -576,7 +597,12 @@ class YacineTvProvider : MainAPI() {
                 val key = "c:${normalizeName(nm)}"
                 val cur = mergedHits[key]
                 if (cur == null) {
-                    mergedHits[key] = SearchHit(nm, ch.logo, mutableListOf(cid))
+                    mergedHits[key] = SearchHit(
+                        nm,
+                        moroccoThumbs[normalizeName(nm)]?.takeIf { it.isNotBlank() }
+                            ?: ch.logo,
+                        mutableListOf(cid),
+                    )
                 } else {
                     if (!cur.ids.contains(cid)) cur.ids.add(cid)
                     if (cur.poster.isNullOrBlank() && !ch.logo.isNullOrBlank()) cur.poster = ch.logo
@@ -761,9 +787,13 @@ class YacineTvProvider : MainAPI() {
                 ?: return false
             // The CDN gates playlists (token_authentication): sign the URL
             // first (token endpoint needs no auth). Unsigned -> 403.
-            val signed = signEasyBroadcast(stream, pageUrl) ?: return false
+            val signedMaster = signEasyBroadcast(stream, pageUrl) ?: return false
+            // Players resolve relative variant URLs against the master and
+            // drop the ?token query -> 403 on variants. Emit the signed best
+            // variant instead; .ts segments play ungated.
+            val playable = bestSignedVariant(signedMaster, pageUrl) ?: signedMaster
             callback.invoke(
-                newExtractorLink(this.name, "$channelName • SNRT", signed) {
+                newExtractorLink(this.name, "$channelName • SNRT", playable) {
                     this.headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl)
                     this.referer = pageUrl
                     this.quality = Qualities.Unknown.value
@@ -789,6 +819,37 @@ class YacineTvProvider : MainAPI() {
             if (!res.contains("token=") || !res.contains("expires=")) return@runCatching null
             val sep = if ("?" in streamUrl) "&" else "?"
             "$streamUrl$sep$res"
+        }.getOrNull()
+    }
+
+    /** Fetches the signed master playlist, picks the highest-bandwidth
+     * variant and returns it freshly signed. Null when anything fails
+     * (caller falls back to the signed master). */
+    private suspend fun bestSignedVariant(signedMasterUrl: String, pageUrl: String): String? {
+        return runCatching {
+            val master = app.get(
+                signedMasterUrl,
+                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
+                timeout = 10,
+            ).text
+            if ("#EXTM3U" !in master) return@runCatching null
+            var bestUri: String? = null
+            var bestBw = -1
+            val lines = master.lines()
+            for (i in lines.indices) {
+                val bw = Regex("""BANDWIDTH=(\d+)""").find(lines[i])
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: continue
+                val uri = lines.getOrNull(i + 1)?.trim()
+                    ?.takeIf { it.isNotEmpty() && !it.startsWith("#") } ?: continue
+                if (bw > bestBw) {
+                    bestBw = bw
+                    bestUri = uri
+                }
+            }
+            val rel = bestUri ?: return@runCatching null
+            val abs = if (rel.startsWith("http")) rel
+            else join(signedMasterUrl.substringBeforeLast("/"), rel)
+            signEasyBroadcast(abs, pageUrl)
         }.getOrNull()
     }
 

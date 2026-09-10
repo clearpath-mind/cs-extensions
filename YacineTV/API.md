@@ -159,10 +159,16 @@ detail hero shows the same homepage banner thumbnail.
   channels (`snrtlive.ma` pages, `url_type` 5) resolve via the EasyBroadcast
   slug (`extractEasyBroadcastSlug` tries several markup variants) and the
   stream URL is signed via `GET https://token.easybroadcast.io/all?url=...`
-  (CDN has `token_authentication: true`; unsigned playlists 403).
-  Generic extractor attempt remains as last resort. Medi 1 embeds serve a
-  JWPlayer page with no static file URL and Télé Maroc is a multi-iframe
-  portal, so those go through the extractor registry and may fail upstream.
+  (CDN has `token_authentication: true`; unsigned playlists 403). Players
+  drop the `?token` query on relative variant URLs, so the provider emits
+  the signed best variant (`bestSignedVariant()`, highest `BANDWIDTH`);
+  `.ts` segments play ungated. Generic extractor attempt remains as last
+  resort. Medi 1 embeds serve a JWPlayer page with no static file URL and
+  Télé Maroc is a multi-iframe portal, so those go through the extractor
+  registry and may fail upstream.
+- **Morocco thumbnails**: SNRT channels use official snrtlive.ma vignette
+  arts (`moroccoThumbs`, verified 200); other Morocco entries keep API
+  logos.
 - **Kids**: most entries are direct m3u8 (`url_type` 3) and play; Almajd
   Kids/Bassma/Rawda embeds are dead upstream (elahmad `Bad Gateway`,
   taghtia redirect chain empty) and have no public direct stream.
