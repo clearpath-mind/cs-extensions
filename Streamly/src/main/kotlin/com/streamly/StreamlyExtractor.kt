@@ -1296,6 +1296,34 @@ private val BLOCKED_EMBED_KEYWORDS = listOf(
     "recaptcha", "googlesyndication", "googletagmanager", "google-analytics",
 )
 
+/**
+ * Temporary solo-test diagnostics: when EgyDead is the only enabled provider,
+ * surface each stage as a Toast (no logcat needed). Silent otherwise.
+ */
+private fun egydeadSoloTest(): Boolean = runCatching {
+    val ctx = StreamlyRuntime.context ?: return false
+    val prefs = ctx.getSharedPreferences("streamly_prefs", android.content.Context.MODE_PRIVATE)
+    val disabled = prefs.getStringSet("disabled_providers", emptySet()) ?: emptySet()
+    !disabled.contains("egydead") && disabled.size >= ProvidersList.providers.size - 1
+}.getOrDefault(false)
+
+private fun egydeadStage(msg: String) {
+    StreamlyDiag.lastStage = "EgyDead: $msg"
+    if (!egydeadSoloTest()) return
+    runCatching {
+        val ctx = StreamlyRuntime.context ?: return
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            runCatching {
+                android.widget.Toast.makeText(
+                    ctx.applicationContext,
+                    "EgyDead: $msg",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+}
+
 suspend fun invokeEgydead(
     res: LinkData,
     subtitleCallback: (SubtitleFile) -> Unit,
@@ -1303,7 +1331,7 @@ suspend fun invokeEgydead(
 ): Boolean {
     val title = res.title?.trim().orEmpty()
     Log.d(EGYDEAD_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
-    StreamlyDiag.lastStage = "EgyDead: start"
+    egydeadStage("start")
     if (title.isEmpty()) return false
 
     var emitted = 0
@@ -1316,11 +1344,11 @@ suspend fun invokeEgydead(
             egydeadResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, countingCallback)
         }
         Log.d(EGYDEAD_TAG, "[done  ] emitted=$emitted")
-        StreamlyDiag.lastStage = if (emitted > 0) "EgyDead: ok" else "EgyDead: no links"
+        egydeadStage(if (emitted > 0) "ok ($emitted links)" else "no links")
         ok || emitted > 0
     } catch (e: Exception) {
         Log.e(EGYDEAD_TAG, "[invoke] failed: ${e.message}")
-        StreamlyDiag.lastStage = "EgyDead: ${e.message}"
+        egydeadStage("error ${e.message}")
         emitted > 0
     }
 }
@@ -1339,7 +1367,7 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
             val html = cfGetText(url, timeout = 15000)
             if (html.isBlank() || isCfChallenge(html)) {
                 Log.w(EGYDEAD_TAG, "[search ] page $page CF challenge / empty for $url")
-                StreamlyDiag.lastStage = "EgyDead: cf challenge"
+                egydeadStage("cf challenge")
                 break
             }
             val doc = Jsoup.parse(html, url)
@@ -1389,11 +1417,11 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
             if (added == 0) break
         } catch (e: Exception) {
             Log.e(EGYDEAD_TAG, "[search ] page $page failed: ${e.message}")
-            StreamlyDiag.lastStage = "EgyDead: search failed: ${e.message}"
+            egydeadStage("search failed: ${e.message}")
             break
         }
     }
-    if (out.isEmpty()) StreamlyDiag.lastStage = "EgyDead: search empty"
+    if (out.isEmpty()) egydeadStage("search empty")
     return out
 }
 
@@ -1518,7 +1546,7 @@ private suspend fun egydeadExtract(
 
     Log.d(EGYDEAD_TAG, "[watch  ] ${filteredWatch.size} embeds + ${filteredDownloads.size} download links on $postUrl (deduped ${downloadCandidates.size - filteredDownloads.size})")
     if (filteredWatch.isEmpty() && filteredDownloads.isEmpty()) {
-        StreamlyDiag.lastStage = "EgyDead: no servers on post"
+        egydeadStage("no servers on page")
     }
 
     val jobs = ArrayList<suspend () -> Unit>(filteredWatch.size + filteredDownloads.size)
@@ -1605,7 +1633,9 @@ private suspend fun egydeadResolveMovie(
         ?: scored.filter { it.second >= MIN_SCORE_MOVIE }
             .maxByOrNull { it.second }?.first
     if (best == null) {
+        val top = scored.maxByOrNull { it.second }
         Log.d(EGYDEAD_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
+        egydeadStage("no match (${scored.size} cands, best ${top?.second})")
         return false
     }
     Log.d(EGYDEAD_TAG, "[match  ] WINNER ${best.url}")
@@ -1643,6 +1673,7 @@ private suspend fun egydeadResolveEpisode(
             return egydeadExtract(href, subtitleCallback, callback, title, year)
         }
         Log.d(EGYDEAD_TAG, "[match  ] E$episode not on S$season page")
+        egydeadStage("ep $episode missing on S$season page")
         return false
     }
 
@@ -1660,6 +1691,7 @@ private suspend fun egydeadResolveEpisode(
         .maxByOrNull { it.third }?.first
     if (match == null) {
         Log.d(EGYDEAD_TAG, "[match  ] S${season}E$episode not found in search results")
+        egydeadStage("S${season}E$episode not found (${results.size} cands)")
         return false
     }
     Log.d(EGYDEAD_TAG, "[match  ] WINNER ${match.url}")
