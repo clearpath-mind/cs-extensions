@@ -115,10 +115,10 @@ fallback.
 
 ## Match details
 
-Plot is `شاهد مباراة {title} بث مباشر`. Competition, kickoff (Latin
-digits), commentator, and broadcast channel — in that order — ride in
-`LinkData` and render as tags on the detail page. The detail hero shows
-the same homepage banner thumbnail.
+Plot is `شاهد البث المباشر لمباراة {title}`. Competition, kickoff (Latin
+digits, `dd/MM - HH:mm`), commentator, and broadcast channel — in that
+order — ride in `LinkData` and render as tags on the detail page. The
+detail hero shows the same homepage banner thumbnail.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 

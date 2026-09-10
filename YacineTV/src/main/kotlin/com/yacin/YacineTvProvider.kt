@@ -233,7 +233,7 @@ class YacineTvProvider : MainAPI() {
         if (epochSec == null || epochSec <= 0) return ""
         return try {
             // Latin digits (normal numbers), not Eastern Arabic numerals.
-            val fmt = SimpleDateFormat("HH:mm - dd/MM", Locale.US)
+            val fmt = SimpleDateFormat("dd/MM - HH:mm", Locale.US)
             fmt.format(Date(epochSec * 1000))
         } catch (_: Exception) { "" }
     }
@@ -246,7 +246,7 @@ class YacineTvProvider : MainAPI() {
     }
 
     private fun matchPlot(title: String): String {
-        return "شاهد مباراة $title بث مباشر"
+        return "شاهد البث المباشر لمباراة $title"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
