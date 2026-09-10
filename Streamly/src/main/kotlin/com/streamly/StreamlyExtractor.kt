@@ -1352,32 +1352,9 @@ private val BLOCKED_EMBED_KEYWORDS = listOf(
     "recaptcha", "googlesyndication", "googletagmanager", "google-analytics",
 )
 
-/**
- * Temporary solo-test diagnostics: when EgyDead is the only enabled provider,
- * surface each stage as a Toast (no logcat needed). Silent otherwise.
- */
-private fun egydeadSoloTest(): Boolean = runCatching {
-    val ctx = StreamlyRuntime.context ?: return false
-    val prefs = ctx.getSharedPreferences("streamly_prefs", android.content.Context.MODE_PRIVATE)
-    val disabled = prefs.getStringSet("disabled_providers", emptySet()) ?: emptySet()
-    !disabled.contains("egydead") && disabled.size >= ProvidersList.providers.size - 1
-}.getOrDefault(false)
-
+/** Stage diagnostics surfaced via StreamlyDiag (logcat only; toasts removed). */
 private fun egydeadStage(msg: String) {
     StreamlyDiag.lastStage = "EgyDead: $msg"
-    if (!egydeadSoloTest()) return
-    runCatching {
-        val ctx = StreamlyRuntime.context ?: return
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            runCatching {
-                android.widget.Toast.makeText(
-                    ctx.applicationContext,
-                    "EgyDead: $msg",
-                    android.widget.Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-    }
 }
 
 private fun egydeadActivity(): android.app.Activity? =
@@ -1557,7 +1534,7 @@ private suspend fun egydeadExtract(
     depth: Int = 0,
 ): Boolean = coroutineScope {
     // Mirrors re-3arabi EgyDead: priming GET, then POST to ?view=watch with View=1 + X-Requested-With,
-    // fallback to GET if POST fails. See /tmp/re-3arabi/Egydead/src/main/kotlin/com/egydead/egydeadProvider.kt:718
+    // fallback to GET if POST fails. See Egydead egydeadProvider.kt loadLinks.
     val originalUrl = postUrl
     val watchPageUrl = if (!postUrl.contains("?view=watch")) "$postUrl?view=watch" else postUrl
     val primeDoc = runCatching { Jsoup.parse(egydeadWebText(originalUrl, timeout = 45000), originalUrl) }.getOrNull()
