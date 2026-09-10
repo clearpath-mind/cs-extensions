@@ -67,7 +67,7 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, WeCima, FaselHD. One adaptive link is
+// Currently: TopCinema, WeCima, FaselHD, EgyBest. One adaptive link is
 // emitted per server (no per-quality lists); ExoPlayer adapts itself.
 // ---------------------------------------------------------------------------
 
@@ -1926,6 +1926,241 @@ suspend fun invokeFaselHd(
     } catch (e: Exception) {
         Log.e(FASELHD_TAG, "[invoke] failed: ${e.message}")
         StreamlyDiag.lastStage = "FaselHD: ${e.message}"
+        emitted > 0
+    }
+}
+
+// ===========================================================================
+// EgyBest (egybest.la) link source.
+//
+// React SPA (Vebto CMS) backed by a JSON API at /api/v1. The API refuses
+// cookie-less/hotlink requests (401 {"message":""}) unless the call carries
+// the site as Referer/Origin, so every call goes out with browser headers.
+// Chain: search/{q}?loader=searchPage -> titles/{id}?loader=titlePage ->
+// titles/{id}/seasons/{s}/episodes (series) -> watch/{videoId} -> video.src
+// embed (egybestvid.com, streamwish-style page with an inline master m3u8).
+// ===========================================================================
+
+private const val EGBEST_MAIN_URL = "https://egybest.la"
+private const val EGBEST_TAG = "EgyBest"
+
+private fun egBestHeaders(): Map<String, String> = mapOf(
+    "Accept" to "application/json, text/plain, */*",
+    "Referer" to "$EGBEST_MAIN_URL/",
+    "Origin" to EGBEST_MAIN_URL,
+    "X-Requested-With" to "XMLHttpRequest",
+)
+
+/** GET a JSON API endpoint; seeds the session cookie jar on a 401 and retries once. */
+private suspend fun egBestApi(path: String): org.json.JSONObject? {
+    val url = "$EGBEST_MAIN_URL/api/v1/$path"
+    fun parse(text: String): org.json.JSONObject? =
+        runCatching { org.json.JSONObject(text) }.getOrNull()
+    parse(cfGetText(url, headers = egBestHeaders(), timeout = 15000))?.let { return it }
+    // First call in a fresh process has no session cookies — visit the
+    // homepage to seed the jar, then retry once.
+    runCatching { cfGetText(EGBEST_MAIN_URL, timeout = 15000) }
+    return parse(cfGetText(url, headers = egBestHeaders(), timeout = 15000))
+}
+
+private data class EgBestTitle(
+    val id: Int,
+    val latin: String,
+    val year: Int?,
+    val isSeries: Boolean,
+)
+
+private fun egBestLatin(item: org.json.JSONObject): String {
+    item.optString("original_title").trim().takeIf { it.length > 2 }?.let { return it }
+    return LATIN_REGEX.findAll(item.optString("name"))
+        .map { it.value.trim('-', ' ', '.') }
+        .filter { it.isNotBlank() }
+        .joinToString(" ")
+}
+
+private suspend fun egBestSearch(query: String, series: Boolean): List<EgBestTitle> {
+    val encoded = URLEncoder.encode(query, "UTF-8")
+    val doc = egBestApi("search/$encoded?loader=searchPage") ?: return emptyList()
+    val arr = doc.optJSONArray("results") ?: return emptyList()
+    val out = ArrayList<EgBestTitle>()
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val isSeries = o.optBoolean("is_series", false)
+        if (isSeries != series) continue
+        val latin = egBestLatin(o)
+        if (latin.isBlank()) continue
+        val year = o.optInt("year", 0).takeIf { it > 1900 }
+            ?: YEAR_REGEX.find(o.optString("name"))?.value?.toIntOrNull()
+        out.add(EgBestTitle(o.optInt("id"), latin, year, isSeries))
+    }
+    return out
+}
+
+private fun egBestScore(c: EgBestTitle, title: String, year: Int?): Int {
+    var score = scoreCandidate(Candidate("", "", c.latin, c.year), title, year)
+    if (c.latin.equals(title, ignoreCase = true)) score += 10
+    return score
+}
+
+/** Resolve one video.src into a stream link. Embed pages carry an inline master m3u8. */
+private suspend fun egBestEmitVideo(
+    src: String,
+    label: String,
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    if (src.contains(".m3u8")) {
+        callback(
+            newExtractorLink(label, label, url = src) {
+                this.referer = postUrl
+                this.quality = Qualities.Unknown.value
+                this.type = ExtractorLinkType.M3U8
+            },
+        )
+        return true
+    }
+    if (Regex("""\.(mp4|mkv)([?#].*)?$""", RegexOption.IGNORE_CASE).containsMatchIn(src)) {
+        callback(
+            newExtractorLink(label, label, url = src) {
+                this.referer = postUrl
+                this.quality = getQualityFromName(src)
+                this.type = ExtractorLinkType.VIDEO
+            },
+        )
+        return true
+    }
+    val page = runCatching {
+        cfGetText(src, referer = postUrl, timeout = 15000)
+    }.getOrNull().orEmpty()
+    val m3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(page)?.value
+    if (!m3u8.isNullOrBlank()) {
+        callback(
+            newExtractorLink(label, label, url = m3u8) {
+                this.referer = src
+                this.quality = Qualities.Unknown.value
+                this.type = ExtractorLinkType.M3U8
+            },
+        )
+        return true
+    }
+    EmbedRouter.route(src, postUrl, subtitleCallback, callback, "EgyBest")
+    return true
+}
+
+private suspend fun egBestWatchVideo(
+    videoId: Int,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val doc = egBestApi("watch/$videoId") ?: return false
+    val v = doc.optJSONObject("video") ?: return false
+    val src = v.optString("src").trim()
+    if (src.isBlank()) return false
+    val quality = v.optString("quality").trim().takeIf { it.isNotBlank() && !it.equals("default", true) }
+    val label = buildString {
+        append("EgyBest - ${v.optString("name").trim().ifBlank { "Server" }}")
+        if (!quality.isNullOrBlank()) append(" $quality")
+    }
+    Log.d(EGBEST_TAG, "[watch  ] video=$videoId type=${v.optString("type")} $label")
+    return egBestEmitVideo(src, label, EGBEST_MAIN_URL, subtitleCallback, callback)
+}
+
+private suspend fun egBestResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val scored = egBestSearch(title, series = false).map { it to egBestScore(it, title, year) }
+    Log.d(EGBEST_TAG, "[search ] movie '$title' year=$year -> ${scored.size} candidates")
+    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
+        Log.d(EGBEST_TAG, "[match  ] score=$s latin='${c.latin}' year=${c.year} id=${c.id}")
+    }
+    val best = scored.filter { it.second >= MIN_SCORE_MOVIE }.maxByOrNull { it.second }?.first
+    if (best == null) {
+        Log.d(EGBEST_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(EGBEST_TAG, "[match  ] WINNER id=${best.id}")
+    val doc = egBestApi("titles/${best.id}?loader=titlePage") ?: return false
+    val videos = doc.optJSONObject("title")?.optJSONArray("videos") ?: return false
+    var found = false
+    for (i in 0 until videos.length()) {
+        val v = videos.optJSONObject(i) ?: continue
+        val src = v.optString("src").trim()
+        if (src.isBlank()) continue
+        val quality = v.optString("quality").trim().takeIf { it.isNotBlank() && !it.equals("default", true) }
+        val label = buildString {
+            append("EgyBest - ${v.optString("name").trim().ifBlank { "Server" }}")
+            if (!quality.isNullOrBlank()) append(" $quality")
+        }
+        found = egBestEmitVideo(src, label, EGBEST_MAIN_URL, subtitleCallback, callback) || found
+    }
+    return found
+}
+
+private suspend fun egBestResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val scored = egBestSearch(title, series = true).map { it to egBestScore(it, title, year) }
+    Log.d(EGBEST_TAG, "[search ] series '$title' S$season E$episode -> ${scored.size} candidates")
+    val best = scored.filter { it.second >= MIN_SCORE_SERIES }.maxByOrNull { it.second }?.first
+    if (best == null) {
+        Log.d(EGBEST_TAG, "[match  ] no series above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(EGBEST_TAG, "[match  ] WINNER id=${best.id}")
+    var page = 1
+    while (page <= 10) {
+        val doc = egBestApi("titles/${best.id}/seasons/$season/episodes?page=$page") ?: return false
+        val pg = doc.optJSONObject("pagination") ?: return false
+        val data = pg.optJSONArray("data") ?: return false
+        for (i in 0 until data.length()) {
+            val e = data.optJSONObject(i) ?: continue
+            if (e.optInt("episode_number", -1) != episode) continue
+            val videoId = e.optJSONObject("primary_video")?.optInt("id", 0) ?: 0
+            if (videoId == 0) return false
+            Log.d(EGBEST_TAG, "[match  ] S${season}E${episode} video=$videoId")
+            return egBestWatchVideo(videoId, subtitleCallback, callback)
+        }
+        if (pg.isNull("next_page")) break
+        page++
+    }
+    Log.d(EGBEST_TAG, "[match  ] E$episode not in S$season episodes")
+    return false
+}
+
+suspend fun invokeEgyBest(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(EGBEST_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "EgyBest: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    return try {
+        val ok = if (res.isMovie) {
+            egBestResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            egBestResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(EGBEST_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "EgyBest: ok" else "EgyBest: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(EGBEST_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "EgyBest: ${e.message}"
         emitted > 0
     }
 }

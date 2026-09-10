@@ -59,7 +59,7 @@ object StreamlyCache {
     }
 
     /** Sensible cold-start order before any stats exist. */
-    private val BASE_PRIORITY = mapOf("topcinema" to 3f, "wecima" to 2f, "faselhd" to 1f)
+    private val BASE_PRIORITY = mapOf("topcinema" to 3f, "wecima" to 2f, "faselhd" to 1f, "egybest" to 1f)
 
     /** Higher score runs earlier; broken providers sink to the end. */
     fun getProviderPriorityScore(providerId: String): Float {
