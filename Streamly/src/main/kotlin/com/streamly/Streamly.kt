@@ -129,33 +129,6 @@ data class ContentRatings(
     @JsonProperty("results") val results: List<ContentRatingEntry>? = null,
 )
 
-data class Keyword(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-)
-
-/** Movies: {keywords:[...]}, TV: {results:[...]} — one wrapper covers both. */
-data class KeywordWrap(
-    @JsonProperty("keywords") val keywords: List<Keyword>? = null,
-    @JsonProperty("results") val results: List<Keyword>? = null,
-)
-
-data class CollectionRef(
-    @JsonProperty("id") val id: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-)
-
-data class CollectionResp(
-    @JsonProperty("parts") val parts: List<Media>? = null,
-)
-
-data class NextEpisode(
-    @JsonProperty("air_date") val airDate: String? = null,
-    @JsonProperty("episode_number") val episodeNumber: Int? = null,
-    @JsonProperty("season_number") val seasonNumber: Int? = null,
-    @JsonProperty("name") val name: String? = null,
-)
-
 data class MediaDetail(
     @JsonProperty("id") val id: Int? = null,
     @JsonProperty("title") val title: String? = null,
@@ -179,9 +152,6 @@ data class MediaDetail(
     @JsonProperty("recommendations") val recommendations: Results? = null,
     @JsonProperty("release_dates") val releaseDates: ReleaseDates? = null,
     @JsonProperty("content_ratings") val contentRatings: ContentRatings? = null,
-    @JsonProperty("belongs_to_collection") val collection: CollectionRef? = null,
-    @JsonProperty("keywords") val keywords: KeywordWrap? = null,
-    @JsonProperty("next_episode_to_air") val nextEpisode: NextEpisode? = null,
 )
 
 data class Episodes(
@@ -356,9 +326,9 @@ open class Streamly : MainAPI() {
         val data = parseJson<Data>(url)
         val type = getType(data.type)
         val append = if (type == TvType.Movie) {
-            "external_ids,videos,credits,recommendations,release_dates,keywords"
+            "external_ids,videos,credits,recommendations,release_dates"
         } else {
-            "external_ids,videos,credits,recommendations,content_ratings,keywords"
+            "external_ids,videos,credits,recommendations,content_ratings"
         }
 
         val resUrl = if (type == TvType.Movie) {
@@ -393,46 +363,8 @@ open class Streamly : MainAPI() {
             val actorName = cast.name ?: return@mapNotNull null
             ActorData(Actor(actorName, getImageUrl(cast.profilePath)), roleString = cast.character)
         } ?: emptyList()
-        val collectionParts = if (type == TvType.Movie) {
-            val cid = res.collection?.id
-            if (cid != null) {
-                runCatching {
-                    app.get("$TMDB_API/collection/$cid?api_key=$apiKey&language=$LANG", timeout = 8000)
-                        .parsedSafe<CollectionResp>()?.parts.orEmpty()
-                        .filter { it.id != null && it.id != data.id }
-                        .take(10)
-                        .mapNotNull { it.toSearchResponse("movie") }
-                }.getOrDefault(emptyList())
-            } else emptyList()
-        } else emptyList()
         val recommendations = res.recommendations?.results
             ?.mapNotNull { it.toSearchResponse(if (type == TvType.Movie) "movie" else "tv") }
-            .orEmpty() + collectionParts
-        val keywordTags = (res.keywords?.keywords.orEmpty() + res.keywords?.results.orEmpty())
-            .mapNotNull { it.name?.takeIf { n -> n.isNotBlank() } }
-            .distinct()
-            .take(6)
-        val nextEpTag = res.nextEpisode?.let { ne ->
-            val s = ne.seasonNumber
-            val e = ne.episodeNumber
-            if (s == null || e == null) null else {
-                val air = ne.airDate
-                val days = air?.takeIf { it.isNotBlank() }?.let { d ->
-                    runCatching {
-                        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
-                        ((fmt.parse(d)?.time ?: 0L) - System.currentTimeMillis()) / 86400000L
-                    }.getOrNull()
-                }
-                when {
-                    days == null -> "Next: S$s E$e"
-                    days < 0 -> "Next: S$s E$e • $air"
-                    days == 0L -> "Next: S$s E$e • today"
-                    days == 1L -> "Next: S$s E$e • tomorrow"
-                    else -> "Next: S$s E$e • in ${days}d"
-                }
-            }
-        }
-        val tags = (genres.orEmpty() + keywordTags + listOfNotNull(nextEpTag)).distinct()
         val trailer = res.videos?.results.orEmpty()
             .filter { it.type == "Trailer" }
             .map { "https://www.youtube.com/watch?v=${it.key}" }
@@ -509,7 +441,7 @@ open class Streamly : MainAPI() {
                 this.backgroundPosterUrl = bgPoster
                 this.year = year
                 this.plot = res.overview
-                this.tags = tags
+                this.tags = genres
                 this.score = Score.from10(res.voteAverage)
                 this.showStatus = getStatus(res.status)
                 if (!contentRating.isNullOrBlank()) this.contentRating = contentRating
@@ -537,7 +469,7 @@ open class Streamly : MainAPI() {
                 this.year = year
                 this.plot = res.overview
                 this.duration = res.runtime
-                this.tags = tags
+                this.tags = genres
                 this.score = Score.from10(res.voteAverage)
                 this.contentRating = contentRating
                 this.recommendations = recommendations
