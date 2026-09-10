@@ -97,6 +97,13 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
   falls back to verified iptv-org EdgeNext CDN streams
   (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`). No public stream
   exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
+
+## Homepage pagination (no duplicates)
+
+All rows fit on one page (no API pagination). `getMainPage` answers
+single-row drill-ins by `request.name` and returns `hasNext = false`;
+`page > 1` returns an empty list so end-of-list scrolling never appends
+the same items twice.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 
@@ -133,6 +140,15 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
   falls back to verified iptv-org EdgeNext CDN streams
   (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`). No public stream
   exists for MBC 2 / MBC 3 / MBC Action / MBC Max / MBC IRAQ.
-- **Logos**: `YacineTV/logos.json` (normalized name -> logo URL, iptv-org
-  database) overrides dead/square API logos at runtime; missing keys fall
+- **Morocco**: 2M (`channel/546`) is a direct m3u8 and plays; the 7 SNRT
+  channels (`snrtlive.ma` pages, `url_type` 5) resolve via the EasyBroadcast
+  slug (`extractEasyBroadcastSlug` tries several markup variants) with a
+  generic extractor attempt as last resort. Medi 1 embeds serve a JWPlayer
+  page with no static file URL and Télé Maroc is a multi-iframe portal, so
+  those go through the extractor registry and may fail upstream.
+- **Kids**: most entries are direct m3u8 (`url_type` 3) and play; Almajd
+  Kids/Bassma/Rawda embeds are dead upstream (elahmad `Bad Gateway`,
+  taghtia redirect chain empty) and have no public direct stream.
+- **Logos**: in-code `logoOverrides` map (normalized name -> logo URL,
+  iptv-org database) overrides dead/square API logos; missing keys fall
   back to the API logo.

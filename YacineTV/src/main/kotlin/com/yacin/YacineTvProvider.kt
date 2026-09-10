@@ -225,6 +225,20 @@ class YacineTvProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // All rows fit on one page (no API pagination). Answer single-row
+        // drill-ins by name and terminate scrolling: without this, page 2+
+        // returns the same full payload and the app appends duplicates.
+        if (request.name.isNotBlank()) {
+            val rows = buildHomeLists()
+            val match = rows.find { it.name == request.name }
+                ?: return newHomePageResponse(request, emptyList(), false)
+            return newHomePageResponse(request, match.list, false)
+        }
+        if (page > 1) return newHomePageResponse(emptyList(), false)
+        return newHomePageResponse(buildHomeLists(), false)
+    }
+
+    private suspend fun buildHomeLists(): List<HomePageList> {
         return coroutineScope {
             val eventsDeferred = async { getEvents() }
             val categories = getCategories()
@@ -336,31 +350,39 @@ class YacineTvProvider : MainAPI() {
             }.awaitAll().flatten()
 
             lists.addAll(otherRows)
-            newHomePageResponse(lists)
+            lists
         }
     }
 
-    /** Curated logo overrides (YacineTV/logos.json in this repo). Keys are
-     * normalized channel names. Fixes dead API logos and upgrades squares to
-     * wide banners that fill the horizontal cards. Fetched once, cached. */
-    private var logoOverrides: Map<String, String>? = null
+    /** Curated logo overrides (in-code). Keys are normalized channel names.
+     * Fixes dead API logos and upgrades squares to wide banners that fill
+     * the horizontal cards. Missing keys fall back to the API logo. */
+    private val logoOverrides = mapOf(
+        "mbc 1" to "https://i.imgur.com/CiA3plN.png",
+        "mbc bollywood" to "https://i.imgur.com/TTAGFHG.png",
+        "mbc drama" to "https://i.imgur.com/g5PWnqp.png",
+        "mbc action" to "https://i.imgur.com/OWZAghw.png",
+        "mbc fm" to "https://i.imgur.com/lF8UxvR.png",
+        "panorama fm" to "https://i.imgur.com/JkDD3bK.png",
+        "mbc drama +" to "https://i.imgur.com/lxWdjXG.png",
+        "mbc 3" to "https://i.imgur.com/PVt8OPN.png",
+        "gulli arabic" to "https://i.imgur.com/34Vcc7u.png",
+        "rotana kids" to "https://i.imgur.com/YQKf0tq.png",
+        "taha kids" to "https://i.imgur.com/hdsrxvX.png",
+        "atfal wa mawahib" to "https://i.imgur.com/Y2BqP9m.png",
+        "almajd rawda" to "https://i.imgur.com/sEC3Zp9.png",
+        "canal j" to "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3c/Canal_J_2019_Logo.png/960px-Canal_J_2019_Logo.png",
+        "disney xd" to "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a8/2015_Disney_XD_logo.svg/960px-2015_Disney_XD_logo.svg.png",
+        "boomerang ar" to "https://upload.wikimedia.org/wikipedia/commons/thumb/3/35/Boomerang_2014_logo.svg/960px-Boomerang_2014_logo.svg.png",
+        "boomerang fr" to "https://upload.wikimedia.org/wikipedia/commons/thumb/3/35/Boomerang_2014_logo.svg/960px-Boomerang_2014_logo.svg.png",
+        "cartoon network" to "https://upload.wikimedia.org/wikipedia/commons/thumb/b/bb/Cartoon_Network_Arabic_logo.png/960px-Cartoon_Network_Arabic_logo.png",
+        "nick jr" to "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Nick_Jr._logo_2023_(outline).svg/960px-Nick_Jr._logo_2023_(outline).svg.png",
+        "nickelodeon fr" to "https://i.imgur.com/E84jnP8.png",
+        "mangas" to "https://i.imgur.com/wmmEOza.png",
+    )
 
-    private suspend fun logoOverridesMap(): Map<String, String> {
-        logoOverrides?.let { return it }
-        val loaded = runCatching {
-            parseJson<Map<String, String>>(
-                app.get(
-                    "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/logos.json",
-                    timeout = 8000,
-                ).text
-            )
-        }.getOrNull() ?: emptyMap()
-        logoOverrides = loaded
-        return loaded
-    }
-
-    private suspend fun logoFor(name: String, apiLogo: String?): String? {
-        logoOverridesMap()[normalizeName(name)]?.takeIf { it.isNotBlank() }?.let { return it }
+    private fun logoFor(name: String, apiLogo: String?): String? {
+        logoOverrides[normalizeName(name)]?.takeIf { it.isNotBlank() }?.let { return it }
         return apiLogo?.takeIf { it.isNotBlank() }
     }
 
@@ -600,20 +622,20 @@ class YacineTvProvider : MainAPI() {
         return try {
             val page = app.get(
                 pageUrl,
-                headers = mapOf("User-Agent" to BROWSER_UA),
-                timeout = 12,
+                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to "https://snrtlive.ma/"),
+                timeout = 15,
             ).text
-            val slug = Regex("""snrt\.player\.easybroadcast\.io/events/([A-Za-z0-9_-]+)""").find(page)
-                ?.groupValues?.getOrNull(1) ?: return false
+            val slug = extractEasyBroadcastSlug(page) ?: return false
             val ev = runCatching {
                 parseJson<EasyBroadcastEvent>(
                     app.get(
                         "https://snrt.player.easybroadcast.io/api/events/$slug",
                         headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
-                        timeout = 12,
+                        timeout = 15,
                     ).text
                 )
             }.getOrNull() ?: return false
+            // DVR playlist keeps timeshift; plain playlist is the live edge.
             val stream = ev.stream?.takeIf { it.isNotBlank() }
                 ?: ev.streamNoTimeshift?.takeIf { it.isNotBlank() }
                 ?: return false
@@ -627,6 +649,22 @@ class YacineTvProvider : MainAPI() {
             )
             true
         } catch (_: Exception) { false }
+    }
+
+    private fun extractEasyBroadcastSlug(page: String): String? {
+        // Page HTML varies (escaped slashes, single/double quotes, query strings).
+        val clean = page.replace("\\/", "/").replace("\\\"", "\"")
+        val patterns = listOf(
+            Regex("""snrt\.player\.easybroadcast\.io/events/([A-Za-z0-9_-]+)"""),
+            Regex("""easybroadcast[^"'\s<>]*?/events/([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE),
+            Regex("""data-event(?:-slug)?=["']([A-Za-z0-9_-]+)["']""", RegexOption.IGNORE_CASE),
+        )
+        for (rx in patterns) {
+            rx.find(clean)?.groupValues?.getOrNull(1)
+                ?.trim()?.trimEnd('/', '?', '#')
+                ?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        return null
     }
 
     override suspend fun loadLinks(
@@ -649,9 +687,13 @@ class YacineTvProvider : MainAPI() {
                     found = true
                     return true
                 }
-                return false
+                // Fall through to the generic extractor attempt below instead
+                // of giving up: page markup may change upstream.
             }
             val headers = streamHeaders(s)
+            val referer = headers["Referer"]?.takeIf { it.isNotBlank() }
+                ?: s.referer?.takeIf { it.isNotBlank() }
+                ?: raw
             val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
             val lower = raw.lowercase()
             // url_type 5/6 (and other non-media pages like mbch.live / arab-stream.live)
@@ -661,7 +703,7 @@ class YacineTvProvider : MainAPI() {
             if (!isDirect) {
                 var resolved = false
                 val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
-                runCatching { loadExtractor(raw, headers["Referer"], subtitleCallback, countCb) }
+                runCatching { loadExtractor(raw, referer, subtitleCallback, countCb) }
                 if (resolved) found = true
                 return resolved
             }
@@ -696,9 +738,12 @@ class YacineTvProvider : MainAPI() {
                 val isDirect = ".m3u8" in lower || s.urlType == 1 || s.urlType == 3 ||
                     lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".ts")
                 if (!isDirect) {
+                    val eventReferer = headers["Referer"]?.takeIf { it.isNotBlank() }
+                        ?: s.referer?.takeIf { it.isNotBlank() }
+                        ?: raw
                     var resolved = false
                     val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
-                    runCatching { loadExtractor(raw, headers["Referer"], subtitleCallback, countCb) }
+                    runCatching { loadExtractor(raw, eventReferer, subtitleCallback, countCb) }
                     if (resolved) found = true
                     return@forEach
                 }
