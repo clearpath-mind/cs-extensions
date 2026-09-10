@@ -51,6 +51,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("name") val name: String = "",
         @JsonProperty("poster") val poster: String? = null,
         @JsonProperty("poster2") val poster2: String? = null, // match: other team logo
+        @JsonProperty("channel") val channel: String? = null, // match: broadcast channel
         @JsonProperty("plot") val plot: String? = null,
     )
 
@@ -257,6 +258,7 @@ class YacineTvProvider : MainAPI() {
                         name = title,
                         poster = poster,
                         poster2 = poster2,
+                        channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                         plot = eventPlot(e),
                     ).toJson()
                     newLiveSearchResponse(title, data, TvType.Live) {
@@ -457,6 +459,7 @@ class YacineTvProvider : MainAPI() {
                     name = title,
                     poster = poster,
                     poster2 = poster2,
+                    channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                     plot = eventPlot(e),
                 ).toJson()
                 out.add(
@@ -580,7 +583,35 @@ class YacineTvProvider : MainAPI() {
 
         if (info.kind == "event" && info.id != null) {
             val streams = getEventStreams(info.id)
-            streams.forEach { emit(info.name, it) }
+            // Label with the broadcast channel (no match name): "beIN SPORTS 1 • HD".
+            val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
+            streams.forEach { s ->
+                val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
+                    ?: return@forEach
+                if (!seenUrls.add(raw)) return@forEach
+                val headers = streamHeaders(s)
+                val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
+                val label = if (tag != null && !serverName.equals(tag, ignoreCase = true)) "$tag • $serverName" else serverName
+                val lower = raw.lowercase()
+                val isDirect = ".m3u8" in lower || s.urlType == 1 || s.urlType == 3 ||
+                    lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".ts")
+                if (!isDirect) {
+                    var resolved = false
+                    val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
+                    runCatching { loadExtractor(raw, headers["Referer"], subtitleCallback, countCb) }
+                    if (resolved) found = true
+                    return@forEach
+                }
+                callback.invoke(
+                    newExtractorLink(this.name, label, raw) {
+                        this.headers = headers
+                        this.referer = headers["Referer"] ?: ""
+                        this.quality = qualityFor(label, raw)
+                        this.type = if (".m3u8" in lower) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    }
+                )
+                found = true
+            }
             return found
         }
 
