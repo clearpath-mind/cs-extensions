@@ -21,17 +21,43 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 /**
  * Rebuilds [link] with the provider name prefixed so players show e.g.
  * "TopCinema - Vidtube". Passthrough when blank or already labeled.
+ *
+ * Normalizes to a single auto-quality source: built-in extractors fan out
+ * per-quality rows ("Strwush 800p", …) — strip the trailing quality token so
+ * the entry reads "TopCinema - Strwush", and force Unknown (auto) for
+ * adaptive M3U8 masters.
  */
 fun relabelLink(link: ExtractorLink, providerName: String?): ExtractorLink {
-    if (providerName.isNullOrBlank() || link.name.startsWith("$providerName ")) return link
+    val cleanName = link.name.trim()
+        .replace(Regex("""\s+\d{3,4}p(\s*hls)?\s*$""", RegexOption.IGNORE_CASE), "")
+        .trim()
+        .ifBlank { link.name.trim() }
+    val autoQuality =
+        if (link.type == ExtractorLinkType.M3U8) Qualities.Unknown.value else link.quality
+    if (providerName.isNullOrBlank() || cleanName.startsWith("$providerName ")) {
+        if (cleanName == link.name.trim() && autoQuality == link.quality) return link
+        return runCatching {
+            @Suppress("DEPRECATION")
+            ExtractorLink(
+                source = link.source,
+                name = cleanName,
+                url = link.url,
+                referer = link.referer,
+                quality = autoQuality,
+                headers = link.headers,
+                extractorData = link.extractorData,
+                type = link.type,
+            )
+        }.getOrElse { link }
+    }
     return runCatching {
         @Suppress("DEPRECATION")
         ExtractorLink(
             source = link.source,
-            name = "$providerName - ${link.name}",
+            name = "$providerName - $cleanName",
             url = link.url,
             referer = link.referer,
-            quality = link.quality,
+            quality = autoQuality,
             headers = link.headers,
             extractorData = link.extractorData,
             type = link.type,
