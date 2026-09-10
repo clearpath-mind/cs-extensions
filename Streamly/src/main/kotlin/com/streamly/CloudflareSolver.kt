@@ -10,6 +10,8 @@ import android.util.Log
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlin.coroutines.resume
@@ -34,7 +36,13 @@ object CloudflareSolver {
                     return@post
                 }
 
-                val webView = WebView(activity)
+                val webView = try {
+                    WebView(activity)
+                } catch (e: Exception) {
+                    Log.w(TAG, "no WebView on device: ${e.message}")
+                    continuation.resume(null)
+                    return@post
+                }
                 webView.layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
@@ -62,6 +70,7 @@ object CloudflareSolver {
 
                 var isSolved = false
                 var isProcessingClick = false
+                var bypassWatching = false
                 val pollingHandler = Handler(Looper.getMainLooper())
 
                 fun finishSuccess(finalUrl: String, reason: String = "unknown") {
@@ -158,16 +167,30 @@ object CloudflareSolver {
 
                 fun checkBypassSuccess() {
                     if (isSolved) return
+                    if (bypassWatching) return
+                    bypassWatching = true
 
-                    val currentLiveUrl = webView.url ?: initialUrl
-                    val currentCookies = cookieManager.getCookie(currentLiveUrl)
+                    fun poll() {
+                        if (isSolved) {
+                            bypassWatching = false
+                            return
+                        }
+                        val currentLiveUrl = try {
+                            webView.url ?: initialUrl
+                        } catch (_: Exception) {
+                            initialUrl
+                        }
+                        val currentCookies = runCatching { cookieManager.getCookie(currentLiveUrl) }.getOrNull()
 
-                    if (currentCookies != null && currentCookies.contains("cf_clearance")) {
-                        finishSuccess(currentLiveUrl, "cf_clearance captured")
-                        return
+                        if (currentCookies != null && currentCookies.contains("cf_clearance")) {
+                            bypassWatching = false
+                            finishSuccess(currentLiveUrl, "cf_clearance captured")
+                            return
+                        }
+
+                        pollingHandler.postDelayed({ poll() }, 500)
                     }
-
-                    pollingHandler.postDelayed({ checkBypassSuccess() }, 500)
+                    poll()
                 }
 
                 webView.webViewClient = object : WebViewClient() {
@@ -175,6 +198,23 @@ object CloudflareSolver {
                         super.onPageStarted(view, url, favicon)
                         if (url != null && url != initialUrl) {
                             Log.d(TAG, "redirect to: $url")
+                        }
+                    }
+
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?,
+                    ) {
+                        super.onReceivedError(view, request, error)
+                        val failing = request?.url?.toString()
+                        Log.w(TAG, "load error on $failing: ${error?.description}")
+                        // Dead seed domain (DNS/ISP block): don't burn the full
+                        // 60s — bail out so the caller can try the next mirror.
+                        if (request?.isForMainFrame == true && failing == initialUrl) {
+                            pollingHandler.postDelayed({
+                                if (!isSolved) finishSuccess(initialUrl, "load-error")
+                            }, 5000)
                         }
                     }
 
@@ -188,6 +228,8 @@ object CloudflareSolver {
 
                 rootView.addView(webView)
                 webView.loadUrl(initialUrl)
+                // Challenges that never fire onPageFinished still get watched.
+                checkBypassSuccess()
             }
         }
     }

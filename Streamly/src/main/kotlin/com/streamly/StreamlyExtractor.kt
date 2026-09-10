@@ -1253,6 +1253,8 @@ private fun wecimaExactEpisode(scope: Document, episode: Int): String? {
 // ---------------------------------------------------------------------------
 
 private const val EGYDEAD_ENTRY_URL = "https://egydead.beer"
+/** Last confirmed-live mirror (search-indexed); fallback when the entry seed is blocked. */
+private const val EGYDEAD_KNOWN_MIRROR = "https://tv10.egydead.live"
 private const val EGYDEAD_TAG = "EgyDead"
 private val EGYDEAD_EPISODE_URL_REGEX = Regex("""-s(\d{1,2})e(\d{1,3})""", RegexOption.IGNORE_CASE)
 
@@ -1359,15 +1361,20 @@ suspend fun invokeEgydead(
  */
 private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candidate> {
     val out = ArrayList<Candidate>()
-    var base = egydeadBase()
     val encoded = URLEncoder.encode(query, "UTF-8")
+    // Entry seed first, then the last known-good mirror: entry domains get
+    // blocked while mirrors serve fine (and mirrors rotate over time).
+    val seeds = linkedSetOf(egydeadBase(), EGYDEAD_KNOWN_MIRROR)
+    for (seed in seeds) {
+    val base = seed
     for (page in 1..maxPages) {
         val url = if (page == 1) "$base/?s=$encoded" else "$base/page/$page/?s=$encoded"
         try {
             val html = cfGetText(url, timeout = 15000)
             if (html.isBlank() || isCfChallenge(html)) {
+                val host = runCatching { java.net.URI(url).host }.getOrDefault("?")
                 Log.w(EGYDEAD_TAG, "[search ] page $page CF challenge / empty for $url")
-                egydeadStage("cf challenge")
+                egydeadStage("cf challenge @ $host")
                 break
             }
             val doc = Jsoup.parse(html, url)
@@ -1420,7 +1427,17 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
             egydeadStage("search failed: ${e.message}")
             break
         }
-    }
+        } // pages
+        if (out.isNotEmpty()) {
+            if (seed != seeds.first()) {
+                egydeadLiveBase = seed
+                originCache[EGYDEAD_ENTRY_URL] = seed
+                Log.d("StreamlyMirror", "egydeadSearch working base: $seed")
+            }
+            break
+        }
+        Log.d(EGYDEAD_TAG, "[search ] seed $seed yielded nothing, trying next")
+    } // seeds
     if (out.isEmpty()) egydeadStage("search empty")
     return out
 }
