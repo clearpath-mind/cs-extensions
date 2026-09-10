@@ -232,7 +232,8 @@ class YacineTvProvider : MainAPI() {
     private fun formatKickoff(epochSec: Long?): String {
         if (epochSec == null || epochSec <= 0) return ""
         return try {
-            val fmt = SimpleDateFormat("HH:mm - dd/MM", Locale("ar"))
+            // Latin digits (normal numbers), not Eastern Arabic numerals.
+            val fmt = SimpleDateFormat("HH:mm - dd/MM", Locale.US)
             fmt.format(Date(epochSec * 1000))
         } catch (_: Exception) { "" }
     }
@@ -245,7 +246,7 @@ class YacineTvProvider : MainAPI() {
     }
 
     private fun matchPlot(title: String): String {
-        return "شاهد بث مباشر لمباراة $title"
+        return "شاهد مباراة $title بث مباشر"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -636,19 +637,20 @@ class YacineTvProvider : MainAPI() {
             else "شاهد بث مباشر لقناة ${data.name}"
         return newMovieLoadResponse(data.name, url, TvType.Live, url) {
             this.posterUrl = data.poster
-            // Matches: second team logo as backdrop (cards only fit one logo).
-            if (!data.poster2.isNullOrBlank()) {
-                this.backgroundPosterUrl = data.poster2
+            // Matches: hero shows the same homepage thumbnail (banner);
+            // fall back to the other team logo when no banner was rendered.
+            if (data.kind == "event") {
+                this.backgroundPosterUrl = data.poster ?: data.poster2
             }
             this.plot = plot
-            // Match meta as tags: competition, broadcast channel,
-            // commentator, kickoff.
+            // Match meta as tags, in order: competition, kickoff,
+            // commentator, broadcast channel.
             if (data.kind == "event") {
                 val tags = listOfNotNull(
                     data.competition?.takeIf { it.isNotBlank() },
-                    data.channel?.takeIf { it.isNotBlank() },
-                    data.commentary?.takeIf { it.isNotBlank() },
                     data.kickoff?.takeIf { it.isNotBlank() },
+                    data.commentary?.takeIf { it.isNotBlank() },
+                    data.channel?.takeIf { it.isNotBlank() },
                 )
                 if (tags.isNotEmpty()) this.tags = tags
             }
