@@ -2083,8 +2083,10 @@ private suspend fun egBestWatchVideo(
     val src = v.optString("src").trim()
     if (src.isBlank()) return false
     val quality = v.optString("quality").trim().takeIf { it.isNotBlank() && !it.equals("default", true) }
+    // video.name is the site's Arabic server label (e.g. "السيرفر الاول")
+    // — use indexed English labels instead.
     val label = buildString {
-        append("EgyBest - ${v.optString("name").trim().ifBlank { "Server" }}")
+        append("EgyBest - Server")
         if (!quality.isNullOrBlank()) append(" $quality")
     }
     Log.d(EGBEST_TAG, "[watch  ] video=$videoId type=${v.optString("type")} $label")
@@ -2117,7 +2119,7 @@ private suspend fun egBestResolveMovie(
         if (src.isBlank()) continue
         val quality = v.optString("quality").trim().takeIf { it.isNotBlank() && !it.equals("default", true) }
         val label = buildString {
-            append("EgyBest - ${v.optString("name").trim().ifBlank { "Server" }}")
+            append("EgyBest - Server ${i + 1}")
             if (!quality.isNullOrBlank()) append(" $quality")
         }
         found = egBestEmitVideo(src, label, EGBEST_MAIN_URL, subtitleCallback, callback) || found
