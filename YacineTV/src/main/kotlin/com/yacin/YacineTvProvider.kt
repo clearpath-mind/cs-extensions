@@ -49,6 +49,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("id") val id: Long? = null, // event id
         @JsonProperty("name") val name: String = "",
         @JsonProperty("poster") val poster: String? = null,
+        @JsonProperty("poster2") val poster2: String? = null, // match: other team logo
         @JsonProperty("plot") val plot: String? = null,
     )
 
@@ -136,6 +137,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("url") val url: String? = null,
         @JsonProperty("referer") val referer: String? = null,
         @JsonProperty("user_agent") val userAgent: String? = null,
+        @JsonProperty("url_type") val urlType: Int? = null,
         @JsonProperty("headers") val headers: Map<String, Any?>? = null,
     )
 
@@ -242,13 +244,18 @@ class YacineTvProvider : MainAPI() {
                 val matchItems = events.mapNotNull { e ->
                     val id = e.id ?: return@mapNotNull null
                     val title = eventTitle(e)
+                    // Homepage cards expose a single poster slot: team1 logo,
+                    // team2 as fallback. Detail page shows both (poster + background).
                     val poster = e.team1?.logo?.takeIf { it.isNotBlank() }
                         ?: e.team2?.logo?.takeIf { it.isNotBlank() }
+                    val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
+                        ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                     val data = LinkData(
                         kind = "event",
                         id = id,
                         name = title,
                         poster = poster,
+                        poster2 = poster2,
                         plot = eventPlot(e),
                     ).toJson()
                     newLiveSearchResponse(title, data, TvType.Live) {
@@ -256,7 +263,7 @@ class YacineTvProvider : MainAPI() {
                     }
                 }
                 if (matchItems.isNotEmpty()) {
-                    lists.add(HomePageList("⚽ مباريات اليوم", matchItems, isHorizontalImages = true))
+                    lists.add(HomePageList("Today's Matches", matchItems, isHorizontalImages = true))
                 }
             }
 
@@ -296,39 +303,66 @@ class YacineTvProvider : MainAPI() {
             }
 
             // 3) Remaining categories, each its own horizontal row.
+            // Parent categories with no direct channels (e.g. ARABIC CHANNELS)
+            // expose country sub-categories via categories/{id} -> one row each.
             val otherRows = otherCats.map { cat ->
                 async {
                     val channels = getChannels(cat.id)
-                    if (channels.isEmpty()) return@async null
-                    val seen = linkedMapOf<String, YacineChannel>()
-                    channels.forEach { ch ->
-                        val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
-                        seen.putIfAbsent(normalizeName(nm), ch)
+                    if (channels.isNotEmpty()) {
+                        return@async listOfNotNull(channelRow(cleanCategoryName(cat.name), channels))
                     }
-                    val items = seen.values.mapNotNull { ch ->
-                        val cid = ch.id ?: return@mapNotNull null
-                        val nm = ch.name?.trim() ?: return@mapNotNull null
-                        val data = LinkData(
-                            kind = "channel",
-                            ids = listOf(cid),
-                            name = nm,
-                            poster = ch.logo,
-                            plot = "شاهد بث مباشر لقناة $nm",
-                        ).toJson()
-                        newLiveSearchResponse(nm, data, TvType.Live) {
-                            this.posterUrl = ch.logo
+                    val subs = getSubcategories(cat.id)
+                    if (subs.isEmpty()) return@async emptyList()
+                    subs.map { sub ->
+                        async {
+                            val subChannels = getChannels(sub.id)
+                            if (subChannels.isEmpty()) return@async null
+                            val title = sub.name?.trim()?.takeIf { it.isNotBlank() }
+                                ?: cleanCategoryName(cat.name)
+                            channelRow(title, subChannels)
                         }
-                    }
-                    if (items.isEmpty()) return@async null
-                    HomePageList(cleanCategoryName(cat.name), items, isHorizontalImages = true)
+                    }.awaitAll().filterNotNull()
                 }
-            }.awaitAll().filterNotNull()
+            }.awaitAll().flatten()
 
             lists.addAll(otherRows)
             newHomePageResponse(lists)
         }
     }
 
+    /** Single horizontal channel row, deduped by normalized name. */
+    private fun channelRow(title: String, channels: List<YacineChannel>): HomePageList? {
+        val seen = linkedMapOf<String, YacineChannel>()
+        channels.forEach { ch ->
+            val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
+            seen.putIfAbsent(normalizeName(nm), ch)
+        }
+        val items = seen.values.mapNotNull { ch ->
+            val cid = ch.id ?: return@mapNotNull null
+            val nm = ch.name?.trim() ?: return@mapNotNull null
+            val data = LinkData(
+                kind = "channel",
+                ids = listOf(cid),
+                name = nm,
+                poster = ch.logo,
+                plot = "شاهد بث مباشر لقناة $nm",
+            ).toJson()
+            newLiveSearchResponse(nm, data, TvType.Live) {
+                this.posterUrl = ch.logo
+            }
+        }
+        if (items.isEmpty()) return null
+        return HomePageList(title, items, isHorizontalImages = true)
+    }
+
+    /** Child categories of a parent (e.g. ARABIC CHANNELS -> 20 countries). */
+    private suspend fun getSubcategories(categoryId: Int): List<YacineCategory> {
+        val (json) = getDecrypted("categories/$categoryId") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
     private data class MergedChannel(
         val name: String,
         var logo: String?,
@@ -350,15 +384,19 @@ class YacineTvProvider : MainAPI() {
 
             val channelDeferred = categories.map { cat ->
                 async {
-                    val tag = if (isBeinQuality(cat)) qualityTag(cat) else ""
-                    getChannels(cat.id).map { ch -> Triple(cat, ch, tag) }
+                    val direct = getChannels(cat.id)
+                    if (direct.isNotEmpty()) return@async direct
+                    // Parent category (e.g. ARABIC CHANNELS): search inside countries.
+                    getSubcategories(cat.id).map { sub ->
+                        async { getChannels(sub.id) }
+                    }.awaitAll().flatten()
                 }
             }.awaitAll().flatten()
 
             val out = mutableListOf<SearchResponse>()
             // Merge hits by channel name so beIN search results keep all quality ids.
             val mergedHits = linkedMapOf<String, SearchHit>()
-            channelDeferred.forEach { (_, ch, _) ->
+            channelDeferred.forEach { ch ->
                 val nm = ch.name?.trim() ?: return@forEach
                 if (!nm.contains(q, ignoreCase = true)) return@forEach
                 val cid = ch.id ?: return@forEach
@@ -392,12 +430,16 @@ class YacineTvProvider : MainAPI() {
                     .joinToString(" ")
                 if (!hay.contains(q, ignoreCase = true)) return@forEach
                 val id = e.id ?: return@forEach
-                val poster = e.team1?.logo ?: e.team2?.logo
+                val poster = e.team1?.logo?.takeIf { it.isNotBlank() }
+                    ?: e.team2?.logo?.takeIf { it.isNotBlank() }
+                val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
+                    ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                 val data = LinkData(
                     kind = "event",
                     id = id,
                     name = title,
                     poster = poster,
+                    poster2 = poster2,
                     plot = eventPlot(e),
                 ).toJson()
                 out.add(
@@ -417,6 +459,10 @@ class YacineTvProvider : MainAPI() {
             else "شاهد بث مباشر لقناة ${data.name}"
         return newMovieLoadResponse(data.name, url, TvType.Live, url) {
             this.posterUrl = data.poster
+            // Matches: second team logo as backdrop (cards only fit one logo).
+            if (!data.poster2.isNullOrBlank()) {
+                this.backgroundPosterUrl = data.poster2
+            }
             this.plot = plot
         }
     }
@@ -488,6 +534,18 @@ class YacineTvProvider : MainAPI() {
             if (!seenUrls.add(raw)) return
             val headers = streamHeaders(s)
             val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
+            val lower = raw.lowercase()
+            // url_type 5/6 (and other non-media pages like mbch.live / arab-stream.live)
+            // are web players, not streams: hand them to the extractor registry.
+            val isDirect = ".m3u8" in lower || s.urlType == 1 || s.urlType == 3 ||
+                lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".ts")
+            if (!isDirect) {
+                var resolved = false
+                val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
+                runCatching { loadExtractor(raw, headers["Referer"], subtitleCallback, countCb) }
+                if (resolved) found = true
+                return
+            }
             callback.invoke(
                 newExtractorLink(
                     this.name,
