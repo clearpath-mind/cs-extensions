@@ -452,6 +452,12 @@ private fun cfHeaders(
 private fun takeSolverHtml(solved: SolverResult, url: String): String? {
     val html = solved.html
     if (html.isNullOrBlank() || isCfChallenge(html)) return null
+    // Captured too early (cookie set before real navigation) the DOM is an
+    // empty shell — never accept it, fall through to the refetch instead.
+    if (html.length < 500) {
+        Log.d(TAG, "[cfGet  ] solved DOM trivial (${html.length} chars), refetching")
+        return null
+    }
     val same = runCatching {
         val a = java.net.URI(solved.finalUrl)
         val b = java.net.URI(url)

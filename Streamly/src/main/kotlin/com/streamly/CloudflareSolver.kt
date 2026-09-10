@@ -74,16 +74,14 @@ object CloudflareSolver {
                 var bypassWatching = false
                 val pollingHandler = Handler(Looper.getMainLooper())
 
-                fun finishSuccess(finalUrl: String, reason: String = "unknown") {
+                fun finishSuccess(finalUrl: String, reason: String = "unknown", awaitContent: Boolean = true) {
                     if (isSolved) return
                     isSolved = true
-                    Log.i(TAG, "solved | reason: $reason | finalUrl: $finalUrl")
+                    Log.i(TAG, "clearance | reason: $reason | finalUrl: $finalUrl")
 
                     cookieManager.flush()
-                    // The WebView already holds the cleared page: capture its DOM so
-                    // callers don't need a redundant OkHttp refetch (whose bridged
-                    // clearance Cloudflare may reject).
                     pollingHandler.removeCallbacksAndMessages(null)
+
                     var delivered = false
                     fun deliver(html: String?) {
                         if (delivered) return
@@ -104,14 +102,58 @@ object CloudflareSolver {
 
                         continuation.resume(SolverResult(finalUrl, finalCookies, cleanHtml))
                     }
-                    pollingHandler.postDelayed({ deliver(null) }, 8000)
-                    try {
-                        webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
-                            deliver(html)
-                        }
-                    } catch (e: Exception) {
+
+                    if (!awaitContent) {
                         deliver(null)
+                        return
                     }
+
+                    // Phase 2: Cloudflare sets cf_clearance BEFORE navigating to the
+                    // real page — capturing outerHTML immediately yields an empty
+                    // shell. Wait for rendered content instead.
+                    var lastUrl: String? = null
+                    var stableSince = SystemClock.uptimeMillis()
+                    pollingHandler.postDelayed({ deliver(null) }, 30000)
+                    fun poll() {
+                        if (delivered) return
+                        val js = """
+                            (function(){try{
+                                var html = document.documentElement.innerHTML || "";
+                                var t = document.body ? document.body.innerText : "";
+                                var ch = /just a moment|checking your browser|verify you are human|performing security verification/i.test(html);
+                                return document.readyState + "|" + t.length + "|" + ch + "|" + location.href;
+                            }catch(e){ return "loading|0|true|"; }})();
+                        """.trimIndent()
+                        try {
+                            webView.evaluateJavascript(js) { res ->
+                                if (delivered) return@evaluateJavascript
+                                val parts = res?.removeSurrounding("\"")?.split("|") ?: emptyList()
+                                if (parts.size < 4) {
+                                    pollingHandler.postDelayed({ poll() }, 500)
+                                    return@evaluateJavascript
+                                }
+                                val ready = parts[0]
+                                val textLen = parts[1].toIntOrNull() ?: 0
+                                val challenged = parts[2].toBoolean()
+                                val currentUrl = parts[3]
+                                val now = SystemClock.uptimeMillis()
+                                if (currentUrl != lastUrl) {
+                                    lastUrl = currentUrl
+                                    stableSince = now
+                                }
+                                if (ready == "complete" && !challenged && textLen > 500 && now - stableSince > 1500) {
+                                    webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
+                                        deliver(html)
+                                    }
+                                } else {
+                                    pollingHandler.postDelayed({ poll() }, 500)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            deliver(null)
+                        }
+                    }
+                    poll()
                 }
 
                 pollingHandler.postDelayed({
@@ -233,7 +275,7 @@ object CloudflareSolver {
                         // 60s — bail out so the caller can try the next mirror.
                         if (request?.isForMainFrame == true && failing == initialUrl) {
                             pollingHandler.postDelayed({
-                                if (!isSolved) finishSuccess(initialUrl, "load-error")
+                                if (!isSolved) finishSuccess(initialUrl, "load-error", awaitContent = false)
                             }, 5000)
                         }
                     }
