@@ -611,12 +611,54 @@ suspend fun invokeTopCinema(
 
 private suspend fun searchSite(query: String, type: String): List<Candidate> {
     val direct = searchOnce(query, type)
-    if (direct.isNotEmpty() || type == "all") return direct
+    // WP-API discovery (same index, exact post URLs); HTML stays as the base.
+    val api = topcinemaApiSearch(query, type)
+    val merged = (direct + api).distinctBy { it.url }
+    if (merged.isNotEmpty() || type == "all") return merged
 
     // Some posts are not indexed under their section; try unfiltered search
     val fallback = searchOnce(query, "all")
     Log.d(TAG, "[search ] '$type' empty for '$query', fallback 'all' -> ${fallback.size} cards")
     return fallback
+}
+
+/**
+ * TopCinema WordPress REST discovery: /wp-json/wp/v2/search returns exact
+ * post URLs (title + url). Filtered by section to preserve the type=
+ * behavior; the HTML search stays as base/fallback.
+ */
+private suspend fun topcinemaApiSearch(query: String, type: String): List<Candidate> {
+    val out = ArrayList<Candidate>()
+    val want = when (type) {
+        "movies" -> "/movies/"
+        "series" -> "/series/"
+        else -> null
+    }
+    return try {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val endpoint = "${topcinemaBase()}/wp-json/wp/v2/search?search=$encoded&per_page=100"
+        val html = cfGetText(endpoint, timeout = 15000)
+        val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
+        if (jsonText.isBlank()) return emptyList()
+        val arr = org.json.JSONArray("[$jsonText]")
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val href = o.optString("url").trim()
+            if (!href.startsWith("http")) continue
+            if (want != null && !href.contains(want)) continue
+            val slug = decodeSlug(href)
+            if (slug.isBlank()) continue
+            val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            if (candidate.latinTitle.isBlank()) continue
+            if (out.any { it.url == href }) continue
+            out.add(candidate)
+        }
+        Log.d(TAG, "[api    ] $endpoint -> ${out.size} posts")
+        out
+    } catch (e: Exception) {
+        Log.e(TAG, "[api    ] TopCinema WP search failed: ${e.message}")
+        out
+    }
 }
 
 private suspend fun searchOnce(query: String, type: String): List<Candidate> {
@@ -1525,6 +1567,54 @@ private suspend fun egydeadSearch(query: String, maxPages: Int = 3): List<Candid
     return out
 }
 
+/**
+ * EgyDead WordPress REST discovery: /wp-json/wp/v2/search returns exact
+ * post URLs + Arabic titles (e.g. moana-2026-1080p-web-dl). Fetched through
+ * the WebView transport like everything else EgyDead. Merged with the HTML
+ * search pool; HTML stays as fallback.
+ */
+private suspend fun egydeadApiSearch(query: String): List<Candidate> {
+    val out = ArrayList<Candidate>()
+    val encoded = URLEncoder.encode(query, "UTF-8")
+    val seeds = linkedSetOf(egydeadBase(), EGYDEAD_KNOWN_MIRROR)
+    for (seed in seeds) {
+        val endpoint = "$seed/wp-json/wp/v2/search?search=$encoded&per_page=100"
+        try {
+            val html = egydeadWebText(endpoint, timeout = 45000)
+            val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
+            if (jsonText.isBlank()) continue
+            val arr = org.json.JSONArray("[$jsonText]")
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                var href = o.optString("url").trim()
+                if (href.isBlank()) continue
+                if (!href.startsWith("http")) href = fixUrl(href, seed)
+                if (!href.startsWith("http")) continue
+                val slug = decodeSlug(href)
+                if (slug.isBlank()) continue
+                val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+                if (candidate.latinTitle.isBlank()) continue
+                if (out.any { it.url == href }) continue
+                out.add(candidate)
+            }
+            Log.d(EGYDEAD_TAG, "[api    ] $endpoint -> ${out.size} total")
+            if (out.isNotEmpty()) break
+        } catch (e: Exception) {
+            Log.e(EGYDEAD_TAG, "[api    ] $endpoint failed: ${e.message}")
+        }
+    }
+    return out
+}
+
+/** Shared fuzzy score plus EgyDead slug preferences: dubbed posts sink,
+ *  subtitled (مترجم) posts get a nudge. */
+private fun egydeadScore(candidate: Candidate, title: String, year: Int?): Int {
+    var score = scoreCandidate(candidate, title, year)
+    if (candidate.slug.contains("مدبلج")) score -= 10
+    else if (candidate.slug.contains("مترجم")) score += 5
+    return score
+}
+
 private suspend fun egydeadExtract(
     postUrl: String,
     subtitleCallback: (SubtitleFile) -> Unit,
@@ -1550,7 +1640,7 @@ private suspend fun egydeadExtract(
                 Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
             }
         if (films.isNotEmpty() && title != null) {
-            val bestFilm = films.map { it to scoreCandidate(it, title, year) }
+            val bestFilm = films.map { it to egydeadScore(it, title, year) }
                 .maxByOrNull { it.second }
             Log.d(EGYDEAD_TAG, "[collect] ${films.size} films on $postUrl best=${bestFilm?.first?.url} score=${bestFilm?.second}")
             if (bestFilm != null && bestFilm.second >= MIN_SCORE_MOVIE) {
@@ -1716,7 +1806,8 @@ private suspend fun egydeadResolveMovie(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val scored = egydeadSearch(title).map { it to scoreCandidate(it, title, year) }
+    val pool = (egydeadSearch(title) + egydeadApiSearch(title)).distinctBy { it.url }
+    val scored = pool.map { it to egydeadScore(it, title, year) }
     Log.d(EGYDEAD_TAG, "[search ] movie '$title' year=$year -> ${scored.size} candidates")
     scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
         Log.d(EGYDEAD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} ${c.url}")
@@ -1752,7 +1843,7 @@ private suspend fun egydeadResolveEpisode(
 ): Boolean {
     // Preferred path: search results include per-season pages
     // (/season/…الموسم-N…) that list every episode with الحلقة-N numbering.
-    val results = egydeadSearch(title)
+    val results = (egydeadSearch(title) + egydeadApiSearch(title)).distinctBy { it.url }
     val seasonPage = results
         .filter { it.url.contains("/season/") }
         .map { it to egydeadSeasonFromSlug(it.slug) }
@@ -1784,7 +1875,7 @@ private suspend fun egydeadResolveEpisode(
             val m = EGYDEAD_EPISODE_URL_REGEX.find(decodeSlug(c.url)) ?: return@mapNotNull null
             val s = m.groupValues[1].toIntOrNull() ?: return@mapNotNull null
             val e = m.groupValues[2].toIntOrNull() ?: return@mapNotNull null
-            val score = scoreCandidate(c, title, year)
+            val score = egydeadScore(c, title, year)
             Triple(c, s to e, score)
         }
         .filter { (_, se, score) -> se.first == season && se.second == episode && score >= MIN_SCORE_SERIES }
