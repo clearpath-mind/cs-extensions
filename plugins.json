@@ -2,14 +2,14 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
         "status": 1,
-        "version": 31,
+        "version": 32,
         "name": "Streamly",
         "internalName": "Streamly",
         "authors": [
             "clearpath-mind"
         ],
         "description": "Streamly - Watch movies and series with Arabic subtitles",
-        "fileSize": 210429,
+        "fileSize": 210549,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -17,19 +17,19 @@
             "TvSeries"
         ],
         "apiVersion": 1,
-        "fileHash": "sha256-e3bf9bceaa3c5725df1e42b8830cbd2430657b195fb9aeb2719c72c33b5e732b"
+        "fileHash": "sha256-135e7012f1c344d2d6117dff733686eb0cde59dbbd9927bfded4c13fafc1dd2f"
     },
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
         "status": 1,
-        "version": 16,
+        "version": 17,
         "name": "YacineTV",
         "internalName": "YacineTV",
         "authors": [
             "clearpath-mind"
         ],
         "description": "YacineTV - Live sports, matches of the day and Arabic live channels",
-        "fileSize": 71446,
+        "fileSize": 72152,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -37,6 +37,6 @@
         ],
         "iconUrl": "https://yt3.googleusercontent.com/ulm35tweg3do5istps0TgCjMmJSVczGUL2NIrXMwI1DDRi5ty29BIzQSUHVgqZN5CSo1PHhiA6M=s900-c-k-c0x00ffffff-no-rj",
         "apiVersion": 1,
-        "fileHash": "sha256-4fdd097b7a6c62825662ede621e565e44e4b72d1e92c308d3dad3b10d56f8c5f"
+        "fileHash": "sha256-5c05c88073283d79a469300c73cd1df1fc1bf8529bf6aed1680914a820ac07fc"
     }
 ]
