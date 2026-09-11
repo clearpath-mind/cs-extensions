@@ -213,6 +213,7 @@ class YacineTvProvider : MainAPI() {
     private fun cleanCategoryName(name: String?): String {
         val n = (name ?: "أخرى").trim()
         if (beinQualityRegex.containsMatchIn(n)) return "beIN SPORTS"
+        if (normalizeName(n) == "mbc channels") return "MBC Channels"
         return n
     }
 
@@ -355,8 +356,8 @@ class YacineTvProvider : MainAPI() {
             }
 
             // 3) Curated homepage rows only:
-            // Today's Matches, beIN SPORTS, Morocco, MBC CHANNELS, KIDS CHANNELS.
-            val wantedTopRows = setOf("mbc channels", "kids channels")
+            // Today's Matches, beIN SPORTS, Morocco Channels, MBC Channels.
+            val wantedTopRows = setOf("mbc channels")
             val otherRows = otherCats.mapNotNull { cat ->
                 val norm = normalizeName(cat.name ?: "")
                 when {
@@ -378,7 +379,7 @@ class YacineTvProvider : MainAPI() {
                     } ?: return@async emptyList()
                     val subChannels = getChannels(morocco.id)
                     if (subChannels.isEmpty()) return@async emptyList()
-                    listOfNotNull(channelRow("Morocco", subChannels, moroccoThumbs))
+                    listOfNotNull(channelRow("Morocco Channels", subChannels, moroccoThumbs))
                 }
             }.awaitAll().flatten()
 
@@ -581,9 +582,9 @@ class YacineTvProvider : MainAPI() {
             val categories = getCategories()
             val q = query.trim()
 
-            // Search mirrors the curated homepage: beIN qualities, Morocco,
-            // MBC CHANNELS, KIDS CHANNELS (+ events below).
-            val wantedTopRows = setOf("mbc channels", "kids channels")
+            // Search mirrors the curated homepage: beIN qualities, Morocco Channels,
+            // MBC Channels (+ events below).
+            val wantedTopRows = setOf("mbc channels")
             val channelDeferred = categories.mapNotNull { cat ->
                 if (isBeinQuality(cat)) return@mapNotNull cat to false
                 val norm = normalizeName(cat.name ?: "")
