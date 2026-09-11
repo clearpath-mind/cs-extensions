@@ -7,6 +7,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Shader
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -413,12 +414,12 @@ class YacineTvProvider : MainAPI() {
         val l2 = e.team2?.logo?.takeIf { it.isNotBlank() }
         if (l1.isNullOrBlank() && l2.isNullOrBlank()) return null
         val ctx = appContext ?: return null
-        // v3 layout (competition top-center, smaller VS): new filename
+        // v4 layout (crest discs, comp/VS pills): new filename so stale files regenerate.
         // so stale v2 files regenerate.
         return withContext(Dispatchers.IO) {
             runCatching {
                 val dir = File(ctx.cacheDir, "yacine_banners").apply { mkdirs() }
-                val out = File(dir, "match_${id}_v3.png")
+                val out = File(dir, "match_${id}_v4.png")
                 if (out.exists() && out.length() > 0) {
                     bannerCache[id] = out.absolutePath
                     return@runCatching out.absolutePath
@@ -456,18 +457,27 @@ class YacineTvProvider : MainAPI() {
         val c = Canvas(bmp)
         val grad = LinearGradient(
             0f, 0f, w.toFloat(), h.toFloat(),
-            Color.parseColor("#3A0D0D"), Color.parseColor("#0D0303"),
+            Color.parseColor("#2B0A0A"), Color.parseColor("#0B0202"),
             Shader.TileMode.CLAMP,
         )
         c.drawRect(0f, 0f, w.toFloat(), h.toFloat(), Paint().apply { shader = grad })
-        // Soft center glow, like the reference banners.
+        // Faint center glow to lift the middle off the dark gradient.
         c.drawCircle(
-            w / 2f, h / 2f, 150f,
-            Paint().apply { color = Color.argb(28, 255, 200, 200); isAntiAlias = true },
+            w / 2f, h / 2f, 170f,
+            Paint().apply { color = Color.argb(22, 255, 190, 190); isAntiAlias = true },
         )
         fun drawCrest(b: Bitmap?, cx: Float) {
             if (b == null) return
-            val maxSide = 380
+            // White disc backdrop + shadow so any crest reads clean.
+            c.drawCircle(
+                cx, h / 2f, 205f,
+                Paint().apply {
+                    color = Color.argb(26, 255, 255, 255)
+                    isAntiAlias = true
+                    setShadowLayer(24f, 0f, 10f, Color.argb(120, 0, 0, 0))
+                },
+            )
+            val maxSide = 330
             val scale = minOf(
                 maxSide / b.width.toFloat(),
                 maxSide / b.height.toFloat(),
@@ -478,30 +488,54 @@ class YacineTvProvider : MainAPI() {
             val s = Bitmap.createScaledBitmap(b, dw, dh, true)
             c.drawBitmap(
                 s, cx - dw / 2f, h / 2f - dh / 2f,
-                Paint().apply { isFilterBitmap = true; isAntiAlias = true },
+                Paint().apply {
+                    isFilterBitmap = true
+                    isAntiAlias = true
+                    setShadowLayer(16f, 0f, 8f, Color.argb(140, 0, 0, 0))
+                },
             )
             if (s != b) s.recycle()
         }
         drawCrest(left, w * 0.22f)
         drawCrest(right, w * 0.78f)
-        val textPaint = Paint().apply {
+        // Competition pill top-center (Canvas shapes Arabic correctly).
+        compName?.let {
+            val p = Paint().apply {
+                color = Color.WHITE
+                textSize = 34f
+                textAlign = Paint.Align.CENTER
+                isAntiAlias = true
+            }
+            val tw = p.measureText(it)
+            val padH = 44f
+            val top = 40f
+            val pill = RectF(w / 2f - tw / 2f - padH, top, w / 2f + tw / 2f + padH, top + 34f + 44f)
+            c.drawRoundRect(
+                pill, 40f, 40f,
+                Paint().apply { color = Color.argb(150, 0, 0, 0); isAntiAlias = true },
+            )
+            c.drawText(it, w / 2f, top + 22f + 30f, p)
+        }
+        // VS pill in the middle.
+        val vsPaint = Paint().apply {
             color = Color.WHITE
+            textSize = 64f
+            isFakeBoldText = true
             textAlign = Paint.Align.CENTER
             isAntiAlias = true
+            setShadowLayer(10f, 0f, 4f, Color.argb(160, 0, 0, 0))
         }
-        // Competition name top-center (Canvas shapes Arabic correctly).
-        compName?.let {
-            c.drawText(it, w / 2f, 84f, textPaint.apply { textSize = 38f })
-        }
-        // VS in the middle, with shadow for contrast.
-        c.drawText(
-            "VS", w / 2f, h / 2f + 30f,
-            textPaint.apply {
-                textSize = 84f
-                isFakeBoldText = true
-                setShadowLayer(12f, 0f, 4f, Color.argb(160, 0, 0, 0))
+        val vsW = vsPaint.measureText("VS")
+        val vsPill = RectF(w / 2f - vsW / 2f - 36f, h / 2f - 58f, w / 2f + vsW / 2f + 36f, h / 2f + 58f)
+        c.drawRoundRect(
+            vsPill, 58f, 58f,
+            Paint().apply {
+                color = Color.parseColor("#C8102E")
+                isAntiAlias = true
+                setShadowLayer(18f, 0f, 8f, Color.argb(140, 0, 0, 0))
             },
         )
+        c.drawText("VS", w / 2f, h / 2f + 22f, vsPaint)
         return bmp
     }
 

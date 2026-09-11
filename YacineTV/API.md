@@ -109,10 +109,10 @@ the same items twice.
 ## Match banners
 
 `Today's Matches` cards use on-device 1280x720 composite banners —
-competition name top-center, smaller VS (84sp) in the middle, both team
-crests on a dark gradient (`matchBanner()`/`renderBanner()`), cached under
-`cacheDir/yacine_banners` per event id (`match_{id}_v3.png`) with API-logo
-fallback.
+competition pill top-center, VS pill (64sp) in the middle, crests on
+white disc backdrops with shadows (`matchBanner()`/`renderBanner()`),
+cached under `cacheDir/yacine_banners` per event id (`match_{id}_v4.png`)
+with API-logo fallback.
 
 ## Match details
 

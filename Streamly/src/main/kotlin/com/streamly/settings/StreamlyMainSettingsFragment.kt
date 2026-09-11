@@ -109,8 +109,9 @@ class StreamlyMainSettingsFragment(
         saveIcon.setOnClickListener {
             showToast("Settings saved")
             dismiss()
-            // Reload the app so the new settings take effect.
-            CommonActivity.activity?.recreate()
+            // Reload the app so the new settings take effect (posted after
+            // dismiss so the fragment transaction completes first).
+            activity?.runOnUiThread { CommonActivity.activity?.recreate() }
         }
 
         return view

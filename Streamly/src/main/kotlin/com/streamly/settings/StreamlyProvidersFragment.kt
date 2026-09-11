@@ -20,7 +20,6 @@ import androidx.core.content.edit
 import androidx.core.view.isNotEmpty
 import androidx.core.widget.addTextChangedListener
 import androidx.fragment.app.DialogFragment
-import com.lagradost.cloudstream3.CommonActivity
 import com.streamly.BuildConfig
 import com.streamly.Provider
 import com.streamly.ProvidersList
@@ -193,9 +192,8 @@ class StreamlyProvidersFragment(
     }
 
     private fun dismissFragment() {
+        // Sources just save (persisted per-toggle); no app reload here.
         dismiss()
-        // Reload the app so the new provider selection takes effect.
-        CommonActivity.activity?.recreate()
     }
 
     inner class ProviderAdapter(
