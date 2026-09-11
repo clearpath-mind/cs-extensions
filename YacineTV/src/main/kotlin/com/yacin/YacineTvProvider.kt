@@ -83,6 +83,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("competition") val competition: String? = null, // match: champions
         @JsonProperty("commentary") val commentary: String? = null, // match: commentator
         @JsonProperty("kickoff") val kickoff: String? = null, // match: formatted start time
+        @JsonProperty("related") val related: List<LinkData>? = null, // detail recommendations
         @JsonProperty("plot") val plot: String? = null,
     )
 
@@ -288,7 +289,7 @@ class YacineTvProvider : MainAPI() {
                 val banners = events.map { e ->
                     async { withTimeoutOrNull(12_000) { matchBanner(e) } }
                 }.awaitAll()
-                val matchItems = events.zip(banners).mapNotNull { (e, banner) ->
+                val matchLinks = events.zip(banners).mapNotNull { (e, banner) ->
                     val id = e.id ?: return@mapNotNull null
                     val title = eventTitle(e)
                     // Composite banner when renderable, else team1 logo with
@@ -298,7 +299,7 @@ class YacineTvProvider : MainAPI() {
                         ?: e.team2?.logo?.takeIf { it.isNotBlank() }
                     val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
                         ?: e.team1?.logo?.takeIf { it.isNotBlank() }
-                    val data = LinkData(
+                    LinkData(
                         kind = "event",
                         id = id,
                         name = title,
@@ -309,9 +310,15 @@ class YacineTvProvider : MainAPI() {
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
                         plot = matchPlot(title),
-                    ).toJson()
-                    newLiveSearchResponse(title, data, TvType.Live) {
-                        this.posterUrl = poster
+                    )
+                }
+                // Detail recommendations: the other matches (no extra network).
+                val matchItems = matchLinks.map { link ->
+                    val withRelated = link.copy(
+                        related = matchLinks.filter { it.id != link.id }.take(12),
+                    )
+                    newLiveSearchResponse(link.name, withRelated.toJson(), TvType.Live) {
+                        this.posterUrl = link.poster
                     }
                 }
                 if (matchItems.isNotEmpty()) {
@@ -337,17 +344,23 @@ class YacineTvProvider : MainAPI() {
                         }
                     }
                 }
-                val beinItems = merged.values.map { m ->
+                val beinLinks = merged.values.map { m ->
                     val logo = m.logo?.takeIf { it.isNotBlank() }
-                    val data = LinkData(
+                    LinkData(
                         kind = "channel",
                         ids = m.ids.map { it.first }.distinct(),
                         name = m.name,
                         poster = logo,
-                        plot = "شاهد بث مباشر لقناة ${m.name}",
-                    ).toJson()
-                    newLiveSearchResponse(m.name, data, TvType.Live) {
-                        this.posterUrl = logo
+                        plot = "شاهد البث المباشر لقناة ${m.name}",
+                    )
+                }
+                // Detail recommendations: row siblings (no extra network).
+                val beinItems = beinLinks.map { link ->
+                    val withRelated = link.copy(
+                        related = beinLinks.filter { it.name != link.name }.take(12),
+                    )
+                    newLiveSearchResponse(link.name, withRelated.toJson(), TvType.Live) {
+                        this.posterUrl = link.poster
                     }
                 }
                 if (beinItems.isNotEmpty()) {
@@ -518,20 +531,26 @@ class YacineTvProvider : MainAPI() {
             val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
             seen.putIfAbsent(normalizeName(nm), ch)
         }
-        val items = seen.values.mapNotNull { ch ->
+        val links = seen.values.mapNotNull { ch ->
             val cid = ch.id ?: return@mapNotNull null
             val nm = ch.name?.trim() ?: return@mapNotNull null
             val logo = thumbOverrides?.get(normalizeName(nm))?.takeIf { it.isNotBlank() }
                 ?: ch.logo?.takeIf { it.isNotBlank() }
-            val data = LinkData(
+            LinkData(
                 kind = "channel",
                 ids = listOf(cid),
                 name = nm,
                 poster = logo,
-                plot = "شاهد بث مباشر لقناة $nm",
-            ).toJson()
-            newLiveSearchResponse(nm, data, TvType.Live) {
-                this.posterUrl = logo
+                plot = "شاهد البث المباشر لقناة $nm",
+            )
+        }
+        // Detail recommendations: row siblings (no extra network).
+        val items = links.map { link ->
+            val withRelated = link.copy(
+                related = links.filter { it.name != link.name }.take(12),
+            )
+            newLiveSearchResponse(link.name, withRelated.toJson(), TvType.Live) {
+                this.posterUrl = link.poster
             }
         }
         if (items.isEmpty()) return null
@@ -615,7 +634,7 @@ class YacineTvProvider : MainAPI() {
                     ids = hit.ids.toList(),
                     name = hit.name,
                     poster = logo,
-                    plot = "شاهد بث مباشر لقناة ${hit.name}",
+                    plot = "شاهد البث المباشر لقناة ${hit.name}",
                 ).toJson()
                 out.add(
                     newLiveSearchResponse(hit.name, data, TvType.Live) {
@@ -660,7 +679,7 @@ class YacineTvProvider : MainAPI() {
         val data = parseJson<LinkData>(url)
         val plot = data.plot
             ?: if (data.kind == "event") matchPlot(data.name)
-            else "شاهد بث مباشر لقناة ${data.name}"
+            else "شاهد البث المباشر لقناة ${data.name}"
         return newMovieLoadResponse(data.name, url, TvType.Live, url) {
             this.posterUrl = data.poster
             // Matches: hero shows the same homepage thumbnail (banner);
@@ -679,6 +698,14 @@ class YacineTvProvider : MainAPI() {
                     data.channel?.takeIf { it.isNotBlank() },
                 )
                 if (tags.isNotEmpty()) this.tags = tags
+            }
+            // Recommendations ride in LinkData (row siblings / other matches).
+            data.related?.takeIf { it.isNotEmpty() }?.let { related ->
+                this.recommendations = related.map { rel ->
+                    newLiveSearchResponse(rel.name, rel.toJson(), TvType.Live) {
+                        this.posterUrl = rel.poster
+                    }
+                }
             }
         }
     }

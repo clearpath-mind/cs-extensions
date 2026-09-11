@@ -120,6 +120,13 @@ Plot is `شاهد البث المباشر لمباراة {title}`. Competition, 
 digits, `dd/MM - HH:mm`), commentator, and broadcast channel — in that
 order — ride in `LinkData` and render as tags on the detail page. The
 detail hero shows the same homepage banner thumbnail.
+
+## Recommendations
+
+Card `LinkData` carries up to 12 row siblings (matches → other matches,
+channels → same-row channels) in `related`; `load()` exposes them as
+`recommendations` with zero extra network. Channel plots use
+`شاهد البث المباشر لقناة {name}` everywhere.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 
