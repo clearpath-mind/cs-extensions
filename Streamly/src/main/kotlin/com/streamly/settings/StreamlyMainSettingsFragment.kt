@@ -12,6 +12,7 @@ import android.widget.LinearLayout
 import android.widget.Switch
 import androidx.core.content.edit
 import androidx.fragment.app.DialogFragment
+import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.streamly.BuildConfig
 import com.streamly.StreamlyPlugin
@@ -108,6 +109,8 @@ class StreamlyMainSettingsFragment(
         saveIcon.setOnClickListener {
             showToast("Settings saved")
             dismiss()
+            // Reload the app so the new settings take effect.
+            CommonActivity.activity?.recreate()
         }
 
         return view
