@@ -99,6 +99,19 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
   feed for MBC 3. MBC 2 / Action / Max have no reachable public stream
   (Free-TV restreams time out from both CI and device) and were removed.
 
+## Search
+
+`GET /search?query={q}` (param must be `query`; Latin only, Arabic returns
+empty) searches channels globally across all quality groups — including
+entries the category crawl never sees (`beIN XTRA 1/2/3`, `RMC Sport`,
+`DAZN 1/2`). The provider uses it directly (one request, hits merged by
+name to keep all quality ids); match events are still matched locally.
+Channel aliases returning the same payload: `channel/{id}/servers`,
+`channel/{id}/links`, `event/{id}/servers`, `event/{id}/details`.
+Nesting: `categories/9/15` lists the 20 ARABIC subcountries (leaf
+`categories/15` is empty). `GET /config` is app config (ads, version,
+player APK), not content.
+
 ## Homepage pagination (no duplicates)
 
 All rows fit on one page (no API pagination). `getMainPage` answers

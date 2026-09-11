@@ -379,7 +379,7 @@ class YacineTvProvider : MainAPI() {
                     } ?: return@async emptyList()
                     val subChannels = getChannels(morocco.id)
                     if (subChannels.isEmpty()) return@async emptyList()
-                    listOfNotNull(channelRow("Morocco Channels", subChannels, moroccoThumbs))
+                    listOfNotNull(channelRow("Moroccan Channels", subChannels, moroccoThumbs))
                 }
             }.awaitAll().flatten()
 
@@ -579,37 +579,23 @@ class YacineTvProvider : MainAPI() {
         if (query.isBlank()) return emptyList()
         return coroutineScope {
             val eventsDeferred = async { getEvents() }
-            val categories = getCategories()
             val q = query.trim()
 
-            // Search mirrors the curated homepage: beIN qualities, Morocco Channels,
-            // MBC Channels (+ events below).
-            val wantedTopRows = setOf("mbc channels")
-            val channelDeferred = categories.mapNotNull { cat ->
-                if (isBeinQuality(cat)) return@mapNotNull cat to false
-                val norm = normalizeName(cat.name ?: "")
-                when {
-                    norm == "arabic channels" || cat.id == 9 -> cat to true // parent
-                    wantedTopRows.contains(norm) -> cat to false
-                    else -> null
-                }
-            }.map { (cat, isParent) ->
-                async {
-                    if (!isParent) return@async getChannels(cat.id)
-                    val subs = getSubcategories(cat.id)
-                    val morocco = subs.firstOrNull {
-                        it.id == 15 || normalizeName(it.name ?: "") == "morocco"
-                    } ?: return@async emptyList()
-                    getChannels(morocco.id)
-                }
-            }.awaitAll().flatten()
+            // Server-side global channel search (Latin only, all quality
+            // groups incl. XTRA/RMC/DAZN): one request instead of crawling
+            // every curated category. Events are still matched locally below.
+            val channelHits = runCatching {
+                val (json) = getDecrypted("search?query=${URLEncoder.encode(q, "UTF-8")}")
+                    ?: return@runCatching emptyList<YacineChannel>()
+                if (json.isBlank()) return@runCatching emptyList<YacineChannel>()
+                parseJson<YacineChannelResponse>(json).data ?: emptyList()
+            }.getOrNull() ?: emptyList()
 
             val out = mutableListOf<SearchResponse>()
             // Merge hits by channel name so beIN search results keep all quality ids.
             val mergedHits = linkedMapOf<String, SearchHit>()
-            channelDeferred.forEach { ch ->
+            channelHits.forEach { ch ->
                 val nm = ch.name?.trim() ?: return@forEach
-                if (!nm.contains(q, ignoreCase = true)) return@forEach
                 val cid = ch.id ?: return@forEach
                 val key = "c:${normalizeName(nm)}"
                 val cur = mergedHits[key]
