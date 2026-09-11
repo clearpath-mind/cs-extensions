@@ -1,5 +1,6 @@
 package com.streamly.settings
 
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Resources
 import android.graphics.drawable.Drawable
@@ -10,9 +11,9 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Switch
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.edit
 import androidx.fragment.app.DialogFragment
-import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.streamly.BuildConfig
 import com.streamly.StreamlyPlugin
@@ -107,13 +108,32 @@ class StreamlyMainSettingsFragment(
         }
 
         saveIcon.setOnClickListener {
-            showToast("Settings saved")
-            dismiss()
-            // Reload the app so the new settings take effect (posted after
-            // dismiss so the fragment transaction completes first).
-            activity?.runOnUiThread { CommonActivity.activity?.recreate() }
+            AlertDialog.Builder(requireContext())
+                .setTitle("Restart Required")
+                .setMessage("Settings have been saved. Restart the app to apply them?")
+                .setPositiveButton("Yes") { _, _ ->
+                    dismiss()
+                    restartApp()
+                }
+                .setNegativeButton("No") { dialog, _ ->
+                    dialog.dismiss()
+                    showToast("Settings saved. Restart app to apply changes.")
+                }
+                .show()
         }
 
         return view
+    }
+
+    /** Full app restart (Cricify-style): uses applicationContext so it
+     * survives the fragment dismiss. */
+    private fun restartApp() {
+        val context = requireContext().applicationContext
+        val component = context.packageManager
+            .getLaunchIntentForPackage(context.packageName)?.component
+        if (component != null) {
+            context.startActivity(Intent.makeRestartActivityTask(component))
+            Runtime.getRuntime().exit(0)
+        }
     }
 }
