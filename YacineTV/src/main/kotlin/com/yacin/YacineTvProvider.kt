@@ -413,11 +413,12 @@ class YacineTvProvider : MainAPI() {
         val l2 = e.team2?.logo?.takeIf { it.isNotBlank() }
         if (l1.isNullOrBlank() && l2.isNullOrBlank()) return null
         val ctx = appContext ?: return null
-        // v2 layout (VS + competition): new filename so stale v1 files regenerate.
+        // v3 layout (competition top-center, smaller VS): new filename
+        // so stale v2 files regenerate.
         return withContext(Dispatchers.IO) {
             runCatching {
                 val dir = File(ctx.cacheDir, "yacine_banners").apply { mkdirs() }
-                val out = File(dir, "match_${id}_v2.png")
+                val out = File(dir, "match_${id}_v3.png")
                 if (out.exists() && out.length() > 0) {
                     bannerCache[id] = out.absolutePath
                     return@runCatching out.absolutePath
@@ -490,13 +491,13 @@ class YacineTvProvider : MainAPI() {
         }
         // Competition name top-center (Canvas shapes Arabic correctly).
         compName?.let {
-            c.drawText(it, w / 2f, 130f, textPaint.apply { textSize = 40f })
+            c.drawText(it, w / 2f, 84f, textPaint.apply { textSize = 38f })
         }
         // VS in the middle, with shadow for contrast.
         c.drawText(
-            "VS", w / 2f, h / 2f + 44f,
+            "VS", w / 2f, h / 2f + 30f,
             textPaint.apply {
-                textSize = 124f
+                textSize = 84f
                 isFakeBoldText = true
                 setShadowLayer(12f, 0f, 4f, Color.argb(160, 0, 0, 0))
             },
@@ -766,6 +767,9 @@ class YacineTvProvider : MainAPI() {
      * Keys are normalized channel names. */
     private val mbcFallbacks = mapOf(
         "mbc 1" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-1/15cf99af5de54063fdabfefe66adc075/index.m3u8",
+        "mbc 2" to "http://37.122.156.107:4000/play/a07g/index.m3u8",
+        "mbc action" to "http://37.122.156.107:4000/play/a07h/index.m3u8",
+        "mbc max" to "http://37.122.156.107:4000/play/a07i/index.m3u8",
         "mbc 3" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-3-usa/5d58265a862a476dc7f97694addb5ded/index.m3u8",
         "mbc 4" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-4/24f134f1cd63db9346439e96b86ca6ed/index.m3u8",
         "mbc 5" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-5/ee6b000cee0629411b666ab26cb13e9b/index.m3u8",
@@ -779,6 +783,15 @@ class YacineTvProvider : MainAPI() {
         "mbc maser drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-drama/567b703c19ede6598222de81b0e4508b/index.m3u8",
         "mbc drama +" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-plus-drama/e37251ec2aac8f6c98f75cd0fa37cd28/index.m3u8",
         "wanasah" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-wanasah/13e82ea6232fa647c43b26e8a41f173d/index.m3u8",
+    )
+
+    /** Verified public backups for Kids channels whose API entries are
+     * dead embeds or stale shahid assets (all verified 200 + multivariant).
+     * Keys are normalized channel names. */
+    private val kidsFallbacks = mapOf(
+        "spacetoon" to "https://live-uae-next.spacetoongo.com/ST_MENA_NEXT/hls/r9p2hjipmw2kl.m3u8",
+        "taha kids" to "https://stream.starmenajo.com/hls/app/live/ts:fhd.m3u8",
+        "atfal wa mawahib" to "https://5d658d7e9f562.streamlock.net/atfal1.com/atfal2/playlist.m3u8",
     )
 
     data class EasyBroadcastEvent(
@@ -920,6 +933,62 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull()
     }
 
+    /** Emits the best variant of a tokenized master playlist with the
+     * original query re-attached (shahid ?t=&e=, ycncdn, boing...).
+     * Players drop ?query on relative refs, so emitting the master URL
+     * alone yields dead subrequests. Returns true if emitted. */
+    private suspend fun emitBestVariant(
+        channelName: String,
+        serverName: String,
+        masterUrl: String,
+        headers: Map<String, String>,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
+            val qIndex = masterUrl.indexOf('?')
+            if (qIndex < 0) return false
+            val query = masterUrl.substring(qIndex) // includes '?'
+            val base = masterUrl.substring(0, qIndex)
+            val master = app.get(masterUrl, headers = headers, timeout = 8).text
+            if ("#EXTM3U" !in master) return false
+            var bestUri: String? = null
+            var bestBw = -1
+            val lines = master.lines()
+            for (i in lines.indices) {
+                val bw = Regex("""BANDWIDTH=(\d+)""").find(lines[i])
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: continue
+                val uri = lines.getOrNull(i + 1)?.trim()
+                    ?.takeIf { it.isNotEmpty() && !it.startsWith("#") } ?: continue
+                if (bw > bestBw) {
+                    bestBw = bw
+                    bestUri = uri
+                }
+            }
+            val rel = bestUri ?: return false
+            // Absolute variant refs may carry their own query already.
+            val variantUrl = if ('?' in rel) {
+                if (rel.startsWith("http")) rel else join(base.substringBeforeLast("/"), rel)
+            } else {
+                val abs = if (rel.startsWith("http")) rel.substringBefore('?')
+                else join(base.substringBeforeLast("/"), rel)
+                abs + query
+            }
+            // Sanity: only emit a variant that actually resolves.
+            val check = app.get(variantUrl, headers = headers, timeout = 8)
+            if (check.code != 200 || "#EXTM3U" !in check.text) return false
+            callback.invoke(
+                newExtractorLink(this.name, "$channelName • $serverName", variantUrl) {
+                    this.headers = headers
+                    this.referer = referer
+                    this.quality = qualityFor("$channelName $serverName", variantUrl)
+                    this.type = ExtractorLinkType.M3U8
+                }
+            )
+            true
+        } catch (_: Exception) { false }
+    }
+
     private fun extractEasyBroadcastSlug(page: String): String? {
         // Page HTML varies (escaped slashes, single/double quotes, query strings).
         val clean = page.replace("\\/", "/").replace("\\\"", "\"")
@@ -985,6 +1054,15 @@ class YacineTvProvider : MainAPI() {
                 if (resolved) found = true
                 return resolved
             }
+            // Tokenized masters (?t=&e=): players drop the query on relative
+            // refs, so resolve the best variant up-front with query kept.
+            if (".m3u8" in lower && "?" in raw) {
+                if (emitBestVariant(channelName, serverName, raw, headers, referer, callback)) {
+                    found = true
+                    return true
+                }
+                // Fall through to the raw master URL below.
+            }
             callback.invoke(
                 newExtractorLink(
                     this.name,
@@ -1025,6 +1103,16 @@ class YacineTvProvider : MainAPI() {
                     if (resolved) found = true
                     return@forEach
                 }
+                // Same tokenized-master handling as channels (beIN ?t=&e=).
+                if (".m3u8" in lower && "?" in raw) {
+                    val eventRef = headers["Referer"]?.takeIf { it.isNotBlank() }
+                        ?: s.referer?.takeIf { it.isNotBlank() }
+                        ?: raw
+                    if (emitBestVariant(tag ?: info.name, serverName, raw, headers, eventRef, callback)) {
+                        found = true
+                        return@forEach
+                    }
+                }
                 callback.invoke(
                     newExtractorLink(this.name, label, raw) {
                         this.headers = headers
@@ -1050,9 +1138,11 @@ class YacineTvProvider : MainAPI() {
         grouped.forEach { (_, streams) ->
             streams.forEach { if (emit(info.name, it)) emitted = true }
         }
-        // Last resort: verified iptv-org direct stream when the API has nothing playable.
+        // Last resort: verified direct backups when the API has nothing playable.
         if (!emitted) {
-            mbcFallbacks[normalizeName(info.name)]?.let { url ->
+            val backup = mbcFallbacks[normalizeName(info.name)]
+                ?: kidsFallbacks[normalizeName(info.name)]
+            backup?.let { url ->
                 if (seenUrls.add(url)) {
                     callback.invoke(
                         newExtractorLink(this.name, "${info.name} • IPTV", url) {

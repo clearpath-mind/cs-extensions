@@ -96,8 +96,8 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
 - **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
   falls back to verified iptv-org EdgeNext CDN streams
   (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`), including the USA
-  feed for MBC 3. No public stream exists for MBC 2 / MBC Action / MBC Max
-  (their embeds are obfuscated pages with nothing extractable).
+  feed for MBC 3. MBC 2 / Action / Max use restreams from Free-TV/IPTV
+  (`37.122.156.107:4000`, unverified from CI — last resort only).
 
 ## Homepage pagination (no duplicates)
 
@@ -109,9 +109,9 @@ the same items twice.
 ## Match banners
 
 `Today's Matches` cards use on-device 1280x720 composite banners —
-competition name top-center, VS in the middle, both team crests on a dark
-gradient (`matchBanner()`/`renderBanner()`), cached under
-`cacheDir/yacine_banners` per event id (`match_{id}_v2.png`) with API-logo
+competition name top-center, smaller VS (84sp) in the middle, both team
+crests on a dark gradient (`matchBanner()`/`renderBanner()`), cached under
+`cacheDir/yacine_banners` per event id (`match_{id}_v3.png`) with API-logo
 fallback.
 
 ## Match details
@@ -162,8 +162,8 @@ channels → same-row channels) in `related`; `load()` exposes them as
 - **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
   falls back to verified iptv-org EdgeNext CDN streams
   (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`), including the USA
-  feed for MBC 3. No public stream exists for MBC 2 / MBC Action / MBC Max
-  (their embeds are obfuscated pages with nothing extractable).
+  feed for MBC 3. MBC 2 / Action / Max use restreams from Free-TV/IPTV
+  (`37.122.156.107:4000`, unverified from CI — last resort only).
 - **Morocco**: 2M (`channel/546`) is a direct m3u8 and plays; the 7 SNRT
   channels (`snrtlive.ma` pages, `url_type` 5) resolve via the EasyBroadcast
   slug (`extractEasyBroadcastSlug` tries several markup variants) and the
