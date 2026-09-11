@@ -1,15 +1,6 @@
 package com.yacin
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.LinearGradient
-import android.graphics.Paint
-import android.graphics.RectF
-import android.graphics.Shader
-import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
@@ -31,20 +22,16 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
 class YacineTvProvider : MainAPI() {
@@ -65,9 +52,6 @@ class YacineTvProvider : MainAPI() {
     fun init(context: Context) {
         appContext = context.applicationContext
     }
-
-    /** On-device match banner cache (event id -> cached PNG path). */
-    private val bannerCache = ConcurrentHashMap<Long, String>()
 
     /** Categories merged into one beIN SPORTS row (one per quality upstream). */
     private val beinQualityIds = setOf(4, 5, 6, 7)
@@ -285,17 +269,17 @@ class YacineTvProvider : MainAPI() {
             // 1) Matches first (horizontal cards with composite banners).
             val events = eventsDeferred.await()
             if (events.isNotEmpty()) {
-                // Banners render in parallel; each is guarded so one slow
-                // logo download never blocks the homepage.
-                val banners = events.map { e ->
-                    async { withTimeoutOrNull(12_000) { matchBanner(e) } }
+                // Thumbnails resolve in parallel; each is guarded so one slow
+                // lookup never blocks the homepage.
+                val thumbs = events.map { e ->
+                    async { withTimeoutOrNull(8_000) { matchThumb(e) } }
                 }.awaitAll()
-                val matchLinks = events.zip(banners).mapNotNull { (e, banner) ->
+                val matchLinks = events.zip(thumbs).mapNotNull { (e, thumb) ->
                     val id = e.id ?: return@mapNotNull null
                     val title = eventTitle(e)
-                    // Composite banner when renderable, else team1 logo with
+                    // TheSportsDB banner when found, else team1 logo with
                     // team2 as fallback. Detail page shows both (poster + background).
-                    val poster = banner
+                    val poster = thumb
                         ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                         ?: e.team2?.logo?.takeIf { it.isNotBlank() }
                     val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
@@ -402,160 +386,117 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** 1280x720 composite match banner (competition badge + name, VS,
-     * both crests on a dark gradient), rendered on-device from the API
-     * team logos and cached under cacheDir/yacine_banners. Returns the
-     * cached PNG path, or null when rendering is impossible (caller falls
-     * back to the API logo). */
-    private suspend fun matchBanner(e: YacineEvent): String? {
+    /** Arabic team name -> English alias for TheSportsDB lookups (verified
+     * hits). Missing names skip the thumbnail API and fall back to API logos. */
+    private val teamAliases = mapOf(
+        "إي زد آلكمار" to "AZ Alkmaar",
+        "فيلم تو تيلبورغ" to "Willem II",
+        "رين" to "Rennes",
+        "مارسيليا" to "Marseille",
+        "وست هام" to "West Ham",
+        "ريكسهام" to "Wrexham",
+        "اشبيلية" to "Sevilla",
+        "فالنسيا" to "Valencia",
+        "انديبندينتي ديل فالي" to "Independiente del Valle",
+        "فلامينغو" to "Flamengo",
+        "فنربخشه" to "Fenerbahce",
+        "روما" to "Roma",
+        "ريال مدريد" to "Real Madrid",
+        "برشلونة" to "Barcelona",
+        "مانشستر يونايتد" to "Manchester United",
+        "مانشستر سيتي" to "Manchester City",
+        "ليفربول" to "Liverpool",
+        "آرسنال" to "Arsenal",
+        "ارسنال" to "Arsenal",
+        "تشيلسي" to "Chelsea",
+        "توتنهام" to "Tottenham",
+        "بايرن ميونخ" to "Bayern Munich",
+        "باريس سان جيرمان" to "Paris SG",
+        "إنتر" to "Inter",
+        "انتر" to "Inter",
+        "ميلان" to "AC Milan",
+        "يوفنتوس" to "Juventus",
+        "دورتموند" to "Borussia Dortmund",
+        "أتلتيكو مدريد" to "Atletico Madrid",
+        "اتلتيكو مدريد" to "Atletico Madrid",
+        "بنفيكا" to "Benfica",
+        "بورتو" to "Porto",
+        "أياكس" to "Ajax",
+        "اياكس" to "Ajax",
+        "أيندهوفن" to "PSV Eindhoven",
+        "ايندهوفن" to "PSV Eindhoven",
+    )
+
+    data class SportsDbEvents(
+        @JsonProperty("event") val event: List<SportsDbEvent>? = null,
+    )
+
+    data class SportsDbEvent(
+        @JsonProperty("dateEvent") val dateEvent: String? = null,
+        @JsonProperty("strEvent") val strEvent: String? = null,
+        @JsonProperty("strThumb") val strThumb: String? = null,
+    )
+
+    /** Ready-made 1280x720 match banner from TheSportsDB (free key),
+     * cached per event id under cacheDir/match_thumbs. Returns null on any
+     * miss so the caller falls back to API team logos. */
+    private val thumbCache = ConcurrentHashMap<Long, String>()
+
+    private suspend fun matchThumb(e: YacineEvent): String? {
         val id = e.id ?: return null
-        bannerCache[id]?.let { if (File(it).exists()) return it }
-        val l1 = e.team1?.logo?.takeIf { it.isNotBlank() }
-        val l2 = e.team2?.logo?.takeIf { it.isNotBlank() }
-        if (l1.isNullOrBlank() && l2.isNullOrBlank()) return null
-        val ctx = appContext ?: return null
-        // v5 layout (spotlights, comp pill + dividers, bordered VS):
-        // new filename so stale files regenerate.
-        // so stale v2 files regenerate.
-        return withContext(Dispatchers.IO) {
+        thumbCache[id]?.let { return it }
+        val ctx = appContext
+        if (ctx != null) {
             runCatching {
-                val dir = File(ctx.cacheDir, "yacine_banners").apply { mkdirs() }
-                val out = File(dir, "match_${id}_v5.png")
-                if (out.exists() && out.length() > 0) {
-                    bannerCache[id] = out.absolutePath
-                    return@runCatching out.absolutePath
+                val f = File(File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }, "match_$id.txt")
+                if (f.exists()) {
+                    f.readText().trim().takeIf { it.startsWith("http") }?.let {
+                        thumbCache[id] = it
+                        return it
+                    }
                 }
-                val b1 = l1?.let { downloadBitmap(it) }
-                val b2 = l2?.let { downloadBitmap(it) }
-                if (b1 == null && b2 == null) return@runCatching null
-                val compName = e.champions?.trim()?.takeIf { it.isNotBlank() }
-                val bmp = renderBanner(b1, b2, compName)
-                FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.PNG, 90, it) }
-                bmp.recycle()
-                if (b1 != null && b1 != bmp) b1.recycle()
-                if (b2 != null && b2 != bmp) b2.recycle()
-                bannerCache[id] = out.absolutePath
-                out.absolutePath
-            }.getOrNull()
-        }
-    }
-
-    private fun downloadBitmap(url: String): Bitmap? {
-        return runCatching {
-            val conn = URL(url).openConnection() as HttpURLConnection
-            conn.setRequestProperty("User-Agent", BROWSER_UA)
-            conn.connectTimeout = 8000
-            conn.readTimeout = 8000
-            conn.instanceFollowRedirects = true
-            conn.inputStream.use { BitmapFactory.decodeStream(it) }
-        }.getOrNull()
-    }
-
-    private fun renderBanner(left: Bitmap?, right: Bitmap?, compName: String?): Bitmap {
-        val w = 1280
-        val h = 720
-        val gold = Color.parseColor("#D4AF37")
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        val grad = LinearGradient(
-            0f, 0f, w.toFloat(), h.toFloat(),
-            Color.parseColor("#2B0A0A"), Color.parseColor("#0B0202"),
-            Shader.TileMode.CLAMP,
-        )
-        c.drawRect(0f, 0f, w.toFloat(), h.toFloat(), Paint().apply { shader = grad })
-        // Soft spotlight behind each crest for a clean premium feel.
-        val spot = Paint().apply {
-            color = Color.argb(30, 255, 220, 220)
-            isAntiAlias = true
-        }
-        c.drawCircle(w * 0.22f, h / 2f, 240f, spot)
-        c.drawCircle(w * 0.78f, h / 2f, 240f, spot)
-        fun drawCrest(b: Bitmap?, cx: Float) {
-            if (b == null) return
-            // White disc backdrop + shadow so any crest reads clean.
-            c.drawCircle(
-                cx, h / 2f, 195f,
-                Paint().apply {
-                    color = Color.argb(38, 255, 255, 255)
-                    isAntiAlias = true
-                    setShadowLayer(24f, 0f, 10f, Color.argb(120, 0, 0, 0))
-                },
-            )
-            val maxSide = 320
-            val scale = minOf(
-                maxSide / b.width.toFloat(),
-                maxSide / b.height.toFloat(),
-                3.5f,
-            )
-            val dw = (b.width * scale).toInt().coerceAtLeast(1)
-            val dh = (b.height * scale).toInt().coerceAtLeast(1)
-            val s = Bitmap.createScaledBitmap(b, dw, dh, true)
-            c.drawBitmap(
-                s, cx - dw / 2f, h / 2f - dh / 2f,
-                Paint().apply {
-                    isFilterBitmap = true
-                    isAntiAlias = true
-                    setShadowLayer(16f, 0f, 8f, Color.argb(140, 0, 0, 0))
-                },
-            )
-            if (s != b) s.recycle()
-        }
-        drawCrest(left, w * 0.22f)
-        drawCrest(right, w * 0.78f)
-        // Competition pill top-center with gold divider lines.
-        compName?.let {
-            val p = Paint().apply {
-                color = Color.WHITE
-                textSize = 34f
-                textAlign = Paint.Align.CENTER
-                isAntiAlias = true
             }
-            val tw = p.measureText(it)
-            val padH = 44f
-            val top = 44f
-            val pillH = 34f + 44f
-            val pill = RectF(w / 2f - tw / 2f - padH, top, w / 2f + tw / 2f + padH, top + pillH)
-            c.drawRoundRect(
-                pill, 40f, 40f,
-                Paint().apply { color = Color.argb(150, 0, 0, 0); isAntiAlias = true },
-            )
-            val lineY = top + pillH + 18f
-            val linePaint = Paint().apply { color = gold; strokeWidth = 4f; isAntiAlias = true }
-            c.drawLine(w / 2f - tw / 2f - padH, lineY, w / 2f - tw / 2f - padH - 90f, lineY, linePaint)
-            c.drawLine(w / 2f + tw / 2f + padH, lineY, w / 2f + tw / 2f + padH + 90f, lineY, linePaint)
-            c.drawCircle(w / 2f, lineY, 6f, Paint().apply { color = gold; isAntiAlias = true })
-            c.drawText(it, w / 2f, top + 22f + 30f, p)
         }
-        // VS pill in the middle with a crisp white border.
-        val vsPaint = Paint().apply {
-            color = Color.WHITE
-            textSize = 60f
-            isFakeBoldText = true
-            textAlign = Paint.Align.CENTER
-            isAntiAlias = true
-            setShadowLayer(10f, 0f, 4f, Color.argb(160, 0, 0, 0))
+        val t1 = e.team1?.name?.trim()?.let { teamAliases[it] } ?: return null
+        val t2 = e.team2?.name?.trim()?.let { teamAliases[it] } ?: return null
+        val day = e.startTime?.let { dayString(it) }
+        for ((a, b) in listOf(t1 to t2, t2 to t1)) {
+            val thumb = searchEventThumb(a, b, day) ?: continue
+            thumbCache[id] = thumb
+            if (ctx != null) {
+                runCatching {
+                    val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
+                    File(dir, "match_$id.txt").writeText(thumb)
+                }
+            }
+            return thumb
         }
-        val vsW = vsPaint.measureText("VS")
-        val vsPill = RectF(w / 2f - vsW / 2f - 34f, h / 2f - 54f, w / 2f + vsW / 2f + 34f, h / 2f + 54f)
-        c.drawRoundRect(
-            vsPill, 54f, 54f,
-            Paint().apply {
-                color = Color.parseColor("#C8102E")
-                isAntiAlias = true
-                setShadowLayer(18f, 0f, 8f, Color.argb(140, 0, 0, 0))
-            },
-        )
-        c.drawRoundRect(
-            vsPill, 54f, 54f,
-            Paint().apply {
-                style = Paint.Style.STROKE
-                strokeWidth = 3f
-                color = Color.argb(220, 255, 255, 255)
-                isAntiAlias = true
-            },
-        )
-        c.drawText("VS", w / 2f, h / 2f + 21f, vsPaint)
-        return bmp
+        return null
+    }
+
+    private fun dayString(epochSec: Long): String {
+        return try {
+            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            fmt.format(Date(epochSec * 1000))
+        } catch (_: Exception) { "" }
+    }
+
+    private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
+        return runCatching {
+            val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
+            val res = app.get(
+                "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$q",
+                headers = mapOf("User-Agent" to BROWSER_UA),
+                timeout = 8,
+            ).text
+            if (res.isBlank()) return@runCatching null
+            val events = parseJson<SportsDbEvents>(res).event.orEmpty()
+            // Prefer the fixture day (avoids wrong-leg banners), else any thumb.
+            events.firstOrNull { !day.isNullOrBlank() && it.dateEvent == day && !it.strThumb.isNullOrBlank() }
+                ?.strThumb
+                ?: events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+        }.getOrNull()
     }
 
     /** Official snrtlive.ma vignette arts for the SNRT channels

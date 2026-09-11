@@ -108,11 +108,11 @@ the same items twice.
 
 ## Match banners
 
-`Today's Matches` cards use on-device 1280x720 composite banners —
-competition pill top-center with gold dividers, bordered VS pill (60sp),
-crests on spotlit white discs (`matchBanner()`/`renderBanner()`), cached
-under `cacheDir/yacine_banners` per event id (`match_{id}_v5.png`) with
-API-logo fallback.
+`Today's Matches` cards use TheSportsDB ready-made 1280x720 banners
+(`strThumb`, free key): both team orders tried, `dateEvent` matched to
+the fixture day to avoid wrong-leg art. Arabic→English club aliases in
+`teamAliases`; thumb URLs cached per event id (`cacheDir/match_thumbs`
++ memory). Misses fall back to API team logos. No on-device compositing.
 
 ## Match details
 
