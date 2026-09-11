@@ -96,8 +96,8 @@ e.g. `beIN SPORTS 1` = `(4→1424, 5→4, 6→24, 7→44)`.
 - **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
   falls back to verified iptv-org EdgeNext CDN streams
   (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`), including the USA
-  feed for MBC 3. MBC 2 / Action / Max use restreams from Free-TV/IPTV
-  (`37.122.156.107:4000`, unverified from CI — last resort only).
+  feed for MBC 3. MBC 2 / Action / Max have no reachable public stream
+  (Free-TV restreams time out from both CI and device) and were removed.
 
 ## Homepage pagination (no duplicates)
 
@@ -127,6 +127,14 @@ Card `LinkData` carries up to 12 row siblings (matches → other matches,
 channels → same-row channels) in `related`; `load()` exposes them as
 `recommendations` with zero extra network. Channel plots use
 `شاهد البث المباشر لقناة {name}` everywhere.
+
+## Dead masters
+
+Tokenized multivariant masters (`shahid ?t=&e=`) whose variants 404 (stale
+CDN cache) are never emitted — the player would only error with "M3u8 must
+contain TS files". Media playlists (no variants) still emit raw. Verified
+Kids backups (Spacetoon/Taha/Atfal) cover the fallbacks that exist; CN
+Arabic, Gulli Arabic, Rotana Kids, Disney XD have no public backup.
 ## `GET /event/2863227001` (also `/event/{id}/servers`, same list)
 
 
@@ -162,8 +170,8 @@ channels → same-row channels) in `related`; `load()` exposes them as
 - **MBC**: when `channel/{id}` is empty or only dead embeds, the provider
   falls back to verified iptv-org EdgeNext CDN streams
   (`shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-*`), including the USA
-  feed for MBC 3. MBC 2 / Action / Max use restreams from Free-TV/IPTV
-  (`37.122.156.107:4000`, unverified from CI — last resort only).
+  feed for MBC 3. MBC 2 / Action / Max have no reachable public stream
+  (Free-TV restreams time out from both CI and device) and were removed.
 - **Morocco**: 2M (`channel/546`) is a direct m3u8 and plays; the 7 SNRT
   channels (`snrtlive.ma` pages, `url_type` 5) resolve via the EasyBroadcast
   slug (`extractEasyBroadcastSlug` tries several markup variants) and the

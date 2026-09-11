@@ -767,9 +767,6 @@ class YacineTvProvider : MainAPI() {
      * Keys are normalized channel names. */
     private val mbcFallbacks = mapOf(
         "mbc 1" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-1/15cf99af5de54063fdabfefe66adc075/index.m3u8",
-        "mbc 2" to "http://37.122.156.107:4000/play/a07g/index.m3u8",
-        "mbc action" to "http://37.122.156.107:4000/play/a07h/index.m3u8",
-        "mbc max" to "http://37.122.156.107:4000/play/a07i/index.m3u8",
         "mbc 3" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-3-usa/5d58265a862a476dc7f97694addb5ded/index.m3u8",
         "mbc 4" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-4/24f134f1cd63db9346439e96b86ca6ed/index.m3u8",
         "mbc 5" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-5/ee6b000cee0629411b666ab26cb13e9b/index.m3u8",
@@ -936,7 +933,11 @@ class YacineTvProvider : MainAPI() {
     /** Emits the best variant of a tokenized master playlist with the
      * original query re-attached (shahid ?t=&e=, ycncdn, boing...).
      * Players drop ?query on relative refs, so emitting the master URL
-     * alone yields dead subrequests. Returns true if emitted. */
+     * alone yields dead subrequests.
+     * Returns 1 if emitted, 0 if the master is not multivariant (caller
+     * falls back to the raw master URL), -1 if it IS multivariant but no
+     * variant resolves (caller must NOT emit the master: it has no TS and
+     * the player would just error). */
     private suspend fun emitBestVariant(
         channelName: String,
         serverName: String,
@@ -944,14 +945,15 @@ class YacineTvProvider : MainAPI() {
         headers: Map<String, String>,
         referer: String,
         callback: (ExtractorLink) -> Unit,
-    ): Boolean {
+    ): Int {
         return try {
             val qIndex = masterUrl.indexOf('?')
-            if (qIndex < 0) return false
+            if (qIndex < 0) return 0
             val query = masterUrl.substring(qIndex) // includes '?'
             val base = masterUrl.substring(0, qIndex)
             val master = app.get(masterUrl, headers = headers, timeout = 8).text
-            if ("#EXTM3U" !in master) return false
+            if ("#EXTM3U" !in master) return 0
+            if ("#EXT-X-STREAM-INF" !in master) return 0 // media playlist: emit raw
             var bestUri: String? = null
             var bestBw = -1
             val lines = master.lines()
@@ -965,7 +967,7 @@ class YacineTvProvider : MainAPI() {
                     bestUri = uri
                 }
             }
-            val rel = bestUri ?: return false
+            val rel = bestUri ?: return -1
             // Absolute variant refs may carry their own query already.
             val variantUrl = if ('?' in rel) {
                 if (rel.startsWith("http")) rel else join(base.substringBeforeLast("/"), rel)
@@ -976,7 +978,7 @@ class YacineTvProvider : MainAPI() {
             }
             // Sanity: only emit a variant that actually resolves.
             val check = app.get(variantUrl, headers = headers, timeout = 8)
-            if (check.code != 200 || "#EXTM3U" !in check.text) return false
+            if (check.code != 200 || "#EXTM3U" !in check.text) return -1
             callback.invoke(
                 newExtractorLink(this.name, "$channelName • $serverName", variantUrl) {
                     this.headers = headers
@@ -985,8 +987,8 @@ class YacineTvProvider : MainAPI() {
                     this.type = ExtractorLinkType.M3U8
                 }
             )
-            true
-        } catch (_: Exception) { false }
+            1
+        } catch (_: Exception) { 0 }
     }
 
     private fun extractEasyBroadcastSlug(page: String): String? {
@@ -1056,12 +1058,17 @@ class YacineTvProvider : MainAPI() {
             }
             // Tokenized masters (?t=&e=): players drop the query on relative
             // refs, so resolve the best variant up-front with query kept.
+            // A multivariant master with no resolvable variant is unplayable:
+            // skip it instead of emitting a link the player errors on.
             if (".m3u8" in lower && "?" in raw) {
-                if (emitBestVariant(channelName, serverName, raw, headers, referer, callback)) {
-                    found = true
-                    return true
+                when (emitBestVariant(channelName, serverName, raw, headers, referer, callback)) {
+                    1 -> {
+                        found = true
+                        return true
+                    }
+                    -1 -> return false
                 }
-                // Fall through to the raw master URL below.
+                // Fall through to the raw master URL below (0).
             }
             callback.invoke(
                 newExtractorLink(
@@ -1108,9 +1115,12 @@ class YacineTvProvider : MainAPI() {
                     val eventRef = headers["Referer"]?.takeIf { it.isNotBlank() }
                         ?: s.referer?.takeIf { it.isNotBlank() }
                         ?: raw
-                    if (emitBestVariant(tag ?: info.name, serverName, raw, headers, eventRef, callback)) {
-                        found = true
-                        return@forEach
+                    when (emitBestVariant(tag ?: info.name, serverName, raw, headers, eventRef, callback)) {
+                        1 -> {
+                            found = true
+                            return@forEach
+                        }
+                        -1 -> return@forEach
                     }
                 }
                 callback.invoke(
