@@ -509,6 +509,7 @@ class YacineTvProvider : MainAPI() {
      * (verified 200; ~5-7 KB each). Other Morocco entries (2M, Medi 1,
      * Télé Maroc) keep API logos. Keys are normalized channel names. */
     private val moroccoThumbs = mapOf(
+        "2m" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/2/29/2M_TV_logo.svg/1280px-2M_TV_logo.svg.png",
         "al aoula" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-03/alaoula-16x9.jpeg",
         "laayoune" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/laayoune-16x9.jpeg",
         "arryadia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/arriyadia-16x9.jpeg",

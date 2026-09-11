@@ -186,8 +186,8 @@ Arabic, Gulli Arabic, Rotana Kids, Disney XD have no public backup.
   pipeline. Télé Maroc is a multi-iframe portal, so it goes through the
   extractor registry and may fail upstream.
 - **Morocco thumbnails**: SNRT channels use official snrtlive.ma vignette
-  arts (`moroccoThumbs`, verified 200); other Morocco entries keep API
-  logos.
+  arts (`moroccoThumbs`, verified 200); 2M uses the Wikimedia `2M_TV_logo`
+  (verified 200); other Morocco entries keep API logos.
 - **Kids**: most entries are direct m3u8 (`url_type` 3) and play; Almajd
   Kids/Bassma/Rawda embeds are dead upstream (elahmad `Bad Gateway`,
   taghtia redirect chain empty) and have no public direct stream.
