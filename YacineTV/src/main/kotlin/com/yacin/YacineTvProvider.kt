@@ -427,7 +427,55 @@ class YacineTvProvider : MainAPI() {
         "اياكس" to "Ajax",
         "أيندهوفن" to "PSV Eindhoven",
         "ايندهوفن" to "PSV Eindhoven",
+        "ديربي كاونتي" to "Derby County",
+        "برمنغهام سيتي" to "Birmingham City",
+        "راسينغ سانتاندير" to "Racing Santander",
+        "الافيس" to "Alaves",
+        "فولهام" to "Fulham",
+        "كريستال بلاس" to "Crystal Palace",
+        "إيبسويتش تاون" to "Ipswich Town",
+        "هال سيتي" to "Hull City",
+        "استون فيلا" to "Aston Villa",
+        "نوتينغهام فورست" to "Nottingham Forest",
+        "بورنموث" to "Bournemouth",
+        "برينتفورد" to "Brentford",
+        "اوساسونا" to "Osasuna",
+        "اسبانيول" to "Espanyol",
+        "ستراسبورغ" to "Strasbourg",
+        "موناكو" to "Monaco",
+        "اتلتيك بلباو" to "Athletic Bilbao",
+        "التشي" to "Elche",
+        "ايفرتون" to "Everton",
+        "قونيا سبور" to "Konyaspor",
+        "طرابزون سبور" to "Trabzonspor",
+        "فورتونا سيتارد" to "Fortuna Sittard",
+        "باريس أف سي" to "Paris FC",
+        "ليون" to "Lyon",
+        "لوريان" to "Lorient",
+        "تولوز" to "Toulouse",
+        "لوهافر" to "Le Havre",
+        "انجيه" to "Angers",
+        "اوكسير" to "Auxerre",
+        "نيس" to "Nice",
+        "رايو فاليكانو" to "Rayo Vallecano",
+        "سندرلاند" to "Sunderland",
     )
+
+    /** Alef/hamza-insensitive lookup: unifies آ/أ/إ->ا, ة->ه, ى->ي so
+     * spelling variants still hit (the أوروبا/آوروبا class of miss). */
+    private fun normalizeArabic(n: String): String {
+        return normalizeName(n)
+            .replace(Regex("[آأإ]"), "ا")
+            .replace("ة", "ه")
+            .replace("ى", "ي")
+    }
+
+    private val teamAliasesNorm = teamAliases.mapKeys { normalizeArabic(it.key) }
+
+    private fun teamAlias(arabicName: String?): String? {
+        val n = arabicName?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return teamAliasesNorm[normalizeArabic(n)]
+    }
 
     data class SportsDbEvents(
         @JsonProperty("event") val event: List<SportsDbEvent>? = null,
@@ -459,8 +507,8 @@ class YacineTvProvider : MainAPI() {
                 }
             }
         }
-        val t1 = e.team1?.name?.trim()?.let { teamAliases[it] } ?: return null
-        val t2 = e.team2?.name?.trim()?.let { teamAliases[it] } ?: return null
+        val t1 = teamAlias(e.team1?.name) ?: return null
+        val t2 = teamAlias(e.team2?.name) ?: return null
         val day = e.startTime?.let { dayString(it) }
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val thumb = searchEventThumb(a, b, day) ?: continue
