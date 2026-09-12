@@ -114,7 +114,7 @@ class YacineTvProvider : MainAPI() {
     }
 
     /** Retries a nullable suspend block (first non-null wins). */
-    private suspend fun <T> retryIO(
+    private suspend inline fun <T> retryIO(
         times: Int = 3,
         delayMs: Long = 800,
         block: suspend () -> T?,
