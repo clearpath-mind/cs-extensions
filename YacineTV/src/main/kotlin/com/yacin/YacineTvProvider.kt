@@ -26,6 +26,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.URLEncoder
@@ -92,18 +93,35 @@ class YacineTvProvider : MainAPI() {
     }
 
     private suspend fun getDecrypted(path: String): Pair<String, String>? {
-        for (base in listOf(mainUrl, fallbackUrl)) {
-            try {
-                val res = app.get(
-                    join(base, path),
-                    headers = mapOf("User-Agent" to "okhttp/4.12.0"),
-                    timeout = 10,
-                )
-                if (res.code == 200 && res.text.isNotBlank()) {
-                    val t = res.headers["t"] ?: ""
-                    return decrypt(res.text, t) to t
-                }
-            } catch (_: Exception) { continue }
+        // The API flaps (connection resets); retry across both bases so one
+        // bad call doesn't wipe entire rows (e.g. matches-only homepage).
+        return retryIO(times = 3) {
+            for (base in listOf(mainUrl, fallbackUrl)) {
+                try {
+                    val res = app.get(
+                        join(base, path),
+                        headers = mapOf("User-Agent" to "okhttp/4.12.0"),
+                        timeout = 10,
+                    )
+                    if (res.code == 200 && res.text.isNotBlank()) {
+                        val t = res.headers["t"] ?: ""
+                        return@retryIO decrypt(res.text, t) to t
+                    }
+                } catch (_: Exception) { continue }
+            }
+            null
+        }
+    }
+
+    /** Retries a nullable suspend block (first non-null wins). */
+    private suspend fun <T> retryIO(
+        times: Int = 3,
+        delayMs: Long = 800,
+        block: suspend () -> T?,
+    ): T? {
+        repeat(times) { attempt ->
+            runCatching { block() }.getOrNull()?.let { return it }
+            if (attempt < times - 1) runCatching { delay(delayMs) }
         }
         return null
     }
@@ -539,22 +557,23 @@ class YacineTvProvider : MainAPI() {
     }
 
     private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
-        return runCatching {
-            val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
-            val res = app.get(
+        // Shared free key flaps (000s); retry the request, but a clean
+        // response with no day-matching thumb is final (no pointless retry).
+        val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
+        val res = retryIO(times = 2) {
+            app.get(
                 "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$q",
                 headers = mapOf("User-Agent" to BROWSER_UA),
                 timeout = 8,
-            ).text
-            if (res.isBlank()) return@runCatching null
-            val events = parseJson<SportsDbEvents>(res).event.orEmpty()
-            // Only the fixture day: a dateless fallback would show wrong-leg
-            // banners (e.g. next year's return leg). No match -> API logos.
-            if (day.isNullOrBlank()) {
-                return@runCatching events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
-            }
-            events.firstOrNull { it.dateEvent == day && !it.strThumb.isNullOrBlank() }?.strThumb
-        }.getOrNull()
+            ).text.takeIf { it.isNotBlank() }
+        } ?: return null
+        val events = runCatching { parseJson<SportsDbEvents>(res).event }.getOrNull().orEmpty()
+        // Only the fixture day: a dateless fallback would show wrong-leg
+        // banners (e.g. next year's return leg). No match -> API logos.
+        if (day.isNullOrBlank()) {
+            return events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+        }
+        events.firstOrNull { it.dateEvent == day && !it.strThumb.isNullOrBlank() }?.strThumb
     }
 
     data class SportsDbTeams(
@@ -585,17 +604,17 @@ class YacineTvProvider : MainAPI() {
                 }
             }
         }
-        return runCatching {
+        return retryIO(times = 2) {
             val q = URLEncoder.encode(englishName, "UTF-8")
             val res = app.get(
                 "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=$q",
                 headers = mapOf("User-Agent" to BROWSER_UA),
                 timeout = 8,
-            ).text
-            if (res.isBlank()) return@runCatching null
-            val badge = parseJson<SportsDbTeams>(res).teams
+            ).text.takeIf { it.isNotBlank() } ?: return@retryIO null
+            val badge = runCatching { parseJson<SportsDbTeams>(res).teams }
+                .getOrNull()
                 ?.firstOrNull { !it.strBadge.isNullOrBlank() }?.strBadge
-                ?: return@runCatching null
+                ?: return@retryIO null
             badgeCache[englishName] = badge
             if (ctx != null) {
                 runCatching {
@@ -604,7 +623,7 @@ class YacineTvProvider : MainAPI() {
                 }
             }
             badge
-        }.getOrNull()
+        }
     }
 
     /** Official snrtlive.ma vignette arts for the SNRT channels

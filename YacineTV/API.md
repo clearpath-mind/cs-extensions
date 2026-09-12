@@ -128,7 +128,8 @@ the fixture day to avoid wrong-leg art. Arabic→English club aliases in
 thumb URLs cached per event id (`cacheDir/match_thumbs` + memory). Only
 the fixture day is accepted (no dateless fallback — avoids wrong-leg
 art). Misses use the 500px TheSportsDB team badge (`team_badges` cache),
-then API team logos. No on-device compositing.
+then API team logos. Yacine + thumbnail lookups retry (`retryIO`) since
+both APIs flap. No on-device compositing.
 
 ## Match details
 
