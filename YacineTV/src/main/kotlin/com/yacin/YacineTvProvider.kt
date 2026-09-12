@@ -268,22 +268,28 @@ class YacineTvProvider : MainAPI() {
 
             val lists = mutableListOf<HomePageList>()
 
-            // 1) Matches first (horizontal cards with composite banners).
+            // 1) Matches first (horizontal cards with API banners).
             val events = eventsDeferred.await()
             if (events.isNotEmpty()) {
-                // Thumbnails resolve in parallel; each is guarded so one slow
-                // lookup never blocks the homepage.
-                val thumbs = events.map { e ->
-                    async { withTimeoutOrNull(8_000) { matchThumb(e) } }
+                // Thumbs/badges resolve in parallel; each is guarded so one
+                // slow lookup never blocks the homepage.
+                val posters = events.map { e ->
+                    async {
+                        val thumb = withTimeoutOrNull(8_000) { matchThumb(e) }
+                        if (thumb != null) return@async thumb
+                        val badge = withTimeoutOrNull(8_000) {
+                            teamAlias(e.team1?.name)?.let { teamBadge(it) }
+                        }
+                        badge
+                            ?: e.team1?.logo?.takeIf { it.isNotBlank() }
+                            ?: e.team2?.logo?.takeIf { it.isNotBlank() }
+                    }
                 }.awaitAll()
-                val matchLinks = events.zip(thumbs).mapNotNull { (e, thumb) ->
+                val matchLinks = events.zip(posters).mapNotNull { (e, poster) ->
                     val id = e.id ?: return@mapNotNull null
                     val title = eventTitle(e)
-                    // TheSportsDB banner when found, else team1 logo with
-                    // team2 as fallback. Detail page shows both (poster + background).
-                    val poster = thumb
-                        ?: e.team1?.logo?.takeIf { it.isNotBlank() }
-                        ?: e.team2?.logo?.takeIf { it.isNotBlank() }
+                    // TheSportsDB banner, else 500px team badge, else API
+                    // team logos. Detail page shows both (poster + background).
                     val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
                         ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                     LinkData(
@@ -395,7 +401,7 @@ class YacineTvProvider : MainAPI() {
         "فيلم تو تيلبورغ" to "Willem II",
         "رين" to "Rennes",
         "مارسيليا" to "Marseille",
-        "وست هام" to "West Ham",
+        "وست هام" to "West Ham United",
         "ريكسهام" to "Wrexham",
         "اشبيلية" to "Sevilla",
         "فالنسيا" to "Valencia",
@@ -411,11 +417,11 @@ class YacineTvProvider : MainAPI() {
         "آرسنال" to "Arsenal",
         "ارسنال" to "Arsenal",
         "تشيلسي" to "Chelsea",
-        "توتنهام" to "Tottenham",
+        "توتنهام" to "Tottenham Hotspur",
         "بايرن ميونخ" to "Bayern Munich",
-        "باريس سان جيرمان" to "Paris SG",
-        "إنتر" to "Inter",
-        "انتر" to "Inter",
+        "باريس سان جيرمان" to "Paris Saint-Germain",
+        "إنتر" to "Inter Milan",
+        "انتر" to "Inter Milan",
         "ميلان" to "AC Milan",
         "يوفنتوس" to "Juventus",
         "دورتموند" to "Borussia Dortmund",
@@ -429,8 +435,8 @@ class YacineTvProvider : MainAPI() {
         "ايندهوفن" to "PSV Eindhoven",
         "ديربي كاونتي" to "Derby County",
         "برمنغهام سيتي" to "Birmingham City",
-        "راسينغ سانتاندير" to "Racing Santander",
-        "الافيس" to "Alaves",
+        "راسينغ سانتاندير" to "Racing de Santander",
+        "الافيس" to "Deportivo Alavés",
         "فولهام" to "Fulham",
         "كريستال بلاس" to "Crystal Palace",
         "إيبسويتش تاون" to "Ipswich Town",
@@ -542,10 +548,62 @@ class YacineTvProvider : MainAPI() {
             ).text
             if (res.isBlank()) return@runCatching null
             val events = parseJson<SportsDbEvents>(res).event.orEmpty()
-            // Prefer the fixture day (avoids wrong-leg banners), else any thumb.
-            events.firstOrNull { !day.isNullOrBlank() && it.dateEvent == day && !it.strThumb.isNullOrBlank() }
-                ?.strThumb
-                ?: events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+            // Only the fixture day: a dateless fallback would show wrong-leg
+            // banners (e.g. next year's return leg). No match -> API logos.
+            if (day.isNullOrBlank()) {
+                return@runCatching events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+            }
+            events.firstOrNull { it.dateEvent == day && !it.strThumb.isNullOrBlank() }?.strThumb
+        }.getOrNull()
+    }
+
+    data class SportsDbTeams(
+        @JsonProperty("teams") val teams: List<SportsDbTeam>? = null,
+    )
+
+    data class SportsDbTeam(
+        @JsonProperty("strBadge") val strBadge: String? = null,
+    )
+
+    /** 500px team badge (much sharper than the 96px API logos) used as the
+     * card poster when no event thumb exists. Disk-cached per team. */
+    private val badgeCache = ConcurrentHashMap<String, String>()
+
+    private suspend fun teamBadge(englishName: String): String? {
+        badgeCache[englishName]?.let { return it }
+        val ctx = appContext
+        val safe = englishName.filter { it.isLetterOrDigit() }.takeIf { it.isNotBlank() }
+            ?: return null
+        if (ctx != null) {
+            runCatching {
+                val f = File(File(ctx.cacheDir, "team_badges").apply { mkdirs() }, "$safe.txt")
+                if (f.exists()) {
+                    f.readText().trim().takeIf { it.startsWith("http") }?.let {
+                        badgeCache[englishName] = it
+                        return it
+                    }
+                }
+            }
+        }
+        return runCatching {
+            val q = URLEncoder.encode(englishName, "UTF-8")
+            val res = app.get(
+                "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=$q",
+                headers = mapOf("User-Agent" to BROWSER_UA),
+                timeout = 8,
+            ).text
+            if (res.isBlank()) return@runCatching null
+            val badge = parseJson<SportsDbTeams>(res).teams
+                ?.firstOrNull { !it.strBadge.isNullOrBlank() }?.strBadge
+                ?: return@runCatching null
+            badgeCache[englishName] = badge
+            if (ctx != null) {
+                runCatching {
+                    val dir = File(ctx.cacheDir, "team_badges").apply { mkdirs() }
+                    File(dir, "$safe.txt").writeText(badge)
+                }
+            }
+            badge
         }.getOrNull()
     }
 

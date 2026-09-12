@@ -124,9 +124,11 @@ the same items twice.
 `Today's Matches` cards use TheSportsDB ready-made 1280x720 banners
 (`strThumb`, free key): both team orders tried, `dateEvent` matched to
 the fixture day to avoid wrong-leg art. Arabic→English club aliases in
-`teamAliases` (alef-insensitive lookup); thumb URLs cached per event id
-(`cacheDir/match_thumbs` + memory). Misses fall back to API team logos.
-No on-device compositing.
+`teamAliases` (alef-insensitive lookup, canonical TheSportsDB names);
+thumb URLs cached per event id (`cacheDir/match_thumbs` + memory). Only
+the fixture day is accepted (no dateless fallback — avoids wrong-leg
+art). Misses use the 500px TheSportsDB team badge (`team_badges` cache),
+then API team logos. No on-device compositing.
 
 ## Match details
 
