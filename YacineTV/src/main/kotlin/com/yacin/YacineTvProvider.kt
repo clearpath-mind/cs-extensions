@@ -296,8 +296,8 @@ class YacineTvProvider : MainAPI() {
                         val thumb = withTimeoutOrNull(8_000) { matchThumb(e) }
                         if (thumb != null) return@async thumb
                         val badge = withTimeoutOrNull(8_000) {
-                            teamAlias(e.team1?.id, e.team1?.name)?.let { teamBadge(it) }
-                                ?: teamAlias(e.team2?.id, e.team2?.name)?.let { teamBadge(it) }
+                            teamAlias(e.team1?.id)?.let { teamBadge(it) }
+                                ?: teamAlias(e.team2?.id)?.let { teamBadge(it) }
                         }
                         badge
                             ?: e.team1?.logo?.takeIf { it.isNotBlank() }
@@ -413,118 +413,9 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Arabic team name -> English alias for TheSportsDB lookups (verified
-     * hits). Missing names skip the thumbnail API and fall back to API logos. */
-    private val teamAliases = mapOf(
-        "إي زد آلكمار" to "AZ Alkmaar",
-        "فيلم تو تيلبورغ" to "Willem II",
-        "رين" to "Rennes",
-        "مارسيليا" to "Marseille",
-        "وست هام" to "West Ham United",
-        "ريكسهام" to "Wrexham",
-        "اشبيلية" to "Sevilla",
-        "فالنسيا" to "Valencia",
-        "انديبندينتي ديل فالي" to "Independiente del Valle",
-        "فلامينغو" to "Flamengo",
-        "فنربخشه" to "Fenerbahce",
-        "روما" to "Roma",
-        "ريال مدريد" to "Real Madrid",
-        "برشلونة" to "Barcelona",
-        "مانشستر يونايتد" to "Manchester United",
-        "مانشستر سيتي" to "Manchester City",
-        "ليفربول" to "Liverpool",
-        "آرسنال" to "Arsenal",
-        "ارسنال" to "Arsenal",
-        "تشيلسي" to "Chelsea",
-        "توتنهام" to "Tottenham Hotspur",
-        "بايرن ميونخ" to "Bayern Munich",
-        "باريس سان جيرمان" to "Paris Saint-Germain",
-        "إنتر" to "Inter Milan",
-        "انتر" to "Inter Milan",
-        "ميلان" to "AC Milan",
-        "يوفنتوس" to "Juventus",
-        "دورتموند" to "Borussia Dortmund",
-        "أتلتيكو مدريد" to "Atletico Madrid",
-        "اتلتيكو مدريد" to "Atletico Madrid",
-        "بنفيكا" to "Benfica",
-        "بورتو" to "Porto",
-        "أياكس" to "Ajax",
-        "اياكس" to "Ajax",
-        "أيندهوفن" to "PSV Eindhoven",
-        "ايندهوفن" to "PSV Eindhoven",
-        "ديربي كاونتي" to "Derby County",
-        "برمنغهام سيتي" to "Birmingham City",
-        "راسينغ سانتاندير" to "Racing de Santander",
-        "الافيس" to "Deportivo Alavés",
-        "فولهام" to "Fulham",
-        "كريستال بلاس" to "Crystal Palace",
-        "إيبسويتش تاون" to "Ipswich Town",
-        "هال سيتي" to "Hull City",
-        "استون فيلا" to "Aston Villa",
-        "نوتينغهام فورست" to "Nottingham Forest",
-        "بورنموث" to "Bournemouth",
-        "برينتفورد" to "Brentford",
-        "اوساسونا" to "Osasuna",
-        "اسبانيول" to "Espanyol",
-        "ستراسبورغ" to "Strasbourg",
-        "موناكو" to "Monaco",
-        "اتلتيك بلباو" to "Athletic Bilbao",
-        "التشي" to "Elche",
-        "ايفرتون" to "Everton",
-        "قونيا سبور" to "Konyaspor",
-        "طرابزون سبور" to "Trabzonspor",
-        "فورتونا سيتارد" to "Fortuna Sittard",
-        "باريس أف سي" to "Paris FC",
-        "ليون" to "Lyon",
-        "لوريان" to "Lorient",
-        "تولوز" to "Toulouse",
-        "لوهافر" to "Le Havre",
-        "انجيه" to "Angers",
-        "اوكسير" to "Auxerre",
-        "نيس" to "Nice",
-        "رايو فاليكانو" to "Rayo Vallecano",
-        "سندرلاند" to "Sunderland",
-        "شيفيلد يونايتد" to "Sheffield United",
-        "وولفرهامبتون" to "Wolverhampton Wanderers",
-        "سيلتا فيغو" to "Celta Vigo",
-        "مالقا" to "Malaga",
-        "كوفنتري سيتي" to "Coventry City",
-        "برايتون" to "Brighton",
-        "ليل" to "Lille",
-        "تروا" to "Troyes",
-        "زفوله" to "PEC Zwolle",
-        "فينورد روتردام" to "Feyenoord",
-        "فينورد" to "Feyenoord",
-        "ليفانتي" to "Levante",
-        "لومان" to "Le Mans",
-        "لانس" to "Lens",
-        "مان يونايتد" to "Manchester United",
-        "مان سيتي" to "Manchester City",
-        "خيتافي" to "Getafe",
-        "لاكورونيا" to "Deportivo La Coruna",
-        "غلطة سراي" to "Galatasaray",
-        "كوجالي سبور" to "Kocaelispor",
-        "سبارتا روتردام" to "Sparta Rotterdam",
-        "بريست" to "Brest",
-        "باريس" to "Paris Saint-Germain",
-        "ريال سوسيداد" to "Real Sociedad",
-    )
-
-    /** Alef/hamza-insensitive lookup: unifies آ/أ/إ->ا, ة->ه, ى->ي so
-     * spelling variants still hit (the أوروبا/آوروبا class of miss). */
-    private fun normalizeArabic(n: String): String {
-        return normalizeName(n)
-            .replace(Regex("[آأإ]"), "ا")
-            .replace("ة", "ه")
-            .replace("ى", "ي")
-    }
-
-    private val teamAliasesNorm = teamAliases.mapKeys { normalizeArabic(it.key) }
-
-    /** Yacine team id -> English alias (from /events team_1/team_2 objects,
-     * verified 2026-09-13). IDs are immune to Arabic spelling variants
-     * (short forms, alef/hamza, trailing spaces); stability across DB
-     * rebuilds is unconfirmed, so the Arabic-name map stays as fallback. */
+    /** Yacine team id -> English alias for TheSportsDB lookups (from
+     * /events team_1/team_2 objects, verified 2026-09-13). Unknown IDs
+     * skip the thumbnail API and fall back to API logos. */
     private val teamAliasesById = mapOf(
         3 to "Barcelona",
         5 to "Real Sociedad",
@@ -554,12 +445,8 @@ class YacineTvProvider : MainAPI() {
         959 to "Kocaelispor",
     )
 
-    /** ID first, Arabic-name map as fallback (see above). */
-    private fun teamAlias(id: Int?, arabicName: String?): String? {
-        if (id != null) teamAliasesById[id]?.let { return it }
-        val n = arabicName?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        return teamAliasesNorm[normalizeArabic(n)]
-    }
+    private fun teamAlias(id: Int?): String? =
+        if (id == null) null else teamAliasesById[id]
 
     data class SportsDbEvents(
         @JsonProperty("event") val event: List<SportsDbEvent>? = null,
@@ -591,8 +478,8 @@ class YacineTvProvider : MainAPI() {
                 }
             }
         }
-        val t1 = teamAlias(e.team1?.id, e.team1?.name) ?: return null
-        val t2 = teamAlias(e.team2?.id, e.team2?.name) ?: return null
+        val t1 = teamAlias(e.team1?.id) ?: return null
+        val t2 = teamAlias(e.team2?.id) ?: return null
         val day = e.startTime?.let { dayString(it) }
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val thumb = searchEventThumb(a, b, day) ?: continue
