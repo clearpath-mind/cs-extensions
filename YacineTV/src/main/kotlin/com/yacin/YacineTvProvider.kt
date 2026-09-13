@@ -271,6 +271,7 @@ class YacineTvProvider : MainAPI() {
 
     private suspend fun buildHomeLists(): List<HomePageList> {
         return coroutineScope {
+            runCatching { ensureTeamAliases() }
             val eventsDeferred = async { getEvents() }
             val categories = getCategories()
 
@@ -413,40 +414,99 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Yacine team id -> English alias for TheSportsDB lookups (from
-     * /events team_1/team_2 objects, verified 2026-09-13). Unknown IDs
-     * skip the thumbnail API and fall back to API logos. */
-    private val teamAliasesById = mapOf(
-        3 to "Barcelona",
-        5 to "Real Sociedad",
-        7 to "Atletico Madrid",
-        21 to "Getafe",
-        24 to "Celta Vigo",
-        38 to "Manchester City",
-        41 to "Manchester United",
-        43 to "Brighton",
-        56 to "Wolverhampton Wanderers",
-        81 to "Paris Saint-Germain",
-        82 to "Lens",
-        87 to "Lille",
-        93 to "Troyes",
-        96 to "Brest",
-        102 to "PSV Eindhoven",
-        107 to "Levante",
-        316 to "Sheffield United",
-        323 to "Feyenoord",
-        470 to "Galatasaray",
-        577 to "Coventry City",
-        685 to "Malaga",
-        824 to "Le Mans",
-        887 to "Sparta Rotterdam",
-        933 to "PEC Zwolle",
-        945 to "Deportivo La Coruna",
-        959 to "Kocaelispor",
-    )
+    /** Yacine team id -> English alias for TheSportsDB lookups.
+     * Loaded from remote team_aliases.json (24h TTL, disk cache
+     * cacheDir/team_aliases/aliases.json + memory). Unknown IDs skip the
+     * thumbnail API and fall back to API logos. */
+    private val teamAliasesUrl =
+        "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/team_aliases.json"
+    private val teamAliasesTtlMs = 24 * 60 * 60 * 1000L
 
-    private fun teamAlias(id: Int?): String? =
-        if (id == null) null else teamAliasesById[id]
+    @Volatile
+    private var teamAliases: Map<Int, String>? = null
+
+    @Volatile
+    private var teamAliasesFetchedAt = 0L
+
+    private fun teamAlias(id: Int?): String? {
+        if (id == null) return null
+        return teamAliases?.get(id)
+    }
+
+    /** Refreshes the team id -> alias map from the remote JSON (24h TTL).
+     * Never throws: any failure keeps the memory/disk map (possibly empty). */
+    private suspend fun ensureTeamAliases() {
+        val now = System.currentTimeMillis()
+        if (teamAliases != null && now - teamAliasesFetchedAt < teamAliasesTtlMs) return
+        val ctx = appContext
+        val cacheFile = ctx?.let { File(File(it.cacheDir, "team_aliases").apply { mkdirs() }, "aliases.json") }
+
+        // Fresh disk cache satisfies the TTL without network.
+        if (teamAliases == null && cacheFile != null) {
+            runCatching {
+                if (cacheFile.exists() && now - cacheFile.lastModified() < teamAliasesTtlMs) {
+                    parseAliasesJson(cacheFile.readText())?.let {
+                        if (it.isNotEmpty()) {
+                            teamAliases = it
+                            teamAliasesFetchedAt = cacheFile.lastModified()
+                            return
+                        }
+                    }
+                }
+            }
+        }
+
+        val remote = fetchRemoteAliases() ?: run {
+            // Offline: use stale disk if present.
+            if (teamAliases == null && cacheFile != null) {
+                runCatching {
+                    if (cacheFile.exists()) {
+                        parseAliasesJson(cacheFile.readText())?.let {
+                            if (it.isNotEmpty()) {
+                                teamAliases = it
+                                teamAliasesFetchedAt = cacheFile.lastModified()
+                            }
+                        }
+                    }
+                }
+            }
+            if (teamAliases == null) teamAliases = emptyMap()
+            return
+        }
+        teamAliases = remote
+        teamAliasesFetchedAt = now
+        if (cacheFile != null) {
+            runCatching { cacheFile.writeText(remoteToJson(remote)) }
+        }
+    }
+
+    private suspend fun fetchRemoteAliases(): Map<Int, String>? {
+        return retryIO(times = 2) {
+            app.get(
+                teamAliasesUrl,
+                headers = mapOf("User-Agent" to BROWSER_UA),
+                timeout = 8,
+            ).text.takeIf { it.isNotBlank() }?.let { parseAliasesJson(it) }
+                ?.takeIf { it.isNotEmpty() }
+        }
+    }
+
+    private fun parseAliasesJson(json: String): Map<Int, String>? {
+        return runCatching {
+            parseJson<Map<String, String>>(json)
+                .mapNotNull { (k, v) ->
+                    val id = k.trim().toIntOrNull() ?: return@mapNotNull null
+                    val alias = v.trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    id to alias
+                }.toMap()
+        }.getOrNull()
+    }
+
+    private fun remoteToJson(map: Map<Int, String>): String {
+        return runCatching {
+            map.toSortedMap().mapKeys { it.key.toString() }.toJson() ?: "{}"
+        }.getOrNull() ?: "{}"
+    }
 
     data class SportsDbEvents(
         @JsonProperty("event") val event: List<SportsDbEvent>? = null,

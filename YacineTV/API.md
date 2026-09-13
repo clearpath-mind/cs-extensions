@@ -124,8 +124,10 @@ the same items twice.
 `Today's Matches` cards use TheSportsDB ready-made 1280x720 banners
 (`strThumb`, free key): both team orders tried, `dateEvent` matched to
 the fixture day to avoid wrong-leg art. Yacine team ids (`/events`
-`team_1`/`team_2` objects) map to canonical TheSportsDB English names in
-`teamAliasesById`; thumb URLs cached per event id (`cacheDir/match_thumbs` + memory). Only
+`team_1`/`team_2` objects) map to canonical TheSportsDB English names via
+`YacineTV/team_aliases.json` (raw.githubusercontent, 24h TTL, disk cache
+`cacheDir/team_aliases/aliases.json` + memory — add new ids to the JSON only,
+no rebuild); thumb URLs cached per event id (`cacheDir/match_thumbs` + memory). Only
 the fixture day is accepted (no dateless fallback — avoids wrong-leg
 art). Misses use the 500px TheSportsDB team badge (`team_badges` cache,
 exact `strTeam` match preferred),
