@@ -255,6 +255,16 @@ class YacineTvProvider : MainAPI() {
         return "شاهد البث المباشر لمباراة $title"
     }
 
+    /** Extra-time/penalties grace after end_time before a finished match
+     * is hidden from homepage and search (saved links keep playing). */
+    private val matchEndGraceSec = 60 * 60L
+
+    private fun isMatchVisible(e: YacineEvent, nowSec: Long): Boolean {
+        val end = e.endTime
+        if (end == null || end <= 0) return true
+        return nowSec <= end + matchEndGraceSec
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         // All rows fit on one page (no API pagination). Answer single-row
         // drill-ins by name and terminate scrolling: without this, page 2+
@@ -288,7 +298,9 @@ class YacineTvProvider : MainAPI() {
             val lists = mutableListOf<HomePageList>()
 
             // 1) Matches first (horizontal cards with API banners).
-            val events = eventsDeferred.await()
+            // Finished matches drop out end_time + grace after the final whistle.
+            val nowSec = System.currentTimeMillis() / 1000
+            val events = eventsDeferred.await().filter { isMatchVisible(it, nowSec) }
             if (events.isNotEmpty()) {
                 // Thumbs/badges resolve in parallel; each is guarded so one
                 // slow lookup never blocks the homepage.
@@ -767,6 +779,7 @@ class YacineTvProvider : MainAPI() {
             }
 
             eventsDeferred.await().forEach { e ->
+                if (!isMatchVisible(e, System.currentTimeMillis() / 1000)) return@forEach
                 val title = eventTitle(e)
                 val hay = listOfNotNull(title, e.champions, e.channel, e.team1?.name, e.team2?.name)
                     .joinToString(" ")
