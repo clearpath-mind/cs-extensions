@@ -22,14 +22,14 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
         "status": 1,
-        "version": 23,
+        "version": 24,
         "name": "YacineTV",
         "internalName": "YacineTV",
         "authors": [
             "clearpath-mind"
         ],
         "description": "YacineTV - Live sports, matches of the day and Arabic live channels",
-        "fileSize": 77584,
+        "fileSize": 83792,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -37,6 +37,6 @@
         ],
         "iconUrl": "https://yt3.googleusercontent.com/ulm35tweg3do5istps0TgCjMmJSVczGUL2NIrXMwI1DDRi5ty29BIzQSUHVgqZN5CSo1PHhiA6M=s900-c-k-c0x00ffffff-no-rj",
         "apiVersion": 1,
-        "fileHash": "sha256-a111b3e7f2a0dd7aedc2b2b68306ef04cb23babda1bab7784b821c8ebc7736f9"
+        "fileHash": "sha256-2108c3e00b2341a2a725ac66096b209a2fef9abdedd0e34dcf714ec1d1a8f1e2"
     }
 ]
