@@ -598,7 +598,7 @@ class YacineTvProvider : MainAPI() {
         if (day.isNullOrBlank()) {
             return events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
         }
-        events.firstOrNull { it.dateEvent == day && !it.strThumb.isNullOrBlank() }?.strThumb
+        return events.firstOrNull { it.dateEvent == day && !it.strThumb.isNullOrBlank() }?.strThumb
     }
 
     data class SportsDbTeams(
