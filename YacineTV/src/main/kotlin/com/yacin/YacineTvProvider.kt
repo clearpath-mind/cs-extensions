@@ -297,6 +297,7 @@ class YacineTvProvider : MainAPI() {
                         if (thumb != null) return@async thumb
                         val badge = withTimeoutOrNull(8_000) {
                             teamAlias(e.team1?.name)?.let { teamBadge(it) }
+                                ?: teamAlias(e.team2?.name)?.let { teamBadge(it) }
                         }
                         badge
                             ?: e.team1?.logo?.takeIf { it.isNotBlank() }
@@ -483,6 +484,30 @@ class YacineTvProvider : MainAPI() {
         "نيس" to "Nice",
         "رايو فاليكانو" to "Rayo Vallecano",
         "سندرلاند" to "Sunderland",
+        "شيفيلد يونايتد" to "Sheffield United",
+        "وولفرهامبتون" to "Wolverhampton Wanderers",
+        "سيلتا فيغو" to "Celta Vigo",
+        "مالقا" to "Malaga",
+        "كوفنتري سيتي" to "Coventry City",
+        "برايتون" to "Brighton",
+        "ليل" to "Lille",
+        "تروا" to "Troyes",
+        "زفوله" to "PEC Zwolle",
+        "فينورد روتردام" to "Feyenoord",
+        "فينورد" to "Feyenoord",
+        "ليفانتي" to "Levante",
+        "لومان" to "Le Mans",
+        "لانس" to "Lens",
+        "مان يونايتد" to "Manchester United",
+        "مان سيتي" to "Manchester City",
+        "خيتافي" to "Getafe",
+        "لاكورونيا" to "Deportivo La Coruna",
+        "غلطة سراي" to "Galatasaray",
+        "كوجالي سبور" to "Kocaelispor",
+        "سبارتا روتردام" to "Sparta Rotterdam",
+        "بريست" to "Brest",
+        "باريس" to "Paris Saint-Germain",
+        "ريال سوسيداد" to "Real Sociedad",
     )
 
     /** Alef/hamza-insensitive lookup: unifies آ/أ/إ->ا, ة->ه, ى->ي so
@@ -581,6 +606,7 @@ class YacineTvProvider : MainAPI() {
     )
 
     data class SportsDbTeam(
+        @JsonProperty("strTeam") val strTeam: String? = null,
         @JsonProperty("strBadge") val strBadge: String? = null,
     )
 
@@ -613,7 +639,13 @@ class YacineTvProvider : MainAPI() {
             ).text.takeIf { it.isNotBlank() } ?: return@retryIO null
             val badge = runCatching { parseJson<SportsDbTeams>(res).teams }
                 .getOrNull()
-                ?.firstOrNull { !it.strBadge.isNullOrBlank() }?.strBadge
+                .orEmpty()
+                .filter { !it.strBadge.isNullOrBlank() }
+                .let { teams ->
+                    teams.firstOrNull {
+                        it.strTeam?.trim().equals(englishName, ignoreCase = true)
+                    } ?: teams.firstOrNull()
+                }?.strBadge
                 ?: return@retryIO null
             badgeCache[englishName] = badge
             if (ctx != null) {
