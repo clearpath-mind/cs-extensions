@@ -635,10 +635,8 @@ class YacineTvProvider : MainAPI() {
                 .getOrNull()
                 .orEmpty()
                 .filter { !it.strBadge.isNullOrBlank() }
-                .let { teams ->
-                    teams.firstOrNull {
-                        it.strTeam?.trim().equals(englishName, ignoreCase = true)
-                    } ?: teams.firstOrNull()
+                .firstOrNull {
+                    it.strTeam?.trim().equals(englishName, ignoreCase = true)
                 }?.strBadge
                 ?: return@retryIO null
             badgeCache[englishName] = badge

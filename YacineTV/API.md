@@ -132,7 +132,8 @@ the fixture day to avoid wrong-leg art. Yacine team ids (`/events`
 no rebuild); thumb URLs cached per event id (`cacheDir/match_thumbs` + memory). Only
 the fixture day is accepted (no dateless fallback — avoids wrong-leg
 art). Misses use the 500px TheSportsDB team badge (`team_badges` cache,
-exact `strTeam` match preferred),
+exact `strTeam` match required — no fuzzy fallback, wrong-team badges
+are never shown),
 then API team logos. Yacine + thumbnail lookups retry (`retryIO`) since
 both APIs flap. No on-device compositing.
 
