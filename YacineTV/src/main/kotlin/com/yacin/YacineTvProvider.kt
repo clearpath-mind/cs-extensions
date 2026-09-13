@@ -296,8 +296,8 @@ class YacineTvProvider : MainAPI() {
                         val thumb = withTimeoutOrNull(8_000) { matchThumb(e) }
                         if (thumb != null) return@async thumb
                         val badge = withTimeoutOrNull(8_000) {
-                            teamAlias(e.team1?.name)?.let { teamBadge(it) }
-                                ?: teamAlias(e.team2?.name)?.let { teamBadge(it) }
+                            teamAlias(e.team1?.id, e.team1?.name)?.let { teamBadge(it) }
+                                ?: teamAlias(e.team2?.id, e.team2?.name)?.let { teamBadge(it) }
                         }
                         badge
                             ?: e.team1?.logo?.takeIf { it.isNotBlank() }
@@ -521,7 +521,42 @@ class YacineTvProvider : MainAPI() {
 
     private val teamAliasesNorm = teamAliases.mapKeys { normalizeArabic(it.key) }
 
-    private fun teamAlias(arabicName: String?): String? {
+    /** Yacine team id -> English alias (from /events team_1/team_2 objects,
+     * verified 2026-09-13). IDs are immune to Arabic spelling variants
+     * (short forms, alef/hamza, trailing spaces); stability across DB
+     * rebuilds is unconfirmed, so the Arabic-name map stays as fallback. */
+    private val teamAliasesById = mapOf(
+        3 to "Barcelona",
+        5 to "Real Sociedad",
+        7 to "Atletico Madrid",
+        21 to "Getafe",
+        24 to "Celta Vigo",
+        38 to "Manchester City",
+        41 to "Manchester United",
+        43 to "Brighton",
+        56 to "Wolverhampton Wanderers",
+        81 to "Paris Saint-Germain",
+        82 to "Lens",
+        87 to "Lille",
+        93 to "Troyes",
+        96 to "Brest",
+        102 to "PSV Eindhoven",
+        107 to "Levante",
+        316 to "Sheffield United",
+        323 to "Feyenoord",
+        470 to "Galatasaray",
+        577 to "Coventry City",
+        685 to "Malaga",
+        824 to "Le Mans",
+        887 to "Sparta Rotterdam",
+        933 to "PEC Zwolle",
+        945 to "Deportivo La Coruna",
+        959 to "Kocaelispor",
+    )
+
+    /** ID first, Arabic-name map as fallback (see above). */
+    private fun teamAlias(id: Int?, arabicName: String?): String? {
+        if (id != null) teamAliasesById[id]?.let { return it }
         val n = arabicName?.trim()?.takeIf { it.isNotBlank() } ?: return null
         return teamAliasesNorm[normalizeArabic(n)]
     }
@@ -556,8 +591,8 @@ class YacineTvProvider : MainAPI() {
                 }
             }
         }
-        val t1 = teamAlias(e.team1?.name) ?: return null
-        val t2 = teamAlias(e.team2?.name) ?: return null
+        val t1 = teamAlias(e.team1?.id, e.team1?.name) ?: return null
+        val t2 = teamAlias(e.team2?.id, e.team2?.name) ?: return null
         val day = e.startTime?.let { dayString(it) }
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val thumb = searchEventThumb(a, b, day) ?: continue
