@@ -121,9 +121,10 @@ the same items twice.
 
 ## Match banners
 
-`Today's Matches` shows only live/upcoming fixtures: events with
-`end_time + 60min grace` in the past are filtered from homepage and search
-(missing `end_time` is kept; saved links keep playing). Cards use TheSportsDB ready-made 1280x720 banners
+`Today's Matches` shows live, upcoming, and ended fixtures (ended are
+kept, sorted `LIVE` -> `UPCOMING` -> `ENDED`). Cards prefix the title
+with `[LIVE]` / `[UPCOMING]` / `[ENDED]` on homepage, search, and detail
+tags. Cards use TheSportsDB ready-made 1280x720 banners
 (`strThumb`, free key): both team orders tried, `dateEvent` matched to
 the fixture day to avoid wrong-leg art. Yacine team ids (`/events`
 `team_1`/`team_2` objects) map to canonical TheSportsDB English names via

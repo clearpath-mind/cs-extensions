@@ -255,14 +255,24 @@ class YacineTvProvider : MainAPI() {
         return "شاهد البث المباشر لمباراة $title"
     }
 
-    /** Extra-time/penalties grace after end_time before a finished match
-     * is hidden from homepage and search (saved links keep playing). */
-    private val matchEndGraceSec = 60 * 60L
+    /** Match state derived from start/end_time vs now. Missing times
+     * keep the match playable: unknown start -> LIVE if end not passed. */
+    private fun matchStatus(e: YacineEvent, nowSec: Long): String {
+        val start = e.startTime?.takeIf { it > 0 }
+        val end = e.endTime?.takeIf { it > 0 }
+        if (end != null && nowSec > end) return "ENDED"
+        if (start != null && nowSec < start) return "UPCOMING"
+        return "LIVE"
+    }
 
-    private fun isMatchVisible(e: YacineEvent, nowSec: Long): Boolean {
-        val end = e.endTime
-        if (end == null || end <= 0) return true
-        return nowSec <= end + matchEndGraceSec
+    private fun eventDisplayName(e: YacineEvent, nowSec: Long): String {
+        return "[${matchStatus(e, nowSec)}] ${eventTitle(e)}"
+    }
+
+    private fun matchRank(status: String): Int = when (status) {
+        "LIVE" -> 0
+        "UPCOMING" -> 1
+        else -> 2
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -298,9 +308,15 @@ class YacineTvProvider : MainAPI() {
             val lists = mutableListOf<HomePageList>()
 
             // 1) Matches first (horizontal cards with API banners).
-            // Finished matches drop out end_time + grace after the final whistle.
+            // Ended matches stay visible with an [ENDED] label.
             val nowSec = System.currentTimeMillis() / 1000
-            val events = eventsDeferred.await().filter { isMatchVisible(it, nowSec) }
+            val events = eventsDeferred.await().sortedWith(
+                compareBy(
+                    { matchRank(matchStatus(it, nowSec)) },
+                    { it.startTime ?: Long.MAX_VALUE },
+                    { -(it.endTime ?: Long.MIN_VALUE) },
+                )
+            )
             if (events.isNotEmpty()) {
                 // Thumbs/badges resolve in parallel; each is guarded so one
                 // slow lookup never blocks the homepage.
@@ -320,6 +336,7 @@ class YacineTvProvider : MainAPI() {
                 val matchLinks = events.zip(posters).mapNotNull { (e, poster) ->
                     val id = e.id ?: return@mapNotNull null
                     val title = eventTitle(e)
+                    val displayName = eventDisplayName(e, nowSec)
                     // TheSportsDB banner, else 500px team badge, else API
                     // team logos. Detail page shows both (poster + background).
                     val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
@@ -327,7 +344,7 @@ class YacineTvProvider : MainAPI() {
                     LinkData(
                         kind = "event",
                         id = id,
-                        name = title,
+                        name = displayName,
                         poster = poster,
                         poster2 = poster2,
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
@@ -765,10 +782,11 @@ class YacineTvProvider : MainAPI() {
                 )
             }
 
+            val nowSec = System.currentTimeMillis() / 1000
             eventsDeferred.await().forEach { e ->
-                if (!isMatchVisible(e, System.currentTimeMillis() / 1000)) return@forEach
                 val title = eventTitle(e)
-                val hay = listOfNotNull(title, e.champions, e.channel, e.team1?.name, e.team2?.name)
+                val displayName = eventDisplayName(e, nowSec)
+                val hay = listOfNotNull(title, displayName, e.champions, e.channel, e.team1?.name, e.team2?.name)
                     .joinToString(" ")
                 if (!hay.contains(q, ignoreCase = true)) return@forEach
                 val id = e.id ?: return@forEach
@@ -779,7 +797,7 @@ class YacineTvProvider : MainAPI() {
                 val data = LinkData(
                     kind = "event",
                     id = id,
-                    name = title,
+                    name = displayName,
                     poster = poster,
                     poster2 = poster2,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
@@ -789,7 +807,7 @@ class YacineTvProvider : MainAPI() {
                     plot = matchPlot(title),
                 ).toJson()
                 out.add(
-                    newLiveSearchResponse(title, data, TvType.Live) {
+                    newLiveSearchResponse(displayName, data, TvType.Live) {
                         this.posterUrl = poster
                     }
                 )
@@ -811,10 +829,12 @@ class YacineTvProvider : MainAPI() {
                 this.backgroundPosterUrl = data.poster ?: data.poster2
             }
             this.plot = plot
-            // Match meta as tags, in order: competition, kickoff,
+            // Match meta as tags, in order: status, competition, kickoff,
             // commentator, broadcast channel.
             if (data.kind == "event") {
+                val status = Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(data.name)?.groupValues?.get(1)
                 val tags = listOfNotNull(
+                    status,
                     data.competition?.takeIf { it.isNotBlank() },
                     data.kickoff?.takeIf { it.isNotBlank() },
                     data.commentary?.takeIf { it.isNotBlank() },
