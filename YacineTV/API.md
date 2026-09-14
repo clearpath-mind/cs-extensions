@@ -122,9 +122,11 @@ the same items twice.
 ## Match banners
 
 `Today's Matches` shows live, upcoming, and ended fixtures (ended are
-kept, sorted `LIVE` -> `UPCOMING` -> `ENDED`). Cards prefix the title
-with `[LIVE]` / `[UPCOMING]` / `[ENDED]` on homepage, search, and detail
-tags. Cards use TheSportsDB ready-made 1280x720 banners
+kept, sorted live -> upcoming -> ended). Cards prefix the title
+with `🔴` / `🔜` / `✅` (Cricify-style) on homepage and search, and detail
+tags carry `LIVE` / `UPCOMING` / `ENDED`. Titles prefer English
+(`team_aliases.json` id -> English `TeamA vs TeamB`) with Arabic
+`Team1 × Team2` fallback when either side is unmapped. Cards use TheSportsDB ready-made 1280x720 banners
 (`strThumb`, free key): both team orders tried, `dateEvent` matched to
 the fixture day to avoid wrong-leg art. Yacine team ids (`/events`
 `team_1`/`team_2` objects) map to canonical TheSportsDB English names via

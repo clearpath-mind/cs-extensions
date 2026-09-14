@@ -251,6 +251,20 @@ class YacineTvProvider : MainAPI() {
         return e.champions?.trim().orEmpty().ifBlank { "مباراة" }
     }
 
+    private fun eventEnglishTitle(e: YacineEvent): String? {
+        // ID -> English via team_aliases.json (remote, no extra network here).
+        // Null when either side is unmapped -> caller falls back to Arabic.
+        val a = teamAlias(e.team1?.id)?.trim().takeIf { !it.isNullOrBlank() }
+        val b = teamAlias(e.team2?.id)?.trim().takeIf { !it.isNullOrBlank() }
+        if (a.isNullOrBlank() || b.isNullOrBlank()) return null
+        if (a == b) return a
+        return "$a vs $b"
+    }
+
+    private fun eventBaseTitle(e: YacineEvent): String {
+        return eventEnglishTitle(e) ?: eventTitle(e)
+    }
+
     private fun matchPlot(title: String): String {
         return "شاهد البث المباشر لمباراة $title"
     }
@@ -265,8 +279,16 @@ class YacineTvProvider : MainAPI() {
         return "LIVE"
     }
 
+    /** Cricify-style emoji prefix: 🔴 live / 🔜 upcoming / ✅ ended. */
+    private fun statusEmoji(status: String): String = when (status) {
+        "LIVE" -> "🔴"
+        "UPCOMING" -> "🔜"
+        else -> "✅"
+    }
+
     private fun eventDisplayName(e: YacineEvent, nowSec: Long): String {
-        return "[${matchStatus(e, nowSec)}] ${eventTitle(e)}"
+        val status = matchStatus(e, nowSec)
+        return "${statusEmoji(status)} ${eventBaseTitle(e)}"
     }
 
     private fun matchRank(status: String): Int = when (status) {
@@ -335,7 +357,7 @@ class YacineTvProvider : MainAPI() {
                 }.awaitAll()
                 val matchLinks = events.zip(posters).mapNotNull { (e, poster) ->
                     val id = e.id ?: return@mapNotNull null
-                    val title = eventTitle(e)
+                    val title = eventBaseTitle(e)
                     val displayName = eventDisplayName(e, nowSec)
                     // TheSportsDB banner, else 500px team badge, else API
                     // team logos. Detail page shows both (poster + background).
@@ -784,9 +806,10 @@ class YacineTvProvider : MainAPI() {
 
             val nowSec = System.currentTimeMillis() / 1000
             eventsDeferred.await().forEach { e ->
-                val title = eventTitle(e)
+                val title = eventBaseTitle(e)
+                val arabicTitle = eventTitle(e)
                 val displayName = eventDisplayName(e, nowSec)
-                val hay = listOfNotNull(title, displayName, e.champions, e.channel, e.team1?.name, e.team2?.name)
+                val hay = listOfNotNull(title, arabicTitle, displayName, e.champions, e.channel, e.team1?.name, e.team2?.name)
                     .joinToString(" ")
                 if (!hay.contains(q, ignoreCase = true)) return@forEach
                 val id = e.id ?: return@forEach
@@ -830,9 +853,15 @@ class YacineTvProvider : MainAPI() {
             }
             this.plot = plot
             // Match meta as tags, in order: status, competition, kickoff,
-            // commentator, broadcast channel.
+            // commentator, broadcast channel. Accepts new emoji prefix
+            // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
             if (data.kind == "event") {
-                val status = Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(data.name)?.groupValues?.get(1)
+                val status = when {
+                    data.name.startsWith("🔴") -> "LIVE"
+                    data.name.startsWith("🔜") -> "UPCOMING"
+                    data.name.startsWith("✅") -> "ENDED"
+                    else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(data.name)?.groupValues?.get(1)
+                }
                 val tags = listOfNotNull(
                     status,
                     data.competition?.takeIf { it.isNotBlank() },
