@@ -228,6 +228,42 @@ class YacineTvProvider : MainAPI() {
             .trim()
     }
 
+    /** Arabic champions -> English fallback when TheSportsDB has no league
+     * (unmapped teams, no day match). Substring matching so minor API
+     * wording variants still hit. Returns null when nothing matches. */
+    private fun translateChampions(arabic: String?): String? {
+        val s = arabic?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val t = s.replace(Regex("""[ً-ٰٟ]"""), "")
+        fun has(vararg keys: String) = keys.any { t.contains(it) }
+        return when {
+            has("أبطال أوروبا", "ابطال اوروبا") -> "UEFA Champions League"
+            has("المؤتمر الأوروبي", "المؤتمر الاوروبي") -> "UEFA Conference League"
+            has("الأوروبي", "الاوروبي") && has("الدوري") -> "UEFA Europa League"
+            has("الإنجليزي", "الانجليزي", "البريميرليج") -> "Premier League"
+            has("الإسباني", "الاسباني", "الليجا") -> "La Liga"
+            has("الإيطالي", "الايطالي", "الكالتشيو") -> "Serie A"
+            has("الألماني", "الالماني", "البوندسليجا") -> "Bundesliga"
+            has("الفرنسي") -> "Ligue 1"
+            has("السعودي", "روشن") -> "Saudi Pro League"
+            has("المغربي", "البطولة الاحترافية", "البطولة") -> "Botola Pro"
+            has("المصري") -> "Egyptian Premier League"
+            has("أبطال أفريقيا", "ابطال افريقيا") -> "CAF Champions League"
+            has("أبطال آسيا", "ابطال اسيا") -> "AFC Champions League"
+            has("أمم أفريقيا", "امم افريقيا") -> "Africa Cup of Nations"
+            has("أمم أوروبا", "امم اوروبا") -> "UEFA Euro"
+            has("كأس العالم", "كاس العالم") -> "FIFA World Cup"
+            else -> null
+        }
+    }
+
+    /** Preferred competition label: TheSportsDB English league, then the
+     * Arabic->English map, then raw Arabic (never blank). */
+    private fun competitionEnglish(league: String?, champions: String?): String? {
+        league?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+        val raw = champions?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return translateChampions(raw) ?: raw
+    }
+
     private fun cleanCategoryName(name: String?): String {
         val n = (name ?: "أخرى").trim()
         if (beinQualityRegex.containsMatchIn(n)) return "beIN SPORTS"
@@ -373,8 +409,7 @@ class YacineTvProvider : MainAPI() {
                         poster = poster,
                         poster2 = poster2,
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                        competition = league?.takeIf { it.isNotBlank() }
-                            ?: e.champions?.trim()?.takeIf { it.isNotBlank() },
+                        competition = competitionEnglish(league, e.champions),
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
                         plot = matchPlot(title),
@@ -584,33 +619,39 @@ class YacineTvProvider : MainAPI() {
 
     private suspend fun matchArt(e: YacineEvent): MatchArt {
         val id = e.id ?: return MatchArt()
+        // Memory: only short-circuit when BOTH pieces are cached, otherwise
+        // keep going so a v32 thumb cache never blocks the new league fetch.
         val cachedThumb = thumbCache[id]
         val cachedLeague = leagueCache[id]
-        if (cachedThumb != null || cachedLeague != null) {
+        if (cachedThumb != null && cachedLeague != null) {
             return MatchArt(cachedThumb, cachedLeague)
         }
         val ctx = appContext
-        var diskThumb: String? = null
-        var diskLeague: String? = null
+        var diskThumb: String? = cachedThumb
+        var diskLeague: String? = cachedLeague
         if (ctx != null) {
             runCatching {
                 val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
-                val tf = File(dir, "match_$id.txt")
-                if (tf.exists()) {
-                    tf.readText().trim().takeIf { it.startsWith("http") }?.let {
-                        diskThumb = it
-                        thumbCache[id] = it
+                if (diskThumb == null) {
+                    val tf = File(dir, "match_$id.txt")
+                    if (tf.exists()) {
+                        tf.readText().trim().takeIf { it.startsWith("http") }?.let {
+                            diskThumb = it
+                            thumbCache[id] = it
+                        }
                     }
                 }
-                val lf = File(dir, "match_${id}_league.txt")
-                if (lf.exists()) {
-                    lf.readText().trim().takeIf { it.isNotBlank() }?.let {
-                        diskLeague = it
-                        leagueCache[id] = it
+                if (diskLeague == null) {
+                    val lf = File(dir, "match_${id}_league.txt")
+                    if (lf.exists()) {
+                        lf.readText().trim().takeIf { it.isNotBlank() }?.let {
+                            diskLeague = it
+                            leagueCache[id] = it
+                        }
                     }
                 }
             }
-            if (diskThumb != null || diskLeague != null) {
+            if (diskThumb != null && diskLeague != null) {
                 return MatchArt(diskThumb, diskLeague)
             }
         }
@@ -663,12 +704,13 @@ class YacineTvProvider : MainAPI() {
             ).text.takeIf { it.isNotBlank() }
         } ?: return MatchArt()
         val events = runCatching { parseJson<SportsDbEvents>(res).event }.getOrNull().orEmpty()
-        // Only the fixture day: a dateless fallback would show wrong-leg
-        // banners (e.g. next year's return leg). No match -> API logos / Arabic champions.
+        if (events.isEmpty()) return MatchArt()
+        // Thumb stays day-strict (wrong-leg banners are worse than none),
+        // but league is the same across legs so it falls back to any event.
         val pool = if (day.isNullOrBlank()) events else events.filter { it.dateEvent == day }
-        if (pool.isEmpty()) return MatchArt()
         val thumb = pool.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
         val league = pool.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
+            ?: events.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
         return MatchArt(thumb, league)
     }
 
@@ -889,8 +931,7 @@ class YacineTvProvider : MainAPI() {
                     poster = poster,
                     poster2 = poster2,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    competition = leagues[id]?.takeIf { it.isNotBlank() }
-                        ?: e.champions?.trim()?.takeIf { it.isNotBlank() },
+                    competition = competitionEnglish(leagues[id], e.champions),
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                     kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
                     plot = matchPlot(title),
@@ -928,9 +969,14 @@ class YacineTvProvider : MainAPI() {
                     data.name.startsWith("✅") -> "ENDED"
                     else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(data.name)?.groupValues?.get(1)
                 }
+                // Old saved links carry Arabic champions + old date format;
+                // re-translate so detail tags show English without re-adding.
+                val competition = data.id?.let { leagueCache[it] }
+                    ?.takeIf { it.isNotBlank() }
+                    ?: competitionEnglish(null, data.competition)
                 val tags = listOfNotNull(
                     status,
-                    data.competition?.takeIf { it.isNotBlank() },
+                    competition,
                     data.kickoff?.takeIf { it.isNotBlank() },
                     data.commentary?.takeIf { it.isNotBlank() },
                     data.channel?.takeIf { it.isNotBlank() },
