@@ -427,9 +427,10 @@ class YacineTvProvider : MainAPI() {
     }
 
     /** Yacine team id -> English alias for TheSportsDB lookups.
-     * Loaded from remote team_aliases.json (24h TTL, disk cache
-     * cacheDir/team_aliases/aliases.json + memory). Unknown IDs skip the
-     * thumbnail API and fall back to API logos. */
+     * Remote team_aliases.json is fetched on every cold start (memory
+     * guards repeats within a session); disk cache
+     * cacheDir/team_aliases/aliases.json is offline fallback only.
+     * Unknown IDs skip the thumbnail API and fall back to API logos. */
     private val teamAliasesUrl =
         "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/team_aliases.json"
     private val teamAliasesTtlMs = 24 * 60 * 60 * 1000L
@@ -445,7 +446,8 @@ class YacineTvProvider : MainAPI() {
         return teamAliases?.get(id)
     }
 
-    /** Refreshes the team id -> alias map from the remote JSON (24h TTL).
+    /** Refreshes the team id -> alias map from the remote JSON on every
+     * cold start (memory guards repeats within a session).
      * Never throws: any failure keeps the memory/disk map (possibly empty). */
     private suspend fun ensureTeamAliases() {
         val now = System.currentTimeMillis()
@@ -453,23 +455,10 @@ class YacineTvProvider : MainAPI() {
         val ctx = appContext
         val cacheFile = ctx?.let { File(File(it.cacheDir, "team_aliases").apply { mkdirs() }, "aliases.json") }
 
-        // Fresh disk cache satisfies the TTL without network.
-        if (teamAliases == null && cacheFile != null) {
-            runCatching {
-                if (cacheFile.exists() && now - cacheFile.lastModified() < teamAliasesTtlMs) {
-                    parseAliasesJson(cacheFile.readText())?.let {
-                        if (it.isNotEmpty()) {
-                            teamAliases = it
-                            teamAliasesFetchedAt = cacheFile.lastModified()
-                            return
-                        }
-                    }
-                }
-            }
-        }
-
+        // Remote-first: every cold start tries network so newly added ids
+        // apply on next app open instead of waiting out a disk TTL.
         val remote = fetchRemoteAliases() ?: run {
-            // Offline: use stale disk if present.
+            // Offline: use disk (even stale) if present.
             if (teamAliases == null && cacheFile != null) {
                 runCatching {
                     if (cacheFile.exists()) {
