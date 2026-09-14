@@ -142,8 +142,9 @@ both APIs flap. No on-device compositing.
 
 ## Match details
 
-Plot is `شاهد البث المباشر لمباراة {title}`. Competition, kickoff (Latin
-digits, `dd/MM - HH:mm`), commentator, and broadcast channel — in that
+Plot is `شاهد البث المباشر لمباراة {title}`. Competition (TheSportsDB
+`strLeague` English, Arabic `champions` fallback), kickoff (Latin
+digits, `dd MMM, HH:mm` e.g. `14 Sep, 07:15`), commentator, and broadcast channel — in that
 order — ride in `LinkData` and render as tags on the detail page. The
 detail hero shows the same homepage banner thumbnail.
 

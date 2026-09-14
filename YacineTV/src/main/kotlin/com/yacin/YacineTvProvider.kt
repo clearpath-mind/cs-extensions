@@ -239,7 +239,8 @@ class YacineTvProvider : MainAPI() {
         if (epochSec == null || epochSec <= 0) return ""
         return try {
             // Latin digits (normal numbers), not Eastern Arabic numerals.
-            val fmt = SimpleDateFormat("dd/MM - HH:mm", Locale.US)
+            // e.g. "14 Sep, 07:15".
+            val fmt = SimpleDateFormat("dd MMM, HH:mm", Locale.US)
             fmt.format(Date(epochSec * 1000))
         } catch (_: Exception) { "" }
     }
@@ -340,22 +341,24 @@ class YacineTvProvider : MainAPI() {
                 )
             )
             if (events.isNotEmpty()) {
-                // Thumbs/badges resolve in parallel; each is guarded so one
-                // slow lookup never blocks the homepage.
-                val posters = events.map { e ->
+                // Thumbs/badges/leagues resolve in parallel; each is guarded
+                // so one slow lookup never blocks the homepage.
+                // TheSportsDB art (thumb + English strLeague) reuses one request.
+                val arts = events.map { e ->
                     async {
-                        val thumb = withTimeoutOrNull(8_000) { matchThumb(e) }
-                        if (thumb != null) return@async thumb
-                        val badge = withTimeoutOrNull(8_000) {
-                            teamAlias(e.team1?.id)?.let { teamBadge(it) }
-                                ?: teamAlias(e.team2?.id)?.let { teamBadge(it) }
-                        }
-                        badge
+                        val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
+                        val poster = art.thumb
+                            ?: withTimeoutOrNull(8_000) {
+                                teamAlias(e.team1?.id)?.let { teamBadge(it) }
+                                    ?: teamAlias(e.team2?.id)?.let { teamBadge(it) }
+                            }
                             ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                             ?: e.team2?.logo?.takeIf { it.isNotBlank() }
+                        poster to art.league
                     }
                 }.awaitAll()
-                val matchLinks = events.zip(posters).mapNotNull { (e, poster) ->
+                val matchLinks = events.zip(arts).mapNotNull { (e, art) ->
+                    val (poster, league) = art
                     val id = e.id ?: return@mapNotNull null
                     val title = eventBaseTitle(e)
                     val displayName = eventDisplayName(e, nowSec)
@@ -370,7 +373,8 @@ class YacineTvProvider : MainAPI() {
                         poster = poster,
                         poster2 = poster2,
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                        competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                        competition = league?.takeIf { it.isNotBlank() }
+                            ?: e.champions?.trim()?.takeIf { it.isNotBlank() },
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
                         plot = matchPlot(title),
@@ -556,43 +560,87 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("dateEvent") val dateEvent: String? = null,
         @JsonProperty("strEvent") val strEvent: String? = null,
         @JsonProperty("strThumb") val strThumb: String? = null,
+        @JsonProperty("strLeague") val strLeague: String? = null,
     )
 
-    /** Ready-made 1280x720 match banner from TheSportsDB (free key),
-     * cached per event id under cacheDir/match_thumbs. Returns null on any
-     * miss so the caller falls back to API team logos. */
+    /** Ready-made 1280x720 match banner + English league from TheSportsDB
+     * (free key), cached per event id under cacheDir/match_thumbs.
+     * Null art falls back to API team logos (thumb) / Arabic champions (league). */
+    private data class MatchArt(
+        val thumb: String? = null,
+        val league: String? = null,
+    )
     private val thumbCache = ConcurrentHashMap<Long, String>()
+    private val leagueCache = ConcurrentHashMap<Long, String>()
 
     private suspend fun matchThumb(e: YacineEvent): String? {
-        val id = e.id ?: return null
-        thumbCache[id]?.let { return it }
+        return matchArt(e).thumb
+    }
+
+    private suspend fun matchLeague(e: YacineEvent): String? {
+        e.id?.let { leagueCache[it]?.let { return it } }
+        return matchArt(e).league
+    }
+
+    private suspend fun matchArt(e: YacineEvent): MatchArt {
+        val id = e.id ?: return MatchArt()
+        val cachedThumb = thumbCache[id]
+        val cachedLeague = leagueCache[id]
+        if (cachedThumb != null || cachedLeague != null) {
+            return MatchArt(cachedThumb, cachedLeague)
+        }
         val ctx = appContext
+        var diskThumb: String? = null
+        var diskLeague: String? = null
         if (ctx != null) {
             runCatching {
-                val f = File(File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }, "match_$id.txt")
-                if (f.exists()) {
-                    f.readText().trim().takeIf { it.startsWith("http") }?.let {
+                val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
+                val tf = File(dir, "match_$id.txt")
+                if (tf.exists()) {
+                    tf.readText().trim().takeIf { it.startsWith("http") }?.let {
+                        diskThumb = it
                         thumbCache[id] = it
-                        return it
+                    }
+                }
+                val lf = File(dir, "match_${id}_league.txt")
+                if (lf.exists()) {
+                    lf.readText().trim().takeIf { it.isNotBlank() }?.let {
+                        diskLeague = it
+                        leagueCache[id] = it
                     }
                 }
             }
+            if (diskThumb != null || diskLeague != null) {
+                return MatchArt(diskThumb, diskLeague)
+            }
         }
-        val t1 = teamAlias(e.team1?.id) ?: return null
-        val t2 = teamAlias(e.team2?.id) ?: return null
+        val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague)
+        val t2 = teamAlias(e.team2?.id) ?: return MatchArt(diskThumb, diskLeague)
         val day = e.startTime?.let { dayString(it) }
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
-            val thumb = searchEventThumb(a, b, day) ?: continue
-            thumbCache[id] = thumb
-            if (ctx != null) {
-                runCatching {
-                    val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
-                    File(dir, "match_$id.txt").writeText(thumb)
+            val art = searchEventArt(a, b, day)
+            if (art.thumb == null && art.league == null) continue
+            art.thumb?.let {
+                thumbCache[id] = it
+                if (ctx != null) {
+                    runCatching {
+                        val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
+                        File(dir, "match_$id.txt").writeText(it)
+                    }
                 }
             }
-            return thumb
+            art.league?.let {
+                leagueCache[id] = it
+                if (ctx != null) {
+                    runCatching {
+                        val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
+                        File(dir, "match_${id}_league.txt").writeText(it)
+                    }
+                }
+            }
+            return MatchArt(art.thumb ?: diskThumb, art.league ?: diskLeague)
         }
-        return null
+        return MatchArt(diskThumb, diskLeague)
     }
 
     private fun dayString(epochSec: Long): String {
@@ -603,9 +651,9 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { "" }
     }
 
-    private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
+    private suspend fun searchEventArt(a: String, b: String, day: String?): MatchArt {
         // Shared free key flaps (000s); retry the request, but a clean
-        // response with no day-matching thumb is final (no pointless retry).
+        // response with no day-matching art is final (no pointless retry).
         val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
         val res = retryIO(times = 2) {
             app.get(
@@ -613,14 +661,19 @@ class YacineTvProvider : MainAPI() {
                 headers = mapOf("User-Agent" to BROWSER_UA),
                 timeout = 8,
             ).text.takeIf { it.isNotBlank() }
-        } ?: return null
+        } ?: return MatchArt()
         val events = runCatching { parseJson<SportsDbEvents>(res).event }.getOrNull().orEmpty()
         // Only the fixture day: a dateless fallback would show wrong-leg
-        // banners (e.g. next year's return leg). No match -> API logos.
-        if (day.isNullOrBlank()) {
-            return events.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
-        }
-        return events.firstOrNull { it.dateEvent == day && !it.strThumb.isNullOrBlank() }?.strThumb
+        // banners (e.g. next year's return leg). No match -> API logos / Arabic champions.
+        val pool = if (day.isNullOrBlank()) events else events.filter { it.dateEvent == day }
+        if (pool.isEmpty()) return MatchArt()
+        val thumb = pool.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+        val league = pool.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
+        return MatchArt(thumb, league)
+    }
+
+    private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
+        return searchEventArt(a, b, day).thumb
     }
 
     data class SportsDbTeams(
@@ -755,6 +808,7 @@ class YacineTvProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         return coroutineScope {
+            runCatching { ensureTeamAliases() }
             val eventsDeferred = async { getEvents() }
             val q = query.trim()
 
@@ -805,13 +859,24 @@ class YacineTvProvider : MainAPI() {
             }
 
             val nowSec = System.currentTimeMillis() / 1000
-            eventsDeferred.await().forEach { e ->
+            val matched = eventsDeferred.await().filter { e ->
                 val title = eventBaseTitle(e)
                 val arabicTitle = eventTitle(e)
                 val displayName = eventDisplayName(e, nowSec)
                 val hay = listOfNotNull(title, arabicTitle, displayName, e.champions, e.channel, e.team1?.name, e.team2?.name)
                     .joinToString(" ")
-                if (!hay.contains(q, ignoreCase = true)) return@forEach
+                hay.contains(q, ignoreCase = true)
+            }
+            // English league per match (cached; bounded lookup so search stays fast).
+            val leagues = matched.map { e ->
+                async {
+                    e.id to (e.id?.let { leagueCache[it] }
+                        ?: withTimeoutOrNull(4_000) { matchLeague(e) })
+                }
+            }.awaitAll().toMap()
+            matched.forEach { e ->
+                val title = eventBaseTitle(e)
+                val displayName = eventDisplayName(e, nowSec)
                 val id = e.id ?: return@forEach
                 val poster = e.team1?.logo?.takeIf { it.isNotBlank() }
                     ?: e.team2?.logo?.takeIf { it.isNotBlank() }
@@ -824,7 +889,8 @@ class YacineTvProvider : MainAPI() {
                     poster = poster,
                     poster2 = poster2,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                    competition = leagues[id]?.takeIf { it.isNotBlank() }
+                        ?: e.champions?.trim()?.takeIf { it.isNotBlank() },
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                     kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
                     plot = matchPlot(title),
