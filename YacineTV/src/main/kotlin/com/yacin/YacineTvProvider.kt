@@ -599,7 +599,7 @@ class YacineTvProvider : MainAPI() {
     )
 
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
-     * (free key), cached per event id under cacheDir/match_thumbs_v2.
+     * (free key), cached per event id under cacheDir/match_thumbs_v3.
      * Entries are fingerprinted by team ids + fixture day and expire after
      * 48h, so a recycled event id or a wrong first pick can never pin a
      * stale banner forever. Null art falls back to API team logos
@@ -615,7 +615,7 @@ class YacineTvProvider : MainAPI() {
     private val artPrintCache = ConcurrentHashMap<Long, String>()
     private val artSavedAt = ConcurrentHashMap<Long, Long>()
     private val ART_TTL_MS = 48 * 60 * 60 * 1000L
-    private val ART_DIR = "match_thumbs_v2"
+    private val ART_DIR = "match_thumbs_v3"
 
     private suspend fun matchThumb(e: YacineEvent): String? {
         return matchArt(e).thumb
@@ -657,15 +657,20 @@ class YacineTvProvider : MainAPI() {
         var diskLeague: String? = leagueCache[id]
         if (ctx != null) {
             runCatching {
-                // One-time cleanup of pre-v2 entries (bare event id, no
-                // fingerprint/TTL) that may hold a wrong banner.
+                // One-time cleanup of pre-v3 entries (bare event id in v1, no
+                // fingerprint/TTL; v2 league-only pins) that may hold a wrong
+                // or thumb-less banner.
                 runCatching {
-                    val legacy = File(ctx.cacheDir, "match_thumbs")
-                    File(legacy, "match_$id.txt").delete()
-                    File(legacy, "match_${id}_league.txt").delete()
+                    File(ctx.cacheDir, "match_thumbs").let { legacy ->
+                        File(legacy, "match_$id.txt").delete()
+                        File(legacy, "match_${id}_league.txt").delete()
+                    }
+                    File(ctx.cacheDir, "match_thumbs_v2").let { v2 ->
+                        File(v2, "match_v2_$id.txt").delete()
+                    }
                 }
                 val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
-                val f = File(dir, "match_v2_$id.txt")
+                val f = File(dir, "match_v3_$id.txt")
                 if (f.exists()) {
                     if (now - f.lastModified() < ART_TTL_MS) {
                         val lines = f.readText().lines()
@@ -697,30 +702,38 @@ class YacineTvProvider : MainAPI() {
         }
         val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague)
         val t2 = teamAlias(e.team2?.id) ?: return MatchArt(diskThumb, diskLeague)
+        // Both team orders are always consulted: the first order often
+        // returns a league-only result (day pool empty, league falls back to
+        // any leg) while the reversed order holds the day-matching banner.
+        // Returning early on league-only is what left cards on logo fallback.
+        var bestThumb: String? = null
+        var bestLeague: String? = null
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val art = searchEventArt(a, b, day)
-            if (art.thumb == null && art.league == null) continue
-            art.thumb?.let {
-                thumbCache[id] = it
-            }
-            art.league?.let {
-                leagueCache[id] = it
-            }
-            if (art.thumb != null || art.league != null) {
-                artPrintCache[id] = print
-                artSavedAt[id] = now
-                if (ctx != null) {
-                    runCatching {
-                        val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
-                        File(dir, "match_v2_$id.txt").writeText(
-                            "$print\n${art.thumb.orEmpty()}\n${art.league.orEmpty()}"
-                        )
-                    }
-                }
-            }
-            return MatchArt(art.thumb ?: diskThumb, art.league ?: diskLeague)
+            if (art.thumb != null && bestThumb == null) bestThumb = art.thumb
+            if (art.league != null && bestLeague == null) bestLeague = art.league
+            if (bestThumb != null && bestLeague != null) break
         }
-        return MatchArt(diskThumb, diskLeague)
+        if (bestThumb == null && bestLeague == null) {
+            return MatchArt(diskThumb, diskLeague)
+        }
+        bestThumb?.let {
+            thumbCache[id] = it
+        }
+        bestLeague?.let {
+            leagueCache[id] = it
+        }
+        artPrintCache[id] = print
+        artSavedAt[id] = now
+        if (ctx != null) {
+            runCatching {
+                val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
+                File(dir, "match_v3_$id.txt").writeText(
+                    "$print\n${bestThumb.orEmpty()}\n${bestLeague.orEmpty()}"
+                )
+            }
+        }
+        return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague)
     }
 
     private fun dayString(epochSec: Long): String {
