@@ -70,6 +70,9 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("competition") val competition: String? = null, // match: champions
         @JsonProperty("commentary") val commentary: String? = null, // match: commentator
         @JsonProperty("kickoff") val kickoff: String? = null, // match: formatted start time
+        @JsonProperty("team1Id") val team1Id: Int? = null, // match: Yacine team id (lazy art)
+        @JsonProperty("team2Id") val team2Id: Int? = null, // match: Yacine team id (lazy art)
+        @JsonProperty("startTime") val startTime: Long? = null, // match: epoch sec (lazy art)
         @JsonProperty("related") val related: List<LinkData>? = null, // detail recommendations
         @JsonProperty("plot") val plot: String? = null,
     )
@@ -458,9 +461,17 @@ class YacineTvProvider : MainAPI() {
                 // Thumbs/badges/leagues resolve in parallel; each is guarded
                 // so one slow lookup never blocks the homepage.
                 // TheSportsDB art (thumb + English strLeague) reuses one request.
-                val arts = events.map { e ->
+                // Visible-row prefetch: only the first PRIORITY_ART_LIMIT
+                // cards (live + soonest upcoming in sort order) hit network;
+                // the rest render from cache only and enrich lazily via
+                // search/detail, which warms the cache for the next build.
+                val arts = events.mapIndexed { index, e ->
                     async {
-                        val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
+                        val art = if (index < PRIORITY_ART_LIMIT) {
+                            withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
+                        } else {
+                            withTimeoutOrNull(2_000) { cachedMatchArt(e) } ?: MatchArt()
+                        }
                         // Badge fallback follows the displayed (home-first) order.
                         val firstBadge = art.orderedTitle?.let { ordered ->
                             val t1a = teamAlias(e.team1?.id)
@@ -511,6 +522,9 @@ class YacineTvProvider : MainAPI() {
                         competition = competitionEnglish(league, e.champions),
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
+                        team1Id = e.team1?.id,
+                        team2Id = e.team2?.id,
+                        startTime = e.startTime,
                         plot = matchPlot(matchup),
                     )
                 }
@@ -707,7 +721,7 @@ class YacineTvProvider : MainAPI() {
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
      * (free key), cached per event id under cacheDir/match_thumbs_v4.
      * Entries are fingerprinted by team ids + fixture day and expire after
-     * 48h, so a recycled event id or a wrong first pick can never pin a
+     * 7 days, so a recycled event id or a wrong first pick can never pin a
      * stale banner forever. Null art falls back to API team logos
      * (thumb) / Arabic champions (league).
      * orderedTitle is the home-first "A vs B" from TheSportsDB
@@ -737,9 +751,12 @@ class YacineTvProvider : MainAPI() {
      * art maps above against recycled ids / changed fixtures. */
     private val artPrintCache = ConcurrentHashMap<Long, String>()
     private val artSavedAt = ConcurrentHashMap<Long, Long>()
-    private val ART_TTL_MS = 48 * 60 * 60 * 1000L
+    private val ART_TTL_MS = 7 * 24 * 60 * 60 * 1000L
+    /** Homepage network prefetch cap: first N cards in sort order (live +
+     * soonest upcoming) resolve full art; the rest render cache-only. */
+    private val PRIORITY_ART_LIMIT = 8
     /** Live state is short-lived (scores change by the minute) while art
-     * pins for 48h: fresh or frozen-FT state serves from memory, otherwise
+     * pins for 7 days: fresh or frozen-FT state serves from memory, otherwise
      * the fetch refreshes both together (same request, no extra network).
      * Empty/failed lookups back off for STATE_TTL (shared free key). */
     private data class StateEntry(val print: String, val state: MatchState?, val savedAt: Long)
@@ -917,6 +934,41 @@ class YacineTvProvider : MainAPI() {
             }
         }
         return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague, finalTitle, bestState)
+    }
+
+    /** Cache-only art (memory, then disk): never touches network. Serves
+     * non-priority homepage cards and warms from search/detail traffic;
+     * null when nothing complete is cached. Cached live state rides along
+     * as-is (possibly stale) — refresh happens on the priority path. */
+    private suspend fun cachedMatchArt(e: YacineEvent): MatchArt? {
+        val id = e.id ?: return null
+        val day = e.startTime?.let { dayString(it) }
+        val print = "${e.team1?.id}_${e.team2?.id}_${day ?: "noday"}"
+        val now = System.currentTimeMillis()
+        if (artPrintCache[id] == print && now - (artSavedAt[id] ?: 0L) < ART_TTL_MS) {
+            val t = thumbCache[id]
+            val l = leagueCache[id]
+            if (t != null && l != null) {
+                val st = stateCache[id]?.takeIf { it.print == print }?.state
+                return MatchArt(t, l, titleCache[id], st)
+            }
+        }
+        val ctx = appContext ?: return null
+        return runCatching {
+            val f = File(File(ctx.cacheDir, ART_DIR).apply { mkdirs() }, "match_v4_$id.txt")
+            if (!f.exists() || now - f.lastModified() >= ART_TTL_MS) return@runCatching null
+            val lines = f.readText().lines()
+            if (lines.size < 3 || lines[0].trim() != print) return@runCatching null
+            val t = lines[1].trim().takeIf { it.startsWith("http") } ?: return@runCatching null
+            val l = lines[2].trim().takeIf { it.isNotBlank() } ?: return@runCatching null
+            thumbCache[id] = t
+            leagueCache[id] = l
+            val title = lines.getOrNull(3)?.trim()?.takeIf { it.isNotBlank() }?.also { titleCache[id] = it }
+            artPrintCache[id] = print
+            artSavedAt[id] = f.lastModified()
+            val st = stateCache[id]?.takeIf { it.print == print }?.state
+            MatchArt(t, l, title, st)
+        }.getOrNull()
     }
 
     private fun dayString(epochSec: Long): String {
@@ -1208,6 +1260,9 @@ class YacineTvProvider : MainAPI() {
                     competition = competitionEnglish(art?.league, e.champions),
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                     kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
+                    team1Id = e.team1?.id,
+                    team2Id = e.team2?.id,
+                    startTime = e.startTime,
                     plot = matchPlot(matchup),
                 ).toJson()
                 out.add(
@@ -1222,15 +1277,42 @@ class YacineTvProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
+        // Lazy art enrich for non-priority cards (homepage renders those
+        // cache-only): resolves banner + live state on detail open and warms
+        // the cache for the next homepage build. Bounded so detail stays fast.
+        val nowSec = System.currentTimeMillis() / 1000
+        val lazyEvent = if (data.kind == "event" && data.id != null &&
+            (data.team1Id != null || data.team2Id != null)
+        ) {
+            YacineEvent(
+                id = data.id,
+                startTime = data.startTime,
+                team1 = data.team1Id?.let { YacineTeam(it) },
+                team2 = data.team2Id?.let { YacineTeam(it) },
+            )
+        } else null
+        val lazyArt = lazyEvent?.let { ev ->
+            withTimeoutOrNull(5_000) {
+                runCatching { ensureTeamAliases() }
+                matchArt(ev)
+            }
+        }
+        // Fresh title only when the canonical home-first matchup resolved;
+        // otherwise the baked card name (rebuilding from id-only teams
+        // would degrade to "مباراة").
+        val name = if (lazyArt?.orderedTitle != null && lazyEvent != null) {
+            eventDisplayName(lazyEvent, nowSec, lazyArt)
+        } else data.name
+        val banner = data.poster ?: lazyArt?.thumb
         val plot = data.plot
-            ?: if (data.kind == "event") matchPlot(data.name)
+            ?: if (data.kind == "event") matchPlot(name)
             else "شاهد البث المباشر لقناة ${data.name}"
-        return newMovieLoadResponse(data.name, url, TvType.Live, url) {
-            this.posterUrl = data.poster
+        return newMovieLoadResponse(name, url, TvType.Live, url) {
+            this.posterUrl = banner
             // Matches: hero shows the same homepage thumbnail (banner);
             // fall back to the other team logo when no banner was rendered.
             if (data.kind == "event") {
-                this.backgroundPosterUrl = data.poster ?: data.poster2
+                this.backgroundPosterUrl = banner ?: data.poster2
             }
             this.plot = plot
             // Match meta as tags, in order: status, competition, kickoff,
@@ -1238,20 +1320,26 @@ class YacineTvProvider : MainAPI() {
             // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
             if (data.kind == "event") {
                 val status = when {
-                    data.name.startsWith("🔴") -> "LIVE"
-                    data.name.startsWith("🔜") -> "UPCOMING"
-                    data.name.startsWith("✅") -> "ENDED"
-                    else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(data.name)?.groupValues?.get(1)
+                    name.startsWith("🔴") -> "LIVE"
+                    name.startsWith("🔜") -> "UPCOMING"
+                    name.startsWith("✅") -> "ENDED"
+                    else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(name)?.groupValues?.get(1)
                 }
                 // Old saved links carry Arabic champions + old date format;
                 // re-translate so detail tags show English without re-adding.
-                val competition = data.id?.let { leagueCache[it] }
-                    ?.takeIf { it.isNotBlank() }
+                val competition = lazyArt?.league?.takeIf { it.isNotBlank() }
+                    ?: data.id?.let { leagueCache[it] }
+                        ?.takeIf { it.isNotBlank() }
                     ?: competitionEnglish(null, data.competition)
+                // Fresh countdown when the kickoff epoch rode along;
+                // otherwise the baked value (old saved links).
+                val kickoff = data.startTime
+                    ?.let { formatKickoff(it, nowSec) }?.takeIf { it.isNotBlank() }
+                    ?: data.kickoff?.takeIf { it.isNotBlank() }
                 val tags = listOfNotNull(
                     status,
                     competition,
-                    data.kickoff?.takeIf { it.isNotBlank() },
+                    kickoff,
                     data.commentary?.takeIf { it.isNotBlank() },
                     data.channel?.takeIf { it.isNotBlank() },
                 )
