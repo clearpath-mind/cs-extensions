@@ -132,9 +132,11 @@ the fixture day to avoid wrong-leg art. Yacine team ids (`/events`
 `team_1`/`team_2` objects) map to canonical TheSportsDB English names via
 `YacineTV/team_aliases.json` (raw.githubusercontent, fetched on every cold start,
 `cacheDir/team_aliases/aliases.json` offline fallback + memory — add new ids to the JSON only,
-no rebuild); thumb URLs cached per event id (`cacheDir/match_thumbs` + memory). Only
+no rebuild); thumb + league cached per event id (`cacheDir/match_thumbs_v2/match_v2_{id}.txt` + memory,
+fingerprinted by team ids + fixture day, 48h TTL; pre-v2 `match_thumbs/` files deleted on sight). Only
 the fixture day is accepted (no dateless fallback — avoids wrong-leg
-art). Misses use the 500px TheSportsDB team badge (`team_badges` cache,
+art), and the banner whose event name contains both teams (accents/case-insensitive)
+is preferred over the first day-match. Misses use the 500px TheSportsDB team badge (`team_badges` cache,
 exact `strTeam` match required — no fuzzy fallback, wrong-team badges
 are never shown),
 then API team logos. Yacine + thumbnail lookups retry (`retryIO`) since

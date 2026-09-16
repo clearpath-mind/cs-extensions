@@ -599,14 +599,23 @@ class YacineTvProvider : MainAPI() {
     )
 
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
-     * (free key), cached per event id under cacheDir/match_thumbs.
-     * Null art falls back to API team logos (thumb) / Arabic champions (league). */
+     * (free key), cached per event id under cacheDir/match_thumbs_v2.
+     * Entries are fingerprinted by team ids + fixture day and expire after
+     * 48h, so a recycled event id or a wrong first pick can never pin a
+     * stale banner forever. Null art falls back to API team logos
+     * (thumb) / Arabic champions (league). */
     private data class MatchArt(
         val thumb: String? = null,
         val league: String? = null,
     )
     private val thumbCache = ConcurrentHashMap<Long, String>()
     private val leagueCache = ConcurrentHashMap<Long, String>()
+    /** Fingerprint (team ids + day) + save time per event id, guarding the
+     * two maps above against recycled ids / changed fixtures. */
+    private val artPrintCache = ConcurrentHashMap<Long, String>()
+    private val artSavedAt = ConcurrentHashMap<Long, Long>()
+    private val ART_TTL_MS = 48 * 60 * 60 * 1000L
+    private val ART_DIR = "match_thumbs_v2"
 
     private suspend fun matchThumb(e: YacineEvent): String? {
         return matchArt(e).thumb
@@ -619,35 +628,66 @@ class YacineTvProvider : MainAPI() {
 
     private suspend fun matchArt(e: YacineEvent): MatchArt {
         val id = e.id ?: return MatchArt()
-        // Memory: only short-circuit when BOTH pieces are cached, otherwise
-        // keep going so a v32 thumb cache never blocks the new league fetch.
-        val cachedThumb = thumbCache[id]
-        val cachedLeague = leagueCache[id]
-        if (cachedThumb != null && cachedLeague != null) {
-            return MatchArt(cachedThumb, cachedLeague)
+        val day = e.startTime?.let { dayString(it) }
+        // Fingerprint: the same event id with different teams/day (recycled
+        // id, rescheduled fixture) must never reuse the old banner.
+        val print = "${e.team1?.id}_${e.team2?.id}_${day ?: "noday"}"
+        val now = System.currentTimeMillis()
+        if (artPrintCache[id] == print) {
+            if (now - (artSavedAt[id] ?: 0L) < ART_TTL_MS) {
+                val cachedThumb = thumbCache[id]
+                val cachedLeague = leagueCache[id]
+                if (cachedThumb != null && cachedLeague != null) {
+                    return MatchArt(cachedThumb, cachedLeague)
+                }
+            } else {
+                // Expired: drop memory so a fresh banner is fetched below.
+                thumbCache.remove(id)
+                leagueCache.remove(id)
+            }
+        } else if (artPrintCache.containsKey(id)) {
+            // Fixture changed under this id: evict the stale art.
+            artPrintCache.remove(id)
+            artSavedAt.remove(id)
+            thumbCache.remove(id)
+            leagueCache.remove(id)
         }
         val ctx = appContext
-        var diskThumb: String? = cachedThumb
-        var diskLeague: String? = cachedLeague
+        var diskThumb: String? = thumbCache[id]
+        var diskLeague: String? = leagueCache[id]
         if (ctx != null) {
             runCatching {
-                val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
-                if (diskThumb == null) {
-                    val tf = File(dir, "match_$id.txt")
-                    if (tf.exists()) {
-                        tf.readText().trim().takeIf { it.startsWith("http") }?.let {
-                            diskThumb = it
-                            thumbCache[id] = it
-                        }
-                    }
+                // One-time cleanup of pre-v2 entries (bare event id, no
+                // fingerprint/TTL) that may hold a wrong banner.
+                runCatching {
+                    val legacy = File(ctx.cacheDir, "match_thumbs")
+                    File(legacy, "match_$id.txt").delete()
+                    File(legacy, "match_${id}_league.txt").delete()
                 }
-                if (diskLeague == null) {
-                    val lf = File(dir, "match_${id}_league.txt")
-                    if (lf.exists()) {
-                        lf.readText().trim().takeIf { it.isNotBlank() }?.let {
-                            diskLeague = it
-                            leagueCache[id] = it
+                val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
+                val f = File(dir, "match_v2_$id.txt")
+                if (f.exists()) {
+                    if (now - f.lastModified() < ART_TTL_MS) {
+                        val lines = f.readText().lines()
+                        if (lines.size >= 3 && lines[0].trim() == print) {
+                            lines[1].trim().takeIf { it.startsWith("http") }?.let {
+                                diskThumb = it
+                                thumbCache[id] = it
+                            }
+                            lines[2].trim().takeIf { it.isNotBlank() }?.let {
+                                diskLeague = it
+                                leagueCache[id] = it
+                            }
+                            if (diskThumb != null && diskLeague != null) {
+                                artPrintCache[id] = print
+                                artSavedAt[id] = f.lastModified()
+                                return MatchArt(diskThumb, diskLeague)
+                            }
+                        } else {
+                            f.delete()
                         }
+                    } else {
+                        f.delete() // expired
                     }
                 }
             }
@@ -657,25 +697,24 @@ class YacineTvProvider : MainAPI() {
         }
         val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague)
         val t2 = teamAlias(e.team2?.id) ?: return MatchArt(diskThumb, diskLeague)
-        val day = e.startTime?.let { dayString(it) }
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val art = searchEventArt(a, b, day)
             if (art.thumb == null && art.league == null) continue
             art.thumb?.let {
                 thumbCache[id] = it
-                if (ctx != null) {
-                    runCatching {
-                        val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
-                        File(dir, "match_$id.txt").writeText(it)
-                    }
-                }
             }
             art.league?.let {
                 leagueCache[id] = it
+            }
+            if (art.thumb != null || art.league != null) {
+                artPrintCache[id] = print
+                artSavedAt[id] = now
                 if (ctx != null) {
                     runCatching {
-                        val dir = File(ctx.cacheDir, "match_thumbs").apply { mkdirs() }
-                        File(dir, "match_${id}_league.txt").writeText(it)
+                        val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
+                        File(dir, "match_v2_$id.txt").writeText(
+                            "$print\n${art.thumb.orEmpty()}\n${art.league.orEmpty()}"
+                        )
                     }
                 }
             }
@@ -708,7 +747,20 @@ class YacineTvProvider : MainAPI() {
         // Thumb stays day-strict (wrong-leg banners are worse than none),
         // but league is the same across legs so it falls back to any event.
         val pool = if (day.isNullOrBlank()) events else events.filter { it.dateEvent == day }
-        val thumb = pool.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+        // Prefer the banner whose event name contains BOTH teams
+        // (accents/case-insensitive): the query can return other legs sharing
+        // one side, and the first day-match is not always ours.
+        fun norm(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+            .replace(Regex("\\p{Mn}+"), "").lowercase()
+        val na = norm(a)
+        val nb = norm(b)
+        val thumb = pool.firstOrNull {
+            !it.strThumb.isNullOrBlank() && it.strEvent?.let { ev ->
+                val n = norm(ev)
+                n.contains(na) && n.contains(nb)
+            } == true
+        }?.strThumb
+            ?: pool.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
         val league = pool.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
             ?: events.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
         return MatchArt(thumb, league)
