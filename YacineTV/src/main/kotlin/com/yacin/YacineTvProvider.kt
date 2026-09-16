@@ -323,9 +323,9 @@ class YacineTvProvider : MainAPI() {
         else -> "✅"
     }
 
-    private fun eventDisplayName(e: YacineEvent, nowSec: Long): String {
+    private fun eventDisplayName(e: YacineEvent, nowSec: Long, titleOverride: String? = null): String {
         val status = matchStatus(e, nowSec)
-        return "${statusEmoji(status)} ${eventBaseTitle(e)}"
+        return "${statusEmoji(status)} ${titleOverride ?: eventBaseTitle(e)}"
     }
 
     private fun matchRank(status: String): Int = when (status) {
@@ -383,25 +383,45 @@ class YacineTvProvider : MainAPI() {
                 val arts = events.map { e ->
                     async {
                         val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
+                        // Badge fallback follows the displayed (home-first) order.
+                        val firstBadge = art.orderedTitle?.let { ordered ->
+                            val t1a = teamAlias(e.team1?.id)
+                            val t2a = teamAlias(e.team2?.id)
+                            when {
+                                t1a != null && ordered.startsWith("$t1a vs") -> t1a to t2a
+                                t2a != null && ordered.startsWith("$t2a vs") -> t2a to t1a
+                                else -> t1a to t2a
+                            }
+                        } ?: (teamAlias(e.team1?.id) to teamAlias(e.team2?.id))
                         val poster = art.thumb
                             ?: withTimeoutOrNull(8_000) {
-                                teamAlias(e.team1?.id)?.let { teamBadge(it) }
-                                    ?: teamAlias(e.team2?.id)?.let { teamBadge(it) }
+                                firstBadge.first?.let { teamBadge(it) }
+                                    ?: firstBadge.second?.let { teamBadge(it) }
                             }
                             ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                             ?: e.team2?.logo?.takeIf { it.isNotBlank() }
-                        poster to art.league
+                        art to poster
                     }
                 }.awaitAll()
-                val matchLinks = events.zip(arts).mapNotNull { (e, art) ->
-                    val (poster, league) = art
+                val matchLinks = events.zip(arts).mapNotNull { (e, artAndPoster) ->
+                    val (art, poster) = artAndPoster
+                    val league = art.league
                     val id = e.id ?: return@mapNotNull null
-                    val title = eventBaseTitle(e)
-                    val displayName = eventDisplayName(e, nowSec)
+                    // Home-first title from TheSportsDB when day-matched;
+                    // Yacine team_1/team_2 order is not reliable.
+                    val title = art.orderedTitle ?: eventBaseTitle(e)
+                    val displayName = eventDisplayName(e, nowSec, title)
                     // TheSportsDB banner, else 500px team badge, else API
                     // team logos. Detail page shows both (poster + background).
-                    val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
-                        ?: e.team1?.logo?.takeIf { it.isNotBlank() }
+                    // poster2 is the second team's logo in displayed order.
+                    val t1Logo = e.team1?.logo?.takeIf { it.isNotBlank() }
+                    val t2Logo = e.team2?.logo?.takeIf { it.isNotBlank() }
+                    val flipped = art.orderedTitle?.let { ordered ->
+                        val t1a = teamAlias(e.team1?.id)
+                        val t2a = teamAlias(e.team2?.id)
+                        t1a != null && t2a != null && ordered == "$t2a vs $t1a"
+                    } == true
+                    val poster2 = if (flipped) t1Logo ?: t2Logo else t2Logo ?: t1Logo
                     LinkData(
                         kind = "event",
                         id = id,
@@ -594,28 +614,56 @@ class YacineTvProvider : MainAPI() {
     data class SportsDbEvent(
         @JsonProperty("dateEvent") val dateEvent: String? = null,
         @JsonProperty("strEvent") val strEvent: String? = null,
+        @JsonProperty("strHomeTeam") val strHomeTeam: String? = null,
+        @JsonProperty("strAwayTeam") val strAwayTeam: String? = null,
         @JsonProperty("strThumb") val strThumb: String? = null,
         @JsonProperty("strLeague") val strLeague: String? = null,
     )
 
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
-     * (free key), cached per event id under cacheDir/match_thumbs_v3.
+     * (free key), cached per event id under cacheDir/match_thumbs_v4.
      * Entries are fingerprinted by team ids + fixture day and expire after
      * 48h, so a recycled event id or a wrong first pick can never pin a
      * stale banner forever. Null art falls back to API team logos
-     * (thumb) / Arabic champions (league). */
+     * (thumb) / Arabic champions (league).
+     * orderedTitle is the home-first "A vs B" from TheSportsDB
+     * (strHomeTeam/strAwayTeam, else strEvent order): Yacine team_1/team_2
+     * is not reliably home-first (e.g. 2026-09-16 Everton-Wolves and
+     * Coventry-Aston Villa were both reversed upstream). */
     private data class MatchArt(
         val thumb: String? = null,
         val league: String? = null,
+        val orderedTitle: String? = null,
     )
     private val thumbCache = ConcurrentHashMap<Long, String>()
     private val leagueCache = ConcurrentHashMap<Long, String>()
+    private val titleCache = ConcurrentHashMap<Long, String>()
     /** Fingerprint (team ids + day) + save time per event id, guarding the
      * two maps above against recycled ids / changed fixtures. */
     private val artPrintCache = ConcurrentHashMap<Long, String>()
     private val artSavedAt = ConcurrentHashMap<Long, Long>()
     private val ART_TTL_MS = 48 * 60 * 60 * 1000L
-    private val ART_DIR = "match_thumbs_v3"
+    private val ART_DIR = "match_thumbs_v4"
+
+    /** Accent/case-insensitive compare for team names across APIs. */
+    private fun normArt(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "").lowercase()
+
+    /** Home-first "A vs B" from a TheSportsDB event. a/b are our aliases
+     * (proper casing for display). Prefers strHomeTeam/strAwayTeam exact
+     * match, falls back to whichever alias comes first in strEvent. */
+    private fun orderedTitleFor(ev: SportsDbEvent, a: String, b: String): String? {
+        val na = normArt(a)
+        val nb = normArt(b)
+        if (na.isBlank() || nb.isBlank() || na == nb) return null
+        val home = ev.strHomeTeam?.let { normArt(it) }?.takeIf { it.isNotBlank() }
+        val away = ev.strAwayTeam?.let { normArt(it) }?.takeIf { it.isNotBlank() }
+        if (home == na && away == nb) return "$a vs $b"
+        if (home == nb && away == na) return "$b vs $a"
+        val n = ev.strEvent?.let { normArt(it) } ?: return null
+        if (!n.contains(na) || !n.contains(nb)) return null
+        return if (n.indexOf(nb) < n.indexOf(na)) "$b vs $a" else "$a vs $b"
+    }
 
     private suspend fun matchThumb(e: YacineEvent): String? {
         return matchArt(e).thumb
@@ -638,12 +686,13 @@ class YacineTvProvider : MainAPI() {
                 val cachedThumb = thumbCache[id]
                 val cachedLeague = leagueCache[id]
                 if (cachedThumb != null && cachedLeague != null) {
-                    return MatchArt(cachedThumb, cachedLeague)
+                    return MatchArt(cachedThumb, cachedLeague, titleCache[id])
                 }
             } else {
                 // Expired: drop memory so a fresh banner is fetched below.
                 thumbCache.remove(id)
                 leagueCache.remove(id)
+                titleCache.remove(id)
             }
         } else if (artPrintCache.containsKey(id)) {
             // Fixture changed under this id: evict the stale art.
@@ -651,15 +700,17 @@ class YacineTvProvider : MainAPI() {
             artSavedAt.remove(id)
             thumbCache.remove(id)
             leagueCache.remove(id)
+            titleCache.remove(id)
         }
         val ctx = appContext
         var diskThumb: String? = thumbCache[id]
         var diskLeague: String? = leagueCache[id]
+        var diskTitle: String? = titleCache[id]
         if (ctx != null) {
             runCatching {
-                // One-time cleanup of pre-v3 entries (bare event id in v1, no
-                // fingerprint/TTL; v2 league-only pins) that may hold a wrong
-                // or thumb-less banner.
+                // One-time cleanup of pre-v4 entries (bare event id in v1, no
+                // fingerprint/TTL; v2 league-only pins; v3 without corrected
+                // home-first title) that may hold a wrong or thumb-less banner.
                 runCatching {
                     File(ctx.cacheDir, "match_thumbs").let { legacy ->
                         File(legacy, "match_$id.txt").delete()
@@ -668,9 +719,12 @@ class YacineTvProvider : MainAPI() {
                     File(ctx.cacheDir, "match_thumbs_v2").let { v2 ->
                         File(v2, "match_v2_$id.txt").delete()
                     }
+                    File(ctx.cacheDir, "match_thumbs_v3").let { v3 ->
+                        File(v3, "match_v3_$id.txt").delete()
+                    }
                 }
                 val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
-                val f = File(dir, "match_v3_$id.txt")
+                val f = File(dir, "match_v4_$id.txt")
                 if (f.exists()) {
                     if (now - f.lastModified() < ART_TTL_MS) {
                         val lines = f.readText().lines()
@@ -683,10 +737,14 @@ class YacineTvProvider : MainAPI() {
                                 diskLeague = it
                                 leagueCache[id] = it
                             }
+                            lines.getOrNull(3)?.trim()?.takeIf { it.isNotBlank() }?.let {
+                                diskTitle = it
+                                titleCache[id] = it
+                            }
                             if (diskThumb != null && diskLeague != null) {
                                 artPrintCache[id] = print
                                 artSavedAt[id] = f.lastModified()
-                                return MatchArt(diskThumb, diskLeague)
+                                return MatchArt(diskThumb, diskLeague, diskTitle)
                             }
                         } else {
                             f.delete()
@@ -697,25 +755,27 @@ class YacineTvProvider : MainAPI() {
                 }
             }
             if (diskThumb != null && diskLeague != null) {
-                return MatchArt(diskThumb, diskLeague)
+                return MatchArt(diskThumb, diskLeague, diskTitle)
             }
         }
-        val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague)
-        val t2 = teamAlias(e.team2?.id) ?: return MatchArt(diskThumb, diskLeague)
+        val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague, diskTitle)
+        val t2 = teamAlias(e.team2?.id) ?: return MatchArt(diskThumb, diskLeague, diskTitle)
         // Both team orders are always consulted: the first order often
         // returns a league-only result (day pool empty, league falls back to
         // any leg) while the reversed order holds the day-matching banner.
         // Returning early on league-only is what left cards on logo fallback.
         var bestThumb: String? = null
         var bestLeague: String? = null
+        var bestTitle: String? = null
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val art = searchEventArt(a, b, day)
             if (art.thumb != null && bestThumb == null) bestThumb = art.thumb
             if (art.league != null && bestLeague == null) bestLeague = art.league
-            if (bestThumb != null && bestLeague != null) break
+            if (art.orderedTitle != null && bestTitle == null) bestTitle = art.orderedTitle
+            if (bestThumb != null && bestLeague != null && bestTitle != null) break
         }
         if (bestThumb == null && bestLeague == null) {
-            return MatchArt(diskThumb, diskLeague)
+            return MatchArt(diskThumb, diskLeague, diskTitle)
         }
         bestThumb?.let {
             thumbCache[id] = it
@@ -723,17 +783,21 @@ class YacineTvProvider : MainAPI() {
         bestLeague?.let {
             leagueCache[id] = it
         }
+        val finalTitle = bestTitle ?: diskTitle
+        finalTitle?.let {
+            titleCache[id] = it
+        } ?: titleCache.remove(id)
         artPrintCache[id] = print
         artSavedAt[id] = now
         if (ctx != null) {
             runCatching {
                 val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
-                File(dir, "match_v3_$id.txt").writeText(
-                    "$print\n${bestThumb.orEmpty()}\n${bestLeague.orEmpty()}"
+                File(dir, "match_v4_$id.txt").writeText(
+                    "$print\n${bestThumb.orEmpty()}\n${bestLeague.orEmpty()}\n${finalTitle.orEmpty()}"
                 )
             }
         }
-        return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague)
+        return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague, finalTitle)
     }
 
     private fun dayString(epochSec: Long): String {
@@ -763,20 +827,27 @@ class YacineTvProvider : MainAPI() {
         // Prefer the banner whose event name contains BOTH teams
         // (accents/case-insensitive): the query can return other legs sharing
         // one side, and the first day-match is not always ours.
-        fun norm(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
-            .replace(Regex("\\p{Mn}+"), "").lowercase()
-        val na = norm(a)
-        val nb = norm(b)
-        val thumb = pool.firstOrNull {
-            !it.strThumb.isNullOrBlank() && it.strEvent?.let { ev ->
-                val n = norm(ev)
-                n.contains(na) && n.contains(nb)
-            } == true
-        }?.strThumb
-            ?: pool.firstOrNull { !it.strThumb.isNullOrBlank() }?.strThumb
+        val na = normArt(a)
+        val nb = normArt(b)
+        fun hasBoth(ev: String?): Boolean {
+            if (ev.isNullOrBlank()) return false
+            val n = normArt(ev)
+            return n.contains(na) && n.contains(nb)
+        }
+        val thumbEvent = pool.firstOrNull {
+            !it.strThumb.isNullOrBlank() && hasBoth(it.strEvent)
+        } ?: pool.firstOrNull { !it.strThumb.isNullOrBlank() }
+        val thumb = thumbEvent?.strThumb
         val league = pool.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
             ?: events.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
-        return MatchArt(thumb, league)
+        // Home-first title from the day-matching fixture (thumb event when
+        // present, else any both-teams pool event): Yacine order is not
+        // reliable, TheSportsDB strHomeTeam/strAwayTeam is.
+        val orderSource = thumbEvent
+            ?: pool.firstOrNull { hasBoth(it.strEvent) }
+            ?: pool.firstOrNull()
+        val orderedTitle = orderSource?.let { orderedTitleFor(it, a, b) }
+        return MatchArt(thumb, league, orderedTitle)
     }
 
     private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
@@ -974,21 +1045,28 @@ class YacineTvProvider : MainAPI() {
                     .joinToString(" ")
                 hay.contains(q, ignoreCase = true)
             }
-            // English league per match (cached; bounded lookup so search stays fast).
-            val leagues = matched.map { e ->
+            // English league + home-first title per match (cached; bounded
+            // lookup so search stays fast).
+            val artMap = matched.map { e ->
                 async {
-                    e.id to (e.id?.let { leagueCache[it] }
-                        ?: withTimeoutOrNull(4_000) { matchLeague(e) })
+                    e.id to (e.id?.let { titleCache[it]?.let { t -> leagueCache[it]?.let { l -> MatchArt(null, l, t) } } }
+                        ?: withTimeoutOrNull(4_000) { matchArt(e) })
                 }
             }.awaitAll().toMap()
             matched.forEach { e ->
-                val title = eventBaseTitle(e)
-                val displayName = eventDisplayName(e, nowSec)
+                val art = artMap[e.id]
+                val title = art?.orderedTitle ?: eventBaseTitle(e)
+                val displayName = eventDisplayName(e, nowSec, title)
                 val id = e.id ?: return@forEach
-                val poster = e.team1?.logo?.takeIf { it.isNotBlank() }
-                    ?: e.team2?.logo?.takeIf { it.isNotBlank() }
-                val poster2 = e.team2?.logo?.takeIf { it.isNotBlank() }
-                    ?: e.team1?.logo?.takeIf { it.isNotBlank() }
+                val t1Logo = e.team1?.logo?.takeIf { it.isNotBlank() }
+                val t2Logo = e.team2?.logo?.takeIf { it.isNotBlank() }
+                val flipped = art?.orderedTitle?.let { ordered ->
+                    val t1a = teamAlias(e.team1?.id)
+                    val t2a = teamAlias(e.team2?.id)
+                    t1a != null && t2a != null && ordered == "$t2a vs $t1a"
+                } == true
+                val poster = if (flipped) t2Logo ?: t1Logo else t1Logo ?: t2Logo
+                val poster2 = if (flipped) t1Logo ?: t2Logo else t2Logo ?: t1Logo
                 val data = LinkData(
                     kind = "event",
                     id = id,
@@ -996,7 +1074,7 @@ class YacineTvProvider : MainAPI() {
                     poster = poster,
                     poster2 = poster2,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    competition = competitionEnglish(leagues[id], e.champions),
+                    competition = competitionEnglish(art?.league, e.champions),
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                     kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
                     plot = matchPlot(title),
