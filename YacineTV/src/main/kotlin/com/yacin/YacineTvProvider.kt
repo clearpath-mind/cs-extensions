@@ -271,13 +271,39 @@ class YacineTvProvider : MainAPI() {
         return n
     }
 
-    private fun formatKickoff(epochSec: Long?): String {
-        if (epochSec == null || epochSec <= 0) return ""
+    /** Local kickoff with countdown, e.g. "Today 19:45 (in 2h 05m)",
+     * "Tomorrow 20:00", "22 Sep, 18:45". Device-local timezone, Latin
+     * digits. Empty when not upcoming (live cards show the minute, ended
+     * cards show FT) so detail tags stay relevant. */
+    private fun formatKickoff(epochSec: Long?, nowSec: Long = System.currentTimeMillis() / 1000): String {
+        if (epochSec == null || epochSec <= 0 || epochSec <= nowSec) return ""
         return try {
-            // Latin digits (normal numbers), not Eastern Arabic numerals.
-            // e.g. "14 Sep, 07:15".
-            val fmt = SimpleDateFormat("dd MMM, HH:mm", Locale.US)
-            fmt.format(Date(epochSec * 1000))
+            val tz = TimeZone.getDefault()
+            val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = tz }
+            val timeFmt = SimpleDateFormat("HH:mm", Locale.US).apply { timeZone = tz }
+            val nowDate = dateFmt.format(Date(nowSec * 1000))
+            val kickDate = dateFmt.format(Date(epochSec * 1000))
+            val time = timeFmt.format(Date(epochSec * 1000))
+            val deltaMin = ((epochSec - nowSec) / 60).toInt()
+            if (kickDate == nowDate) {
+                val cd = when {
+                    deltaMin < 60 -> "in ${deltaMin.coerceAtLeast(1)}m"
+                    deltaMin < 24 * 60 -> "in ${deltaMin / 60}h ${(deltaMin % 60).toString().padStart(2, '0')}m"
+                    else -> ""
+                }
+                if (cd.isNotEmpty()) "Today $time ($cd)" else "Today $time"
+            } else {
+                val cal = java.util.Calendar.getInstance(tz).apply {
+                    timeInMillis = nowSec * 1000
+                    add(java.util.Calendar.DAY_OF_YEAR, 1)
+                }
+                if (kickDate == dateFmt.format(cal.time)) {
+                    "Tomorrow $time"
+                } else {
+                    SimpleDateFormat("dd MMM, HH:mm", Locale.US).apply { timeZone = tz }
+                        .format(Date(epochSec * 1000))
+                }
+            }
         } catch (_: Exception) { "" }
     }
 
@@ -323,9 +349,61 @@ class YacineTvProvider : MainAPI() {
         else -> "✅"
     }
 
-    private fun eventDisplayName(e: YacineEvent, nowSec: Long, titleOverride: String? = null): String {
-        val status = matchStatus(e, nowSec)
-        return "${statusEmoji(status)} ${titleOverride ?: eventBaseTitle(e)}"
+    /** Display status: live TheSportsDB state wins over Yacine clocks
+     * (clock skew / missing times); otherwise Yacine start/end_time. */
+    private fun displayStatus(e: YacineEvent, nowSec: Long, state: MatchState?): String {
+        val s = state?.status?.trim()?.uppercase()
+        if (s != null) {
+            if (isInPlayScore(s)) return "LIVE"
+            if (isFinalScore(s)) return "ENDED"
+        }
+        return matchStatus(e, nowSec)
+    }
+
+    /** Minute tag for live cards: 65' | HT | FT | LIVE | null. */
+    private fun minuteLabel(state: MatchState?): String? {
+        val s = state ?: return null
+        val raw = s.status?.trim()?.uppercase() ?: return null
+        if (isFinalScore(raw)) return "FT"
+        if (raw == "HT") return "HT"
+        if (!isInPlayScore(raw)) return null
+        val p = s.progress?.trim()?.takeIf { it.isNotBlank() } ?: return "LIVE"
+        return if (p[0].isDigit() && !p.endsWith("'")) "$p'" else p
+    }
+
+    /** Card title, option (a): score inline when TheSportsDB has it on the
+     * day-matching fixture, e.g. "🔴 65' Everton 1-0 Wolves",
+     * "✅ FT Coventry City 2-1 Aston Villa". Scores only ever pair with
+     * orderedTitle (canonical home-first); without it, plain "A vs B". */
+    private fun eventDisplayName(e: YacineEvent, nowSec: Long, art: MatchArt? = null): String {
+        val matchup = art?.orderedTitle ?: eventBaseTitle(e)
+        val teams = art?.orderedTitle?.split(" vs ")?.takeIf { it.size == 2 }
+        val st = art?.state
+        val hs = st?.homeScore
+        val aws = st?.awayScore
+        val status = displayStatus(e, nowSec, st)
+        val emoji = statusEmoji(status)
+        if (teams != null && hs != null && aws != null) {
+            val score = "${teams[0]} $hs-$aws ${teams[1]}"
+            return when (status) {
+                "LIVE" -> {
+                    val tag = if (st?.status?.trim()?.uppercase() == "HT") "HT" else (minuteLabel(st) ?: "LIVE")
+                    "$emoji $tag $score"
+                }
+                "UPCOMING" -> "$emoji $matchup"
+                else -> {
+                    val tag = if (isFinalScore(st?.status)) "FT " else ""
+                    "$emoji $tag$score"
+                }
+            }
+        }
+        return when (status) {
+            "LIVE" -> {
+                val min = minuteLabel(st)
+                if (min != null) "$emoji $min $matchup" else "$emoji $matchup"
+            }
+            else -> "$emoji $matchup"
+        }
     }
 
     private fun matchRank(status: String): Int = when (status) {
@@ -407,10 +485,11 @@ class YacineTvProvider : MainAPI() {
                     val (art, poster) = artAndPoster
                     val league = art.league
                     val id = e.id ?: return@mapNotNull null
-                    // Home-first title from TheSportsDB when day-matched;
-                    // Yacine team_1/team_2 order is not reliable.
-                    val title = art.orderedTitle ?: eventBaseTitle(e)
-                    val displayName = eventDisplayName(e, nowSec, title)
+                    // Home-first matchup from TheSportsDB when day-matched;
+                    // Yacine team_1/team_2 order is not reliable. The card
+                    // title adds live minute + score inline (option a).
+                    val matchup = art.orderedTitle ?: eventBaseTitle(e)
+                    val displayName = eventDisplayName(e, nowSec, art)
                     // TheSportsDB banner, else 500px team badge, else API
                     // team logos. Detail page shows both (poster + background).
                     // poster2 is the second team's logo in displayed order.
@@ -431,8 +510,8 @@ class YacineTvProvider : MainAPI() {
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                         competition = competitionEnglish(league, e.champions),
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
-                        kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
-                        plot = matchPlot(title),
+                        kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
+                        plot = matchPlot(matchup),
                     )
                 }
                 // Detail recommendations: the other matches (no extra network).
@@ -618,6 +697,11 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("strAwayTeam") val strAwayTeam: String? = null,
         @JsonProperty("strThumb") val strThumb: String? = null,
         @JsonProperty("strLeague") val strLeague: String? = null,
+        @JsonProperty("strStatus") val strStatus: String? = null,
+        @JsonProperty("strProgress") val strProgress: String? = null,
+        @JsonProperty("intHomeScore") val intHomeScore: String? = null,
+        @JsonProperty("intAwayScore") val intAwayScore: String? = null,
+        @JsonProperty("strTimestamp") val strTimestamp: String? = null,
     )
 
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
@@ -634,15 +718,37 @@ class YacineTvProvider : MainAPI() {
         val thumb: String? = null,
         val league: String? = null,
         val orderedTitle: String? = null,
+        val state: MatchState? = null,
+    )
+    /** Live score/progress from the day-matching TheSportsDB event.
+     * Scores always follow the canonical home-first order (same fixture
+     * as orderedTitle), never Yacine team_1/team_2 order. Scores parse
+     * from String because the API mixes "2" and 2. */
+    private data class MatchState(
+        val status: String? = null, // NS | 1H | HT | 2H | ET | FT ...
+        val progress: String? = null, // e.g. 65'
+        val homeScore: Int? = null,
+        val awayScore: Int? = null,
     )
     private val thumbCache = ConcurrentHashMap<Long, String>()
     private val leagueCache = ConcurrentHashMap<Long, String>()
     private val titleCache = ConcurrentHashMap<Long, String>()
     /** Fingerprint (team ids + day) + save time per event id, guarding the
-     * two maps above against recycled ids / changed fixtures. */
+     * art maps above against recycled ids / changed fixtures. */
     private val artPrintCache = ConcurrentHashMap<Long, String>()
     private val artSavedAt = ConcurrentHashMap<Long, Long>()
     private val ART_TTL_MS = 48 * 60 * 60 * 1000L
+    /** Live state is short-lived (scores change by the minute) while art
+     * pins for 48h: fresh or frozen-FT state serves from memory, otherwise
+     * the fetch refreshes both together (same request, no extra network).
+     * Empty/failed lookups back off for STATE_TTL (shared free key). */
+    private data class StateEntry(val print: String, val state: MatchState?, val savedAt: Long)
+    private val stateCache = ConcurrentHashMap<Long, StateEntry>()
+    private val STATE_TTL_MS = 3 * 60 * 1000L
+    private fun isInPlayScore(s: String?) =
+        s?.trim()?.uppercase() in setOf("1H", "HT", "2H", "ET", "BT", "P")
+    private fun isFinalScore(s: String?) =
+        s?.trim()?.uppercase() in setOf("FT", "AET", "AP")
     private val ART_DIR = "match_thumbs_v4"
 
     /** Accent/case-insensitive compare for team names across APIs. */
@@ -681,18 +787,25 @@ class YacineTvProvider : MainAPI() {
         // id, rescheduled fixture) must never reuse the old banner.
         val print = "${e.team1?.id}_${e.team2?.id}_${day ?: "noday"}"
         val now = System.currentTimeMillis()
+        // Live state is short-lived (scores change by the minute) while
+        // thumb/league/title pin for 48h: fresh or frozen-FT state serves
+        // from memory, otherwise the fetch below refreshes both together.
+        val cachedState = stateCache[id]?.takeIf { it.print == print }
+        val stateOk = cachedState != null &&
+            (isFinalScore(cachedState.state?.status) || now - cachedState.savedAt < STATE_TTL_MS)
         if (artPrintCache[id] == print) {
             if (now - (artSavedAt[id] ?: 0L) < ART_TTL_MS) {
                 val cachedThumb = thumbCache[id]
                 val cachedLeague = leagueCache[id]
-                if (cachedThumb != null && cachedLeague != null) {
-                    return MatchArt(cachedThumb, cachedLeague, titleCache[id])
+                if (cachedThumb != null && cachedLeague != null && stateOk) {
+                    return MatchArt(cachedThumb, cachedLeague, titleCache[id], cachedState?.state)
                 }
             } else {
                 // Expired: drop memory so a fresh banner is fetched below.
                 thumbCache.remove(id)
                 leagueCache.remove(id)
                 titleCache.remove(id)
+                stateCache.remove(id)
             }
         } else if (artPrintCache.containsKey(id)) {
             // Fixture changed under this id: evict the stale art.
@@ -701,6 +814,7 @@ class YacineTvProvider : MainAPI() {
             thumbCache.remove(id)
             leagueCache.remove(id)
             titleCache.remove(id)
+            stateCache.remove(id)
         }
         val ctx = appContext
         var diskThumb: String? = thumbCache[id]
@@ -741,10 +855,10 @@ class YacineTvProvider : MainAPI() {
                                 diskTitle = it
                                 titleCache[id] = it
                             }
-                            if (diskThumb != null && diskLeague != null) {
+                            if (diskThumb != null && diskLeague != null && stateOk) {
                                 artPrintCache[id] = print
                                 artSavedAt[id] = f.lastModified()
-                                return MatchArt(diskThumb, diskLeague, diskTitle)
+                                return MatchArt(diskThumb, diskLeague, diskTitle, cachedState?.state)
                             }
                         } else {
                             f.delete()
@@ -754,8 +868,8 @@ class YacineTvProvider : MainAPI() {
                     }
                 }
             }
-            if (diskThumb != null && diskLeague != null) {
-                return MatchArt(diskThumb, diskLeague, diskTitle)
+            if (diskThumb != null && diskLeague != null && stateOk) {
+                return MatchArt(diskThumb, diskLeague, diskTitle, cachedState?.state)
             }
         }
         val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague, diskTitle)
@@ -767,15 +881,20 @@ class YacineTvProvider : MainAPI() {
         var bestThumb: String? = null
         var bestLeague: String? = null
         var bestTitle: String? = null
+        var bestState: MatchState? = null
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val art = searchEventArt(a, b, day)
             if (art.thumb != null && bestThumb == null) bestThumb = art.thumb
             if (art.league != null && bestLeague == null) bestLeague = art.league
             if (art.orderedTitle != null && bestTitle == null) bestTitle = art.orderedTitle
-            if (bestThumb != null && bestLeague != null && bestTitle != null) break
+            if (art.state != null && bestState == null) bestState = art.state
+            if (bestThumb != null && bestLeague != null && bestTitle != null && bestState != null) break
         }
+        // Cache the state lookup (even null) so empty/failed lookups back
+        // off instead of hammering the shared key on every build.
+        stateCache[id] = StateEntry(print, bestState, now)
         if (bestThumb == null && bestLeague == null) {
-            return MatchArt(diskThumb, diskLeague, diskTitle)
+            return MatchArt(diskThumb, diskLeague, bestTitle ?: diskTitle, bestState)
         }
         bestThumb?.let {
             thumbCache[id] = it
@@ -797,7 +916,7 @@ class YacineTvProvider : MainAPI() {
                 )
             }
         }
-        return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague, finalTitle)
+        return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague, finalTitle, bestState)
     }
 
     private fun dayString(epochSec: Long): String {
@@ -847,7 +966,22 @@ class YacineTvProvider : MainAPI() {
             ?: pool.firstOrNull { hasBoth(it.strEvent) }
             ?: pool.firstOrNull()
         val orderedTitle = orderSource?.let { orderedTitleFor(it, a, b) }
-        return MatchArt(thumb, league, orderedTitle)
+        // Live state from the same fixture (scores follow canonical
+        // home-first order, same as orderedTitle). Null when no day match:
+        // callers fall back to Yacine clocks, no score shown.
+        fun num(v: String?) =
+            v?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }?.toIntOrNull()
+        val state = orderSource?.let { src ->
+            MatchState(
+                status = src.strStatus?.trim()?.takeIf { it.isNotBlank() },
+                progress = src.strProgress?.trim()?.takeIf { it.isNotBlank() },
+                homeScore = num(src.intHomeScore),
+                awayScore = num(src.intAwayScore),
+            ).takeIf { s ->
+                s.status != null || s.progress != null || s.homeScore != null || s.awayScore != null
+            }
+        }
+        return MatchArt(thumb, league, orderedTitle, state)
     }
 
     private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
@@ -1045,18 +1179,15 @@ class YacineTvProvider : MainAPI() {
                     .joinToString(" ")
                 hay.contains(q, ignoreCase = true)
             }
-            // English league + home-first title per match (cached; bounded
-            // lookup so search stays fast).
+            // English league + home-first title + live state per match
+            // (cached; bounded lookup so search stays fast).
             val artMap = matched.map { e ->
-                async {
-                    e.id to (e.id?.let { titleCache[it]?.let { t -> leagueCache[it]?.let { l -> MatchArt(null, l, t) } } }
-                        ?: withTimeoutOrNull(4_000) { matchArt(e) })
-                }
+                async { e.id to withTimeoutOrNull(4_000) { matchArt(e) } }
             }.awaitAll().toMap()
             matched.forEach { e ->
                 val art = artMap[e.id]
-                val title = art?.orderedTitle ?: eventBaseTitle(e)
-                val displayName = eventDisplayName(e, nowSec, title)
+                val matchup = art?.orderedTitle ?: eventBaseTitle(e)
+                val displayName = eventDisplayName(e, nowSec, art)
                 val id = e.id ?: return@forEach
                 val t1Logo = e.team1?.logo?.takeIf { it.isNotBlank() }
                 val t2Logo = e.team2?.logo?.takeIf { it.isNotBlank() }
@@ -1076,8 +1207,8 @@ class YacineTvProvider : MainAPI() {
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                     competition = competitionEnglish(art?.league, e.champions),
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
-                    kickoff = formatKickoff(e.startTime).takeIf { it.isNotBlank() },
-                    plot = matchPlot(title),
+                    kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
+                    plot = matchPlot(matchup),
                 ).toJson()
                 out.add(
                     newLiveSearchResponse(displayName, data, TvType.Live) {
