@@ -463,29 +463,33 @@ class YacineTvProvider : MainAPI() {
                 val arts = events.map { e ->
                     async {
                         val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
-                        // Badge fallback follows the displayed (home-first) order.
-                        val firstBadge = art.orderedTitle?.let { ordered ->
-                            val t1a = teamAlias(e.team1?.id)
-                            val t2a = teamAlias(e.team2?.id)
-                            when {
-                                t1a != null && ordered.startsWith("$t1a vs") -> t1a to t2a
-                                t2a != null && ordered.startsWith("$t2a vs") -> t2a to t1a
-                                else -> t1a to t2a
-                            }
-                        } ?: (teamAlias(e.team1?.id) to teamAlias(e.team2?.id))
+                        // Home-first aliases for badges + generated card.
+                        val t1a = teamAlias(e.team1?.id)
+                        val t2a = teamAlias(e.team2?.id)
+                        val ordered = art.orderedTitle?.split(" vs ")?.takeIf { it.size == 2 }
+                        val homeAlias = ordered?.get(0) ?: t1a
+                        val awayAlias = ordered?.get(1) ?: t2a
+                        val badges = eventBadges(homeAlias, awayAlias)
+                        val status = displayStatus(e, nowSec, art.state)
+                        val competition = competitionEnglish(art.league, e.champions)
+                        // Banner, else generated card (badges + league logo +
+                        // date), else badges, else API logos.
                         val poster = art.thumb
-                            ?: withTimeoutOrNull(8_000) {
-                                firstBadge.first?.let { teamBadge(it) }
-                                    ?: firstBadge.second?.let { teamBadge(it) }
-                            }
+                            ?: matchCardUrl(
+                                homeAlias, awayAlias,
+                                badges.getOrNull(0), badges.getOrNull(1),
+                                art.leagueBadge, competition,
+                                e.startTime, nowSec, status, minuteLabel(art.state),
+                            )
+                            ?: badges.getOrNull(0)
+                            ?: badges.getOrNull(1)
                             ?: e.team1?.logo?.takeIf { it.isNotBlank() }
                             ?: e.team2?.logo?.takeIf { it.isNotBlank() }
-                        art to poster
+                        Triple(art, poster, competition)
                     }
                 }.awaitAll()
-                val matchLinks = events.zip(arts).mapNotNull { (e, artAndPoster) ->
-                    val (art, poster) = artAndPoster
-                    val league = art.league
+                val matchLinks = events.zip(arts).mapNotNull { (e, artPosterComp) ->
+                    val (art, poster, competition) = artPosterComp
                     val id = e.id ?: return@mapNotNull null
                     // Home-first matchup from TheSportsDB when day-matched;
                     // Yacine team_1/team_2 order is not reliable. The card
@@ -510,7 +514,7 @@ class YacineTvProvider : MainAPI() {
                         poster = poster,
                         poster2 = poster2,
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                        competition = competitionEnglish(league, e.champions),
+                        competition = competition,
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
                         team1Id = e.team1?.id,
@@ -666,6 +670,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("strAwayTeam") val strAwayTeam: String? = null,
         @JsonProperty("strThumb") val strThumb: String? = null,
         @JsonProperty("strLeague") val strLeague: String? = null,
+        @JsonProperty("strLeagueBadge") val strLeagueBadge: String? = null,
         @JsonProperty("strStatus") val strStatus: String? = null,
         @JsonProperty("strProgress") val strProgress: String? = null,
         @JsonProperty("intHomeScore") val intHomeScore: String? = null,
@@ -685,6 +690,7 @@ class YacineTvProvider : MainAPI() {
     private data class MatchArt(
         val thumb: String? = null,
         val league: String? = null,
+        val leagueBadge: String? = null,
         val orderedTitle: String? = null,
         val state: MatchState? = null,
     )
@@ -728,6 +734,58 @@ class YacineTvProvider : MainAPI() {
         return if (n.indexOf(nb) < n.indexOf(na)) "$b vs $a" else "$a vs $b"
     }
 
+    /** Both team badges in parallel (home-first order). Null per side
+     * when unmapped or the lookup fails — the card renders placeholders. */
+    private suspend fun eventBadges(homeAlias: String?, awayAlias: String?): List<String?> =
+        coroutineScope {
+            listOf(homeAlias, awayAlias).map { alias ->
+                async { alias?.let { withTimeoutOrNull(6_000) { teamBadge(it) } } }
+            }.awaitAll()
+        }
+
+    /** Cricify-style generated match card (verified params: title, teamA/B,
+     * teamAImg/teamBImg, eventLogo=league badge, time=kickoff date,
+     * isLive/isEnded). Used as poster when no TheSportsDB banner exists.
+     * Null when home/away names are unknown. */
+    private fun matchCardUrl(
+        home: String?,
+        away: String?,
+        badgeH: String?,
+        badgeA: String?,
+        leagueBadge: String?,
+        competition: String?,
+        startTime: Long?,
+        nowSec: Long,
+        status: String,
+        minute: String?,
+    ): String? {
+        if (home.isNullOrBlank() || away.isNullOrBlank()) return null
+        return runCatching {
+            fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+            val time = when (status) {
+                "LIVE" -> minute ?: "LIVE"
+                "ENDED" -> "FT"
+                else -> startTime?.takeIf { it > nowSec }?.let {
+                    val tz = TimeZone.getDefault()
+                    SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US).apply { timeZone = tz }
+                        .format(Date(it * 1000))
+                } ?: ""
+            }
+            buildString {
+                append("https://live-card-png.cricify.workers.dev/?")
+                append("title=${enc(competition?.takeIf { it.isNotBlank() } ?: "Football")}")
+                append("&teamA=${enc(home)}")
+                append("&teamB=${enc(away)}")
+                if (!badgeH.isNullOrBlank()) append("&teamAImg=${enc(badgeH)}")
+                if (!badgeA.isNullOrBlank()) append("&teamBImg=${enc(badgeA)}")
+                if (!leagueBadge.isNullOrBlank()) append("&eventLogo=${enc(leagueBadge)}")
+                if (time.isNotBlank()) append("&time=${enc(time)}")
+                append("&isLive=${status == "LIVE"}")
+                append("&isEnded=${status == "ENDED"}")
+            }
+        }.getOrNull()
+    }
+
     private suspend fun matchThumb(e: YacineEvent): String? {
         return matchArt(e).thumb
     }
@@ -750,12 +808,14 @@ class YacineTvProvider : MainAPI() {
         // Returning early on league-only is what left cards on logo fallback.
         var bestThumb: String? = null
         var bestLeague: String? = null
+        var bestLeagueBadge: String? = null
         var bestTitle: String? = null
         var bestState: MatchState? = null
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val art = searchEventArt(a, b, day)
             if (art.thumb != null && bestThumb == null) bestThumb = art.thumb
             if (art.league != null && bestLeague == null) bestLeague = art.league
+            if (art.leagueBadge != null && bestLeagueBadge == null) bestLeagueBadge = art.leagueBadge
             if (art.orderedTitle != null && bestTitle == null) bestTitle = art.orderedTitle
             if (art.state != null && bestState == null) bestState = art.state
             if (bestThumb != null && bestLeague != null && bestTitle != null && bestState != null) break
@@ -763,9 +823,9 @@ class YacineTvProvider : MainAPI() {
         // No backoff cache: empty/failed lookups simply return nothing and
         // are retried on the next build (Cricify-style always-fresh).
         if (bestThumb == null && bestLeague == null) {
-            return MatchArt(null, null, bestTitle, bestState)
+            return MatchArt(null, null, bestLeagueBadge, bestTitle, bestState)
         }
-        return MatchArt(bestThumb, bestLeague, bestTitle, bestState)
+        return MatchArt(bestThumb, bestLeague, bestLeagueBadge, bestTitle, bestState)
     }
 
     private fun dayString(epochSec: Long): String {
@@ -815,6 +875,12 @@ class YacineTvProvider : MainAPI() {
             ?: pool.firstOrNull { hasBoth(it.strEvent) }
             ?: pool.firstOrNull()
         val orderedTitle = orderSource?.let { orderedTitleFor(it, a, b) }
+        // League badge for the generated card (eventLogo): same fixture
+        // first, then any pool/event fallback like the league name.
+        fun http(u: String?) = u?.trim()?.takeIf { it.startsWith("http") }
+        val leagueBadge = http(orderSource?.strLeagueBadge)
+            ?: pool.firstOrNull { !it.strLeagueBadge.isNullOrBlank() }?.strLeagueBadge?.trim()
+            ?: events.firstOrNull { !it.strLeagueBadge.isNullOrBlank() }?.strLeagueBadge?.trim()
         // Live state from the same fixture (scores follow canonical
         // home-first order, same as orderedTitle). Null when no day match:
         // callers fall back to Yacine clocks, no score shown.
@@ -830,7 +896,7 @@ class YacineTvProvider : MainAPI() {
                 s.status != null || s.progress != null || s.homeScore != null || s.awayScore != null
             }
         }
-        return MatchArt(thumb, league, orderedTitle, state)
+        return MatchArt(thumb, league, leagueBadge, orderedTitle, state)
     }
 
     private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
@@ -1005,13 +1071,20 @@ class YacineTvProvider : MainAPI() {
                     .joinToString(" ")
                 hay.contains(q, ignoreCase = true)
             }
-            // English league + home-first title + live state per match
-            // (cached; bounded lookup so search stays fast).
+            // English league + home-first title + live state + badges per
+            // match (no cache; bounded lookup so search stays fast).
             val artMap = matched.map { e ->
-                async { e.id to withTimeoutOrNull(4_000) { matchArt(e) } }
+                async {
+                    val art = withTimeoutOrNull(4_000) { matchArt(e) }
+                    val t1a = teamAlias(e.team1?.id)
+                    val t2a = teamAlias(e.team2?.id)
+                    val ordered = art?.orderedTitle?.split(" vs ")?.takeIf { it.size == 2 }
+                    val badges = eventBadges(ordered?.get(0) ?: t1a, ordered?.get(1) ?: t2a)
+                    e.id to (art to badges)
+                }
             }.awaitAll().toMap()
             matched.forEach { e ->
-                val art = artMap[e.id]
+                val (art, badges) = artMap[e.id] ?: (null to listOf(null, null))
                 val matchup = art?.orderedTitle ?: eventBaseTitle(e)
                 val displayName = eventDisplayName(e, nowSec, art)
                 val id = e.id ?: return@forEach
@@ -1022,7 +1095,16 @@ class YacineTvProvider : MainAPI() {
                     val t2a = teamAlias(e.team2?.id)
                     t1a != null && t2a != null && ordered == "$t2a vs $t1a"
                 } == true
-                val poster = if (flipped) t2Logo ?: t1Logo else t1Logo ?: t2Logo
+                val competition = competitionEnglish(art?.league, e.champions)
+                val status = displayStatus(e, nowSec, art?.state)
+                // Generated card (badges + league logo + date), else API logos.
+                val poster = matchCardUrl(
+                    art?.orderedTitle?.split(" vs ")?.getOrNull(0) ?: teamAlias(e.team1?.id),
+                    art?.orderedTitle?.split(" vs ")?.getOrNull(1) ?: teamAlias(e.team2?.id),
+                    badges.getOrNull(0), badges.getOrNull(1),
+                    art?.leagueBadge, competition,
+                    e.startTime, nowSec, status, minuteLabel(art?.state),
+                ) ?: if (flipped) t2Logo ?: t1Logo else t1Logo ?: t2Logo
                 val poster2 = if (flipped) t1Logo ?: t2Logo else t2Logo ?: t1Logo
                 val data = LinkData(
                     kind = "event",
@@ -1031,7 +1113,7 @@ class YacineTvProvider : MainAPI() {
                     poster = poster,
                     poster2 = poster2,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    competition = competitionEnglish(art?.league, e.champions),
+                    competition = competition,
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                     kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
                     team1Id = e.team1?.id,
@@ -1051,9 +1133,9 @@ class YacineTvProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
-        // Lazy art enrich for non-priority cards (homepage renders those
-        // cache-only): resolves banner + live state on detail open and warms
-        // the cache for the next homepage build. Bounded so detail stays fast.
+        // Lazy art enrich on detail open (homepage cards carry team ids;
+        // the generated card URL is already baked as poster when there was
+        // no banner). Bounded so detail stays fast.
         val nowSec = System.currentTimeMillis() / 1000
         val lazyEvent = if (data.kind == "event" && data.id != null &&
             (data.team1Id != null || data.team2Id != null)
