@@ -28,13 +28,11 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.File
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import java.util.concurrent.ConcurrentHashMap
 
 class YacineTvProvider : MainAPI() {
     override var mainUrl = "https://def.ycnapi.com/api"
@@ -461,17 +459,10 @@ class YacineTvProvider : MainAPI() {
                 // Thumbs/badges/leagues resolve in parallel; each is guarded
                 // so one slow lookup never blocks the homepage.
                 // TheSportsDB art (thumb + English strLeague) reuses one request.
-                // Visible-row prefetch: only the first PRIORITY_ART_LIMIT
-                // cards (live + soonest upcoming in sort order) hit network;
-                // the rest render from cache only and enrich lazily via
-                // search/detail, which warms the cache for the next build.
-                val arts = events.mapIndexed { index, e ->
+                // Cricify-style: no cache, every card fetches fresh.
+                val arts = events.map { e ->
                     async {
-                        val art = if (index < PRIORITY_ART_LIMIT) {
-                            withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
-                        } else {
-                            withTimeoutOrNull(2_000) { cachedMatchArt(e) } ?: MatchArt()
-                        }
+                        val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
                         // Badge fallback follows the displayed (home-first) order.
                         val firstBadge = art.orderedTitle?.let { ordered ->
                             val t1a = teamAlias(e.team1?.id)
@@ -618,65 +609,35 @@ class YacineTvProvider : MainAPI() {
     }
 
     /** Yacine team id -> English alias for TheSportsDB lookups.
-     * Remote team_aliases.json is fetched on every cold start (memory
-     * guards repeats within a session); disk cache
-     * cacheDir/team_aliases/aliases.json is offline fallback only.
-     * Unknown IDs skip the thumbnail API and fall back to API logos. */
+     * Cricify-style: fetched fresh from remote on every build, no
+     * memory/disk cache. Unknown IDs skip the thumbnail API and fall back
+     * to API logos. */
     private val teamAliasesUrl =
         "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/team_aliases.json"
-    private val teamAliasesTtlMs = 24 * 60 * 60 * 1000L
 
     @Volatile
     private var teamAliases: Map<Int, String>? = null
-
-    @Volatile
-    private var teamAliasesFetchedAt = 0L
 
     private fun teamAlias(id: Int?): String? {
         if (id == null) return null
         return teamAliases?.get(id)
     }
 
-    /** Refreshes the team id -> alias map from the remote JSON on every
-     * cold start (memory guards repeats within a session).
-     * Never throws: any failure keeps the memory/disk map (possibly empty). */
+    /** Fetches the team id -> alias map from the remote JSON on every call.
+     * Never throws: any failure keeps the last map (possibly empty). */
     private suspend fun ensureTeamAliases() {
-        val now = System.currentTimeMillis()
-        if (teamAliases != null && now - teamAliasesFetchedAt < teamAliasesTtlMs) return
-        val ctx = appContext
-        val cacheFile = ctx?.let { File(File(it.cacheDir, "team_aliases").apply { mkdirs() }, "aliases.json") }
-
-        // Remote-first: every cold start tries network so newly added ids
-        // apply on next app open instead of waiting out a disk TTL.
-        val remote = fetchRemoteAliases() ?: run {
-            // Offline: use disk (even stale) if present.
-            if (teamAliases == null && cacheFile != null) {
-                runCatching {
-                    if (cacheFile.exists()) {
-                        parseAliasesJson(cacheFile.readText())?.let {
-                            if (it.isNotEmpty()) {
-                                teamAliases = it
-                                teamAliasesFetchedAt = cacheFile.lastModified()
-                            }
-                        }
-                    }
-                }
-            }
-            if (teamAliases == null) teamAliases = emptyMap()
+        fetchRemoteAliases()?.takeIf { it.isNotEmpty() }?.let {
+            teamAliases = it
             return
         }
-        teamAliases = remote
-        teamAliasesFetchedAt = now
-        if (cacheFile != null) {
-            runCatching { cacheFile.writeText(remoteToJson(remote)) }
-        }
+        if (teamAliases == null) teamAliases = emptyMap()
     }
 
     private suspend fun fetchRemoteAliases(): Map<Int, String>? {
         return retryIO(times = 2) {
             app.get(
                 teamAliasesUrl,
-                headers = mapOf("User-Agent" to BROWSER_UA),
+                headers = noCacheHeaders,
                 timeout = 8,
             ).text.takeIf { it.isNotBlank() }?.let { parseAliasesJson(it) }
                 ?.takeIf { it.isNotEmpty() }
@@ -692,12 +653,6 @@ class YacineTvProvider : MainAPI() {
                     id to alias
                 }.toMap()
         }.getOrNull()
-    }
-
-    private fun remoteToJson(map: Map<Int, String>): String {
-        return runCatching {
-            map.toSortedMap().mapKeys { it.key.toString() }.toJson() ?: "{}"
-        }.getOrNull() ?: "{}"
     }
 
     data class SportsDbEvents(
@@ -719,10 +674,9 @@ class YacineTvProvider : MainAPI() {
     )
 
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
-     * (free key), cached per event id under cacheDir/match_thumbs_v4.
-     * Entries are fingerprinted by team ids + fixture day and expire after
-     * 7 days, so a recycled event id or a wrong first pick can never pin a
-     * stale banner forever. Null art falls back to API team logos
+     * (free key). Cricify-style: no cache — every build fetches fresh
+     * (Cache-Control: no-cache), same request also carrying the home-first
+     * title and live state. Null art falls back to API team logos
      * (thumb) / Arabic champions (league).
      * orderedTitle is the home-first "A vs B" from TheSportsDB
      * (strHomeTeam/strAwayTeam, else strEvent order): Yacine team_1/team_2
@@ -744,29 +698,15 @@ class YacineTvProvider : MainAPI() {
         val homeScore: Int? = null,
         val awayScore: Int? = null,
     )
-    private val thumbCache = ConcurrentHashMap<Long, String>()
-    private val leagueCache = ConcurrentHashMap<Long, String>()
-    private val titleCache = ConcurrentHashMap<Long, String>()
-    /** Fingerprint (team ids + day) + save time per event id, guarding the
-     * art maps above against recycled ids / changed fixtures. */
-    private val artPrintCache = ConcurrentHashMap<Long, String>()
-    private val artSavedAt = ConcurrentHashMap<Long, Long>()
-    private val ART_TTL_MS = 7 * 24 * 60 * 60 * 1000L
-    /** Homepage network prefetch cap: first N cards in sort order (live +
-     * soonest upcoming) resolve full art; the rest render cache-only. */
-    private val PRIORITY_ART_LIMIT = 8
-    /** Live state is short-lived (scores change by the minute) while art
-     * pins for 7 days: fresh or frozen-FT state serves from memory, otherwise
-     * the fetch refreshes both together (same request, no extra network).
-     * Empty/failed lookups back off for STATE_TTL (shared free key). */
-    private data class StateEntry(val print: String, val state: MatchState?, val savedAt: Long)
-    private val stateCache = ConcurrentHashMap<Long, StateEntry>()
-    private val STATE_TTL_MS = 3 * 60 * 1000L
     private fun isInPlayScore(s: String?) =
         s?.trim()?.uppercase() in setOf("1H", "HT", "2H", "ET", "BT", "P")
     private fun isFinalScore(s: String?) =
         s?.trim()?.uppercase() in setOf("FT", "AET", "AP")
-    private val ART_DIR = "match_thumbs_v4"
+    /** Cricify parity: every data request opts out of HTTP caching. */
+    private val noCacheHeaders = mapOf(
+        "User-Agent" to BROWSER_UA,
+        "Cache-Control" to "no-cache, no-store",
+    )
 
     /** Accent/case-insensitive compare for team names across APIs. */
     private fun normArt(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
@@ -793,104 +733,17 @@ class YacineTvProvider : MainAPI() {
     }
 
     private suspend fun matchLeague(e: YacineEvent): String? {
-        e.id?.let { leagueCache[it]?.let { return it } }
         return matchArt(e).league
     }
 
+    /** Cricify-style: no art/state cache — every build fetches fresh
+     * (Cache-Control: no-cache), same request returning thumb + league +
+     * home-first title + live state. Bounded by caller timeouts. */
     private suspend fun matchArt(e: YacineEvent): MatchArt {
-        val id = e.id ?: return MatchArt()
+        e.id ?: return MatchArt()
         val day = e.startTime?.let { dayString(it) }
-        // Fingerprint: the same event id with different teams/day (recycled
-        // id, rescheduled fixture) must never reuse the old banner.
-        val print = "${e.team1?.id}_${e.team2?.id}_${day ?: "noday"}"
-        val now = System.currentTimeMillis()
-        // Live state is short-lived (scores change by the minute) while
-        // thumb/league/title pin for 48h: fresh or frozen-FT state serves
-        // from memory, otherwise the fetch below refreshes both together.
-        val cachedState = stateCache[id]?.takeIf { it.print == print }
-        val stateOk = cachedState != null &&
-            (isFinalScore(cachedState.state?.status) || now - cachedState.savedAt < STATE_TTL_MS)
-        if (artPrintCache[id] == print) {
-            if (now - (artSavedAt[id] ?: 0L) < ART_TTL_MS) {
-                val cachedThumb = thumbCache[id]
-                val cachedLeague = leagueCache[id]
-                if (cachedThumb != null && cachedLeague != null && stateOk) {
-                    return MatchArt(cachedThumb, cachedLeague, titleCache[id], cachedState?.state)
-                }
-            } else {
-                // Expired: drop memory so a fresh banner is fetched below.
-                thumbCache.remove(id)
-                leagueCache.remove(id)
-                titleCache.remove(id)
-                stateCache.remove(id)
-            }
-        } else if (artPrintCache.containsKey(id)) {
-            // Fixture changed under this id: evict the stale art.
-            artPrintCache.remove(id)
-            artSavedAt.remove(id)
-            thumbCache.remove(id)
-            leagueCache.remove(id)
-            titleCache.remove(id)
-            stateCache.remove(id)
-        }
-        val ctx = appContext
-        var diskThumb: String? = thumbCache[id]
-        var diskLeague: String? = leagueCache[id]
-        var diskTitle: String? = titleCache[id]
-        if (ctx != null) {
-            runCatching {
-                // One-time cleanup of pre-v4 entries (bare event id in v1, no
-                // fingerprint/TTL; v2 league-only pins; v3 without corrected
-                // home-first title) that may hold a wrong or thumb-less banner.
-                runCatching {
-                    File(ctx.cacheDir, "match_thumbs").let { legacy ->
-                        File(legacy, "match_$id.txt").delete()
-                        File(legacy, "match_${id}_league.txt").delete()
-                    }
-                    File(ctx.cacheDir, "match_thumbs_v2").let { v2 ->
-                        File(v2, "match_v2_$id.txt").delete()
-                    }
-                    File(ctx.cacheDir, "match_thumbs_v3").let { v3 ->
-                        File(v3, "match_v3_$id.txt").delete()
-                    }
-                }
-                val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
-                val f = File(dir, "match_v4_$id.txt")
-                if (f.exists()) {
-                    if (now - f.lastModified() < ART_TTL_MS) {
-                        val lines = f.readText().lines()
-                        if (lines.size >= 3 && lines[0].trim() == print) {
-                            lines[1].trim().takeIf { it.startsWith("http") }?.let {
-                                diskThumb = it
-                                thumbCache[id] = it
-                            }
-                            lines[2].trim().takeIf { it.isNotBlank() }?.let {
-                                diskLeague = it
-                                leagueCache[id] = it
-                            }
-                            lines.getOrNull(3)?.trim()?.takeIf { it.isNotBlank() }?.let {
-                                diskTitle = it
-                                titleCache[id] = it
-                            }
-                            if (diskThumb != null && diskLeague != null && stateOk) {
-                                artPrintCache[id] = print
-                                artSavedAt[id] = f.lastModified()
-                                return MatchArt(diskThumb, diskLeague, diskTitle, cachedState?.state)
-                            }
-                        } else {
-                            f.delete()
-                        }
-                    } else {
-                        f.delete() // expired
-                    }
-                }
-            }
-            if (diskThumb != null && diskLeague != null && stateOk) {
-                return MatchArt(diskThumb, diskLeague, diskTitle, cachedState?.state)
-            }
-        }
-        val t1 = teamAlias(e.team1?.id) ?: return MatchArt(diskThumb, diskLeague, diskTitle)
-        val t2 = teamAlias(e.team2?.id) ?: return MatchArt(diskThumb, diskLeague, diskTitle)
+        val t1 = teamAlias(e.team1?.id) ?: return MatchArt()
+        val t2 = teamAlias(e.team2?.id) ?: return MatchArt()
         // Both team orders are always consulted: the first order often
         // returns a league-only result (day pool empty, league falls back to
         // any leg) while the reversed order holds the day-matching banner.
@@ -907,68 +760,12 @@ class YacineTvProvider : MainAPI() {
             if (art.state != null && bestState == null) bestState = art.state
             if (bestThumb != null && bestLeague != null && bestTitle != null && bestState != null) break
         }
-        // Cache the state lookup (even null) so empty/failed lookups back
-        // off instead of hammering the shared key on every build.
-        stateCache[id] = StateEntry(print, bestState, now)
+        // No backoff cache: empty/failed lookups simply return nothing and
+        // are retried on the next build (Cricify-style always-fresh).
         if (bestThumb == null && bestLeague == null) {
-            return MatchArt(diskThumb, diskLeague, bestTitle ?: diskTitle, bestState)
+            return MatchArt(null, null, bestTitle, bestState)
         }
-        bestThumb?.let {
-            thumbCache[id] = it
-        }
-        bestLeague?.let {
-            leagueCache[id] = it
-        }
-        val finalTitle = bestTitle ?: diskTitle
-        finalTitle?.let {
-            titleCache[id] = it
-        } ?: titleCache.remove(id)
-        artPrintCache[id] = print
-        artSavedAt[id] = now
-        if (ctx != null) {
-            runCatching {
-                val dir = File(ctx.cacheDir, ART_DIR).apply { mkdirs() }
-                File(dir, "match_v4_$id.txt").writeText(
-                    "$print\n${bestThumb.orEmpty()}\n${bestLeague.orEmpty()}\n${finalTitle.orEmpty()}"
-                )
-            }
-        }
-        return MatchArt(bestThumb ?: diskThumb, bestLeague ?: diskLeague, finalTitle, bestState)
-    }
-
-    /** Cache-only art (memory, then disk): never touches network. Serves
-     * non-priority homepage cards and warms from search/detail traffic;
-     * null when nothing complete is cached. Cached live state rides along
-     * as-is (possibly stale) — refresh happens on the priority path. */
-    private suspend fun cachedMatchArt(e: YacineEvent): MatchArt? {
-        val id = e.id ?: return null
-        val day = e.startTime?.let { dayString(it) }
-        val print = "${e.team1?.id}_${e.team2?.id}_${day ?: "noday"}"
-        val now = System.currentTimeMillis()
-        if (artPrintCache[id] == print && now - (artSavedAt[id] ?: 0L) < ART_TTL_MS) {
-            val t = thumbCache[id]
-            val l = leagueCache[id]
-            if (t != null && l != null) {
-                val st = stateCache[id]?.takeIf { it.print == print }?.state
-                return MatchArt(t, l, titleCache[id], st)
-            }
-        }
-        val ctx = appContext ?: return null
-        return runCatching {
-            val f = File(File(ctx.cacheDir, ART_DIR).apply { mkdirs() }, "match_v4_$id.txt")
-            if (!f.exists() || now - f.lastModified() >= ART_TTL_MS) return@runCatching null
-            val lines = f.readText().lines()
-            if (lines.size < 3 || lines[0].trim() != print) return@runCatching null
-            val t = lines[1].trim().takeIf { it.startsWith("http") } ?: return@runCatching null
-            val l = lines[2].trim().takeIf { it.isNotBlank() } ?: return@runCatching null
-            thumbCache[id] = t
-            leagueCache[id] = l
-            val title = lines.getOrNull(3)?.trim()?.takeIf { it.isNotBlank() }?.also { titleCache[id] = it }
-            artPrintCache[id] = print
-            artSavedAt[id] = f.lastModified()
-            val st = stateCache[id]?.takeIf { it.print == print }?.state
-            MatchArt(t, l, title, st)
-        }.getOrNull()
+        return MatchArt(bestThumb, bestLeague, bestTitle, bestState)
     }
 
     private fun dayString(epochSec: Long): String {
@@ -986,7 +783,7 @@ class YacineTvProvider : MainAPI() {
         val res = retryIO(times = 2) {
             app.get(
                 "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$q",
-                headers = mapOf("User-Agent" to BROWSER_UA),
+                headers = noCacheHeaders,
                 timeout = 8,
             ).text.takeIf { it.isNotBlank() }
         } ?: return MatchArt()
@@ -1050,33 +847,18 @@ class YacineTvProvider : MainAPI() {
     )
 
     /** 500px team badge (much sharper than the 96px API logos) used as the
-     * card poster when no event thumb exists. Disk-cached per team. */
-    private val badgeCache = ConcurrentHashMap<String, String>()
-
+     * card poster when no event thumb exists. Cricify-style: fetched fresh
+     * every time, no cache. */
     private suspend fun teamBadge(englishName: String): String? {
-        badgeCache[englishName]?.let { return it }
-        val ctx = appContext
-        val safe = englishName.filter { it.isLetterOrDigit() }.takeIf { it.isNotBlank() }
-            ?: return null
-        if (ctx != null) {
-            runCatching {
-                val f = File(File(ctx.cacheDir, "team_badges").apply { mkdirs() }, "$safe.txt")
-                if (f.exists()) {
-                    f.readText().trim().takeIf { it.startsWith("http") }?.let {
-                        badgeCache[englishName] = it
-                        return it
-                    }
-                }
-            }
-        }
+        if (englishName.isBlank()) return null
         return retryIO(times = 2) {
             val q = URLEncoder.encode(englishName, "UTF-8")
             val res = app.get(
                 "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=$q",
-                headers = mapOf("User-Agent" to BROWSER_UA),
+                headers = noCacheHeaders,
                 timeout = 8,
             ).text.takeIf { it.isNotBlank() } ?: return@retryIO null
-            val badge = runCatching { parseJson<SportsDbTeams>(res).teams }
+            runCatching { parseJson<SportsDbTeams>(res).teams }
                 .getOrNull()
                 .orEmpty()
                 .filter { !it.strBadge.isNullOrBlank() }
@@ -1084,14 +866,6 @@ class YacineTvProvider : MainAPI() {
                     it.strTeam?.trim().equals(englishName, ignoreCase = true)
                 }?.strBadge
                 ?: return@retryIO null
-            badgeCache[englishName] = badge
-            if (ctx != null) {
-                runCatching {
-                    val dir = File(ctx.cacheDir, "team_badges").apply { mkdirs() }
-                    File(dir, "$safe.txt").writeText(badge)
-                }
-            }
-            badge
         }
     }
 
@@ -1328,8 +1102,6 @@ class YacineTvProvider : MainAPI() {
                 // Old saved links carry Arabic champions + old date format;
                 // re-translate so detail tags show English without re-adding.
                 val competition = lazyArt?.league?.takeIf { it.isNotBlank() }
-                    ?: data.id?.let { leagueCache[it] }
-                        ?.takeIf { it.isNotBlank() }
                     ?: competitionEnglish(null, data.competition)
                 // Fresh countdown when the kickoff epoch rode along;
                 // otherwise the baked value (old saved links).
