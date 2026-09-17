@@ -2187,3 +2187,291 @@ private suspend fun shoofAlbaServers(
         false
     }
 }
+
+// ---------------------------------------------------------------------------
+// EgyDead (egydead.skin) link source. Port of the re-3arabi EgyDead search +
+// watch chain, adapted to Streamly's TMDB-title matching: `?s=<query>` ->
+// ul.posts-list li.movieItem cards -> /film/ posts play directly, series
+// resolve through div.seasons-list season pages and div.EpsList episode
+// lists. Watch flow is `?view=watch` + POST View=1; servers come from
+// ul.serversList / donwload-servers-list / [data-link] candidates.
+// EarnVids/StreamHG go through the ported ExternalEarnVidsExtractor, the
+// rest through EmbedRouter. All traffic uses cfGet*/cfPost*: the site sits
+// behind Cloudflare (403s datacenter/bot traffic; the on-device solver
+// clears it).
+// ---------------------------------------------------------------------------
+
+private const val EGDEAD_SEED_URL = "https://egydead.skin"
+private const val EGDEAD_TAG = "EgyDead"
+
+/** EgyDead rotates domains; resolve the live origin once and reuse it. */
+private suspend fun egDeadBase(): String = resolveOrigin(EGDEAD_SEED_URL)
+
+/** Arabic-aware season/episode numbers (SxxExx, xN, حلقة/الموسم). */
+private val EGDEAD_SEASON_REGEX =
+    Regex("""(?ix)(?:الموسم[\s:\-_.]*0*(\d+))|(?:S(?:eason)?[\s:\-_.]*0*(\d+))""")
+private val EGDEAD_EPISODE_REGEX =
+    Regex("""(?ix)(?:حلقة[\s:\-_.]*0*(\d+))|(?:Episode[\s:\-_.]*0*(\d+))|(?:EP[\s:\-_.]*0*(\d+))|(?:\d+[xX]0*(\d+))|(?:S(?:eason)?[\s:\-_.]*\d+[\s\-_.,]*E(?:p(?:isode)?)?[\s:\-_.]*0*(\d+))""")
+
+private fun egDeadNum(re: Regex, s: String?): Int? {
+    if (s.isNullOrBlank()) return null
+    return re.find(s)?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }?.toIntOrNull()
+}
+
+suspend fun invokeEgyDead(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(EGDEAD_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "EgyDead: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    return try {
+        val ok = if (res.isMovie) {
+            egDeadResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            egDeadResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(EGDEAD_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "EgyDead: ok" else "EgyDead: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(EGDEAD_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "EgyDead: ${e.message}"
+        emitted > 0
+    }
+}
+
+private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
+    return withContext(Dispatchers.IO) {
+        try {
+            val base = egDeadBase()
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val doc = cfGetDoc("$base/?s=$encoded", timeout = 20000)
+            doc.select("ul.posts-list li.movieItem").mapNotNull { li ->
+                val a = li.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") }
+                    ?: return@mapNotNull null
+                if (type == "film" && !href.contains("/film/")) return@mapNotNull null
+                if (type == "series" && !href.contains("/season/") && !href.contains("/serie")) return@mapNotNull null
+                val titleText = li.selectFirst("h1.BottomTitle")?.text()?.trim()
+                    .takeIf { !it.isNullOrBlank() } ?: a.text().trim()
+                val slug = decodeSlug(href)
+                val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
+                if (latin.isBlank()) return@mapNotNull null
+                Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
+            }.distinctBy { it.url }
+        } catch (e: Exception) {
+            Log.e(EGDEAD_TAG, "[search ] failed: ${e.message}")
+            emptyList()
+        }
+    }
+}
+
+private suspend fun egDeadResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = egDeadSearch(title, "film")
+    Log.d(EGDEAD_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+
+    val best = candidates.map { it to scoreCandidate(it, title, year) }
+        .maxByOrNull { it.second }
+        ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
+    if (best == null) {
+        Log.d(EGDEAD_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(EGDEAD_TAG, "[match  ] WINNER ${best.url}")
+    return egDeadWatchServers(best.url, subtitleCallback, callback)
+}
+
+private suspend fun egDeadResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = egDeadSearch(title, "series")
+    Log.d(EGDEAD_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(EGDEAD_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(EGDEAD_TAG, "[match  ] anchor ${anchor.url}")
+
+    // A direct episode hit still wins when its numbers agree.
+    if ("/episode/" in anchor.url) {
+        if (egDeadNum(EGDEAD_SEASON_REGEX, anchor.slug) == season &&
+            egDeadNum(EGDEAD_EPISODE_REGEX, anchor.slug) == episode
+        ) {
+            return egDeadWatchServers(anchor.url, subtitleCallback, callback)
+        }
+        Log.d(EGDEAD_TAG, "[match  ] anchor is not the requested episode")
+        return false
+    }
+    var seasonUrl = anchor.url
+    if ("/season/" !in seasonUrl) {
+        // Series hub (/serie/): find the requested season link.
+        val hub = try {
+            cfGetDoc(seasonUrl, timeout = 20000)
+        } catch (e: Exception) {
+            Log.e(EGDEAD_TAG, "[anchor ] failed: ${e.message}")
+            return false
+        }
+        val seasonsCont = hub.selectFirst("div.seasons-list") ?: hub.selectFirst("div.seasons")
+        val link = seasonsCont?.select("a[href]")?.mapNotNull { a ->
+            val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") }
+                ?: return@mapNotNull null
+            if ("/season/" !in href) return@mapNotNull null
+            href to (egDeadNum(EGDEAD_SEASON_REGEX, href + " " + a.text()) ?: 9999)
+        }?.firstOrNull { it.second == season }?.first
+        if (link == null) {
+            Log.d(EGDEAD_TAG, "[match  ] S$season not in seasons list")
+            return false
+        }
+        seasonUrl = link
+    }
+    val seasonDoc = try {
+        cfGetDoc(seasonUrl, timeout = 20000)
+    } catch (e: Exception) {
+        Log.e(EGDEAD_TAG, "[season ] failed: ${e.message}")
+        return false
+    }
+    val epsCont = seasonDoc.selectFirst("div.EpsList")
+        ?: seasonDoc.selectFirst("div.episodes-list")
+    val epUrl = epsCont?.select("a[href]")?.mapNotNull { a ->
+        val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") }
+            ?: return@mapNotNull null
+        if ("/season/" in href || "/film/" in href) return@mapNotNull null
+        val label = (a.attr("title").takeIf { it.isNotBlank() } ?: a.text()).trim()
+        href to (egDeadNum(EGDEAD_EPISODE_REGEX, "$href $label") ?: 9999)
+    }?.firstOrNull { it.second == episode }?.first
+    if (epUrl == null) {
+        Log.d(EGDEAD_TAG, "[match  ] E$episode not in season episode list")
+        return false
+    }
+    return egDeadWatchServers(epUrl, subtitleCallback, callback)
+}
+
+/** Film/episode post -> `?view=watch` (+POST View=1) -> server candidates. */
+private suspend fun egDeadWatchServers(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    try {
+        val watchUrl = postUrl.trimEnd('/') + "?view=watch"
+        val doc = try {
+            cfPostDoc(watchUrl, data = mapOf("View" to "1"), referer = postUrl, timeout = 20000)
+        } catch (_: Exception) {
+            try {
+                cfGetDoc(watchUrl, referer = postUrl, timeout = 20000)
+            } catch (e: Exception) {
+                Log.e(EGDEAD_TAG, "[watch  ] page failed: ${e.message}")
+                return@coroutineScope false
+            }
+        }
+        val seen = LinkedHashSet<String>()
+        fun norm(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            val t = raw.trim()
+            if (t.startsWith("#") || t.startsWith("javascript:", ignoreCase = true)) return null
+            return fixUrl(t, watchUrl).takeIf { it.startsWith("http") }
+        }
+        val candidates = ArrayList<Pair<String, String?>>()
+        fun add(link: String?, name: String?) {
+            norm(link)?.takeIf { seen.add(it) }?.let { candidates.add(it to name?.trim()) }
+        }
+        // Download servers.
+        listOf(
+            "ul.donwload-servers-list li", "ul.download-servers-list li",
+            "div.donwload-servers-list li",
+        ).flatMap { doc.select(it) }.forEach { li ->
+            val name = li.selectFirst("span.ser-name")?.text()
+                ?: li.selectFirst("p")?.text()
+            add(
+                li.selectFirst("a.ser-link")?.attr("href")
+                    ?: li.selectFirst("a")?.attr("href")
+                    ?: li.attr("data-link").takeIf { it.isNotBlank() },
+                name,
+            )
+        }
+        // Watch servers.
+        listOf(
+            "ul.serversList li", "ul.servers-list li",
+            "div.serversList li", "div.servers-list li",
+        ).flatMap { doc.select(it) }.forEach { li ->
+            val name = li.selectFirst("p")?.text()
+                ?: li.selectFirst(".ser-name")?.text()
+                ?: li.selectFirst("span.ser-name")?.text()
+            add(
+                li.attr("data-link").takeIf { it.isNotBlank() }
+                    ?: li.selectFirst("[data-link]")?.attr("data-link")
+                    ?: li.selectFirst("button[data-link]")?.attr("data-link")
+                    ?: li.selectFirst("a")?.attr("href"),
+                name,
+            )
+        }
+        // Generic data-link hooks.
+        doc.select("[data-link]").forEach { el ->
+            add(
+                el.attr("data-link"),
+                el.attr("data-name").takeIf { it.isNotBlank() }
+                    ?: el.attr("data-provider").takeIf { it.isNotBlank() },
+            )
+        }
+        // Generic player/embed/download anchors.
+        doc.select("a[href]").forEach { a ->
+            val href = a.attr("href")
+            if (href.contains("player", true) || href.contains("embed", true) ||
+                href.contains("download", true) || href.contains("drive", true) ||
+                href.contains("mp4", true)
+            ) {
+                add(href, a.attr("title").takeIf { it.isNotBlank() } ?: a.text().takeIf { it.isNotBlank() })
+            }
+        }
+        Log.d(EGDEAD_TAG, "[watch  ] servers=${candidates.size}")
+        if (candidates.isEmpty()) return@coroutineScope false
+        candidates.amap { (link, name) ->
+            async {
+                val isEarn = name != null &&
+                    (name.equals("EarnVids", true) || name.equals("StreamHG", true))
+                if (isEarn) {
+                    val custom = runCatching {
+                        withContext(Dispatchers.IO) {
+                            ExternalEarnVidsExtractor.extract(link, egDeadBase())
+                        }
+                    }.getOrNull()
+                    if (!custom.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink("EgyDead", "$name (Custom)", url = custom) {
+                                this.referer = egDeadBase()
+                                this.quality = Qualities.Unknown.value
+                                this.type = ExtractorLinkType.M3U8
+                            }
+                        )
+                    }
+                }
+                EmbedRouter.route(link, watchUrl, subtitleCallback, callback, "EgyDead")
+            }
+        }.awaitAll()
+        true
+    } catch (e: Exception) {
+        Log.e(EGDEAD_TAG, "[watch  ] failed: ${e.message}")
+        false
+    }
+}
