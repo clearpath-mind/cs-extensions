@@ -2521,8 +2521,13 @@ private suspend fun egDeadWatchServers(
         }
         Log.d(EGDEAD_TAG, "[watch  ] servers=${candidates.size}")
         if (candidates.isEmpty()) return@coroutineScope false
+        candidates.forEach { (link, name) ->
+            Log.d(EGDEAD_TAG, "[watch  ] server name=${name ?: "?"} link=$link")
+        }
         candidates.amap { (link, name) ->
             async {
+                var n = 0
+                val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
                 val isEarn = name != null &&
                     (name.equals("EarnVids", true) || name.equals("StreamHG", true))
                 if (isEarn) {
@@ -2532,7 +2537,7 @@ private suspend fun egDeadWatchServers(
                         }
                     }.getOrNull()
                     if (!custom.isNullOrBlank()) {
-                        callback(
+                        counting(
                             newExtractorLink("EgyDead", "$name (Custom)", url = custom) {
                                 this.referer = egDeadBase()
                                 this.quality = Qualities.Unknown.value
@@ -2541,7 +2546,8 @@ private suspend fun egDeadWatchServers(
                         )
                     }
                 }
-                EmbedRouter.route(link, watchUrl, subtitleCallback, callback, "EgyDead")
+                EmbedRouter.route(link, watchUrl, subtitleCallback, counting, "EgyDead")
+                Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n")
             }
         }.awaitAll()
         true
