@@ -2302,7 +2302,16 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
             val body = runCatching { doc.body()?.text().orEmpty() }.getOrDefault("")
             val uls = doc.select("ul[class]").map { it.attr("class") }.distinct().take(10)
             val filmLinks = doc.select("a[href*=/film/]").map { it.attr("href") }.take(3)
-            Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' movieItem=${doc.select("li.movieItem").size} uls=$uls filmLinks=$filmLinks body='${body.take(200)}'")
+            val items = doc.select("li.movieItem")
+            val hrefKinds = doc.select("a[href]").map { a ->
+                runCatching { URI(fixUrl(a.attr("href"), base)).path?.split("/")?.getOrNull(1) }.getOrDefault("?")
+            }.distinct().take(15)
+            Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' movieItem=${items.size} uls=$uls filmLinks=$filmLinks hrefKinds=$hrefKinds body='${body.take(200)}'")
+            items.take(5).forEach { li ->
+                val chain = generateSequence(li.parent()) { it.parent() }.take(3)
+                    .map { p -> "${p.tagName()}.${p.className()}" }.toList()
+                Log.d(EGDEAD_TAG, "[search ] item parents=$chain html='${li.outerHtml().take(300)}'")
+            }
             emptyList<Candidate>()
         } catch (e: Exception) {
             Log.e(EGDEAD_TAG, "[search ] failed: ${e.message}")
