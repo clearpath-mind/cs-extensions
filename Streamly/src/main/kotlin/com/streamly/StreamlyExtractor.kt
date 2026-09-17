@@ -1231,13 +1231,37 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
         }
     }
 
+/** Theme live-filter via POST (the GET keywords page renders an empty shell). */
+private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
+    withContext(Dispatchers.IO) {
+        try {
+            val base = mycimaBase()
+            val html = cfPostText(
+                "$base/filtering/",
+                data = mapOf("keywords" to query),
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                referer = base,
+                timeout = 15000,
+            )
+            if (html.isBlank()) return@withContext emptyList<Candidate>()
+            val doc = Jsoup.parse(html, base)
+            doc.select("div#MainFiltar div.GridItem").ifEmpty { doc.select("div.GridItem") }
+                .mapNotNull { mycimaFromGridItem(it, base) }
+                .distinctBy { it.url }
+        } catch (e: Exception) {
+            Log.e(MYCIMA_TAG, "[search ] filter POST failed: ${e.message}")
+            emptyList()
+        }
+    }
+
 /** Section/archive slugs that are never posts (nav harvest must skip them). */
 private val MYCIMA_SKIP_SLUGS = setOf(
     "movies", "movie", "series", "seriestv", "tv", "episodes", "episode",
     "seasons", "season", "categories", "category", "tags", "tag",
     "actors", "actor", "home", "main", "filtering", "watch", "download",
-    "login", "register", "contact", "dmca", "privacy", "sitemap", "feed",
-    "comments", "author", "page", "search", "go", "govid",
+    "login", "register", "contact", "contact-us", "about", "about-us",
+    "terms", "terms-of-use", "privacy", "privacy-policy", "dmca",
+    "page", "search", "go", "govid",
 )
 
 /** Single-segment same-host post URLs (mycima slugs carry no /series/ prefix). */
@@ -1273,6 +1297,7 @@ private suspend fun mycimaWpSearch(query: String): List<Candidate> =
                     Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label), isSeries = if (seriesHit) true else null)
                 }.distinctBy { it.url }
             val out = (cards + links).distinctBy { it.url }
+            Log.d(MYCIMA_TAG, "[search ] ?s= '$query' -> ${out.size} (cards=${cards.size} links=${links.size}) title='${doc.title()}'")
             if (out.isEmpty()) {
                 Log.d(MYCIMA_TAG, "[search ] ?s= 0 results title='${doc.title()}' links=${doc.select("a[href]").size}")
             }
@@ -1292,7 +1317,10 @@ private suspend fun mycimaApiSearch(query: String): List<Candidate> {
         val endpoint = "$base/wp-json/wp/v2/search?search=$encoded&per_page=100"
         val html = cfGetText(endpoint, timeout = 15000)
         val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
-        if (jsonText.isBlank()) return emptyList()
+        if (jsonText.isBlank()) {
+            Log.d(MYCIMA_TAG, "[api    ] $endpoint -> 0 posts (raw=${html.length} chars)")
+            return emptyList()
+        }
         val arr = org.json.JSONArray("[$jsonText]")
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
@@ -1321,9 +1349,10 @@ private suspend fun mycimaApiSearch(query: String): List<Candidate> {
 private suspend fun mycimaSearch(query: String): List<Candidate> = coroutineScope {
     // Sequential CF-challenged fetches stall the whole plugin run; fan out.
     val f = async { mycimaFilterSearch(query) }
+    val fp = async { mycimaFilterPostSearch(query) }
     val w = async { mycimaWpSearch(query) }
     val a = async { mycimaApiSearch(query) }
-    val merged = (f.await() + w.await() + a.await()).distinctBy { it.url }
+    val merged = (f.await() + fp.await() + w.await() + a.await()).distinctBy { it.url }
     Log.d(MYCIMA_TAG, "[search ] '$query' -> ${merged.size} candidates")
     merged
 }
