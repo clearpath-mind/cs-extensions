@@ -1483,7 +1483,7 @@ private suspend fun mycimaExtractPost(
         servers.forEach { (link, name) ->
             Log.d(MYCIMA_TAG, "[watch  ] server name=${name ?: "?"} link=$link")
         }
-        servers.amap { (rawLink, name) ->
+        servers.toList().amap { (rawLink, name) ->
             async {
                 var link = rawLink.trim()
                 if ("govid" in link) {
