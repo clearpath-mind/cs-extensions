@@ -463,6 +463,7 @@ private data class Candidate(
     val slug: String,
     val latinTitle: String,
     val year: Int?,
+    val isDub: Boolean = false,
 )
 
 private val EPISODE_REGEX = Regex("""الحلقة[-\s]*(\d+)""")
@@ -2322,6 +2323,14 @@ private const val EGDEAD_TAG = "EgyDead"
 /** EgyDead rotates domains; resolve the live origin once and reuse it. */
 private suspend fun egDeadBase(): String = resolveOrigin(EGDEAD_SEED_URL)
 
+/** Dubbed-post signals: explicit مدبلج/dubbed markers, or EgyDead's -ar
+ *  slug suffix for Arabic-dubbed versions (sultana-2026-1080p-web-dl-ar). */
+private fun egDeadIsDub(slug: String, text: String): Boolean {
+    if (text.contains("مدبلج") || text.contains("مدبلجه")) return true
+    if (slug.contains("مدبلج") || slug.contains("dubbed", ignoreCase = true)) return true
+    if (slug.trimEnd('/').endsWith("-ar", ignoreCase = true)) return true
+    return false
+}
 /** Arabic-aware season/episode numbers (SxxExx, xN, حلقة/الموسم). */
 private val EGDEAD_SEASON_REGEX =
     Regex("""(?ix)(?:الموسم[\s:\-_.]*0*(\d+))|(?:S(?:eason)?[\s:\-_.]*0*(\d+))""")
@@ -2395,11 +2404,12 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
                 val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") } ?: return null
                 val titleText = li.selectFirst("h1.BottomTitle")?.text()?.trim()
                     .takeIf { !it.isNullOrBlank() } ?: a.text().trim()
-                if (!typeOk(href, li.text() + " " + titleText)) return null
+                val cardText = li.text() + " " + titleText
+                if (!typeOk(href, cardText)) return null
                 val slug = decodeSlug(href)
                 val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
                 if (latin.isBlank()) return null
-                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
+                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText), egDeadIsDub(slug, cardText))
             }
             fun fromLink(rawHref: String, label: String): Candidate? {
                 val href = fixUrl(rawHref, base)
@@ -2407,7 +2417,7 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
                 val slug = decodeSlug(href)
                 val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
                 if (latin.isBlank()) return null
-                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label))
+                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label), egDeadIsDub(slug, label))
             }
             val primary = doc.select("ul.posts-list li.movieItem").mapNotNull { fromCard(it) }.distinctBy { it.url }
             if (primary.isNotEmpty()) return@withContext primary
@@ -2468,15 +2478,23 @@ private suspend fun egDeadResolveMovie(
     Log.d(EGDEAD_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
     if (candidates.isEmpty()) return false
 
-    val best = candidates.map { it to scoreCandidate(it, title, year) }
-        .maxByOrNull { it.second }
-        ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
-    if (best == null) {
+    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    val above = scored.filter { it.second >= MIN_SCORE_MOVIE }
+    if (above.isEmpty()) {
         Log.d(EGDEAD_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
         return false
     }
-    Log.d(EGDEAD_TAG, "[match  ] WINNER ${best.url}")
-    return egDeadWatchServers(best.url, subtitleCallback, callback)
+    // Prefer the Arabic-dubbed post when one clears the threshold.
+    val best = above.filter { it.first.isDub }.maxByOrNull { it.second }
+        ?.also { Log.d(EGDEAD_TAG, "[match  ] dubbed version available, preferring it") }
+        ?: above.maxByOrNull { it.second }
+    val winner = best?.first
+    if (winner == null) {
+        Log.d(EGDEAD_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(EGDEAD_TAG, "[match  ] WINNER ${winner.url} dub=${winner.isDub}")
+    return egDeadWatchServers(winner.url, subtitleCallback, callback)
 }
 
 private suspend fun egDeadResolveEpisode(
