@@ -668,10 +668,22 @@ private suspend fun cfGetDoc(
 ): Document {
     val target = applyHostOverride(url)
     val first = runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.document.toString())) {
         return first.document
+    }
+    // Stage 2 (re-3arabi smartGet): one silent plain retry before burning a
+    // WebView solve — CF sometimes passes the second hit, or a parallel
+    // provider cleared the wall while we worked.
+    delay(1500)
+    runCatching {
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
+    }.getOrNull()?.let { pre ->
+        if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.document.toString())) {
+            Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
+            return pre.document
+        }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
     val solved = cfSolve(target)
@@ -686,7 +698,7 @@ private suspend fun cfGetDoc(
     }
     val ck = cfCookies(retryUrl)
     val second = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0)
     }.getOrNull()
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
     return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
@@ -700,10 +712,20 @@ private suspend fun cfGetText(
 ): String {
     val target = applyHostOverride(url)
     val first = runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.text)) {
         return first.text
+    }
+    // Stage 2 (re-3arabi smartGet): one silent plain retry before solving.
+    delay(1500)
+    runCatching {
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
+    }.getOrNull()?.let { pre ->
+        if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.text)) {
+            Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
+            return pre.text
+        }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
     val solved = cfSolve(target)
@@ -723,7 +745,7 @@ private suspend fun cfGetText(
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0)
     }.getOrNull()
     val second: String? = secondResp?.text
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
@@ -742,9 +764,19 @@ private suspend fun cfPostText(
     }
     val target = applyHostOverride(url)
     val first = runCatching {
-        app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout).text
+        app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout, cacheTime = 0).text
     }.getOrNull()
     if (first != null && !isCfChallenge(first)) return first
+    // Stage 2 (re-3arabi smartPost): one silent plain retry before solving.
+    delay(1500)
+    runCatching {
+        app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout, cacheTime = 0).text
+    }.getOrNull()?.let { pre ->
+        if (!isCfChallenge(pre)) {
+            Log.d(TAG, "[cfPost ] wall cleared on silent retry for $target")
+            return pre
+        }
+    }
     // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
     Log.d(TAG, "[cfPost ] wall ($target), solving…")
     val solved = cfSolve(target)
@@ -753,7 +785,7 @@ private suspend fun cfPostText(
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = cfRetryTimeout(timeout))
+        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = cfRetryTimeout(timeout), cacheTime = 0)
     }.getOrNull()
     val retry: String? = secondResp?.text
     Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
