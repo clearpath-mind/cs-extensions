@@ -1047,45 +1047,54 @@ class YacineTvProvider : MainAPI() {
             eventDisplayName(lazyEvent, nowSec, lazyArt)
         } else data.name
         val banner = data.poster ?: lazyArt?.thumb
-        val plot = data.plot
+        // Match meta, in order: status, competition, kickoff,
+        // commentator, broadcast channel. Accepts new emoji prefix
+        // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
+        // Old saved links carry Arabic champions + old date format;
+        // re-translate so detail shows English without re-adding.
+        val status = if (data.kind == "event") when {
+            name.startsWith("🔴") -> "LIVE"
+            name.startsWith("🔜") -> "UPCOMING"
+            name.startsWith("✅") -> "ENDED"
+            else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(name)?.groupValues?.get(1)
+        } else null
+        val competition = if (data.kind == "event") {
+            lazyArt?.league?.takeIf { it.isNotBlank() }
+                ?: competitionEnglish(null, data.competition)
+        } else null
+        // Fresh countdown when the kickoff epoch rode along;
+        // otherwise the baked value (old saved links).
+        val kickoff = if (data.kind == "event") {
+            data.startTime
+                ?.let { formatKickoff(it, nowSec) }?.takeIf { it.isNotBlank() }
+                ?: data.kickoff?.takeIf { it.isNotBlank() }
+        } else null
+        // Cricify-style emoji plot, no tags: one line per available
+        // field in fixed order. UPCOMING gets no status line (the kickoff
+        // line covers it); channels keep their watch plot below.
+        val matchPlotLines = if (data.kind == "event") listOfNotNull(
+            when (status) {
+                "LIVE" -> "🔴 مباشر الآن"
+                "ENDED" -> "✅ انتهت المباراة"
+                else -> null
+            },
+            competition?.let { "🏆 $it" },
+            kickoff?.let { "🕐 $it" },
+            data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
+            data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
+        ) else emptyList()
+        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("\n")
+            ?: data.plot
             ?: if (data.kind == "event") matchPlot(name)
             else "شاهد البث المباشر لقناة ${data.name}"
         return newMovieLoadResponse(name, url, TvType.Live, url) {
             this.posterUrl = banner
             // Matches: hero shows the same homepage thumbnail (banner);
-            // fall back to the other team logo when no banner was rendered.
+            // empty when no banner was rendered (no team-logo fallback).
             if (data.kind == "event") {
                 this.backgroundPosterUrl = banner ?: data.poster2
             }
             this.plot = plot
-            // Match meta as tags, in order: status, competition, kickoff,
-            // commentator, broadcast channel. Accepts new emoji prefix
-            // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
-            if (data.kind == "event") {
-                val status = when {
-                    name.startsWith("🔴") -> "LIVE"
-                    name.startsWith("🔜") -> "UPCOMING"
-                    name.startsWith("✅") -> "ENDED"
-                    else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(name)?.groupValues?.get(1)
-                }
-                // Old saved links carry Arabic champions + old date format;
-                // re-translate so detail tags show English without re-adding.
-                val competition = lazyArt?.league?.takeIf { it.isNotBlank() }
-                    ?: competitionEnglish(null, data.competition)
-                // Fresh countdown when the kickoff epoch rode along;
-                // otherwise the baked value (old saved links).
-                val kickoff = data.startTime
-                    ?.let { formatKickoff(it, nowSec) }?.takeIf { it.isNotBlank() }
-                    ?: data.kickoff?.takeIf { it.isNotBlank() }
-                val tags = listOfNotNull(
-                    status,
-                    competition,
-                    kickoff,
-                    data.commentary?.takeIf { it.isNotBlank() },
-                    data.channel?.takeIf { it.isNotBlank() },
-                )
-                if (tags.isNotEmpty()) this.tags = tags
-            }
             // Recommendations ride in LinkData (row siblings / other matches).
             data.related?.takeIf { it.isNotEmpty() }?.let { related ->
                 this.recommendations = related.map { rel ->
