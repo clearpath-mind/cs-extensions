@@ -1083,7 +1083,7 @@ class YacineTvProvider : MainAPI() {
             data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
             data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
         ) else emptyList()
-        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("\n")
+        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
             ?: data.plot
             ?: if (data.kind == "event") matchPlot(name)
             else "شاهد البث المباشر لقناة ${data.name}"
