@@ -66,9 +66,9 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, MyCima, FaselHD, Shoof, EgyDead. One adaptive link is
-// emitted per server (no per-quality lists); ExoPlayer adapts itself.
-// ---------------------------------------------------------------------------
+// Currently: TopCinema, MyCima, FaselHD, Shoof, EgyDead. Every master m3u8
+// is expanded into per-quality variants so slow networks can pick manually.
+/// ---------------------------------------------------------------------------
 
 private const val FASELHD_RES_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
@@ -112,7 +112,12 @@ fun extractIframeSources(doc: Document, base: String): List<String> {
 }
 
 @SuppressLint("SetJavaScriptEnabled")
-suspend fun faselHdResolveWebView(iframeUrl: String, referer: String, sniffMp4: Boolean = false): String? =
+suspend fun faselHdResolveWebView(
+    iframeUrl: String,
+    referer: String,
+    sniffMp4: Boolean = false,
+    onResolvedPage: (String) -> Unit = {},
+): String? =
     suspendCancellableCoroutine { cont ->
         val activity = StreamlyRuntime.context as? Activity
         if (activity == null || activity.isFinishing) {
@@ -246,7 +251,12 @@ suspend fun faselHdResolveWebView(iframeUrl: String, referer: String, sniffMp4: 
                     if (!lowerUrl.startsWith("http")) return true
                     if (lowerUrl.contains("policies.google.com") || lowerUrl.contains("recaptcha") || lowerUrl.contains("mcaptcha") || lowerUrl.contains("melbet")) { Handler(Looper.getMainLooper()).post { view?.loadUrl(finalUrl, mapOf("Referer" to referer)) }; return true }
                     val currentHost = runCatching { Uri.parse(url).host?.replace("www.", "") ?: "" }.getOrDefault("")
-                    if (originalHost.isNotBlank() && currentHost.isNotBlank() && !currentHost.contains(originalHost)) return true
+                    if (originalHost.isNotBlank() && currentHost.isNotBlank() && !currentHost.contains(originalHost)) {
+                        val samePlayerRedirect = sniffMp4 && request?.isForMainFrame == true &&
+                            !request.hasGesture() && Uri.parse(url).path == Uri.parse(finalUrl).path
+                        if (!samePlayerRedirect) return true
+                        Log.d("StreamHG", "following player redirect: $url")
+                    }
                     return false
                 }
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) { super.onPageStarted(view, url, favicon); view?.evaluateJavascript(fastSnifferJs, null) }
@@ -353,8 +363,8 @@ object ExternalEarnVidsExtractor {
 /** megamax.me (EgyDead's primary server) is a Vue/Inertia app: the
  *  /iframe/{id} page carries per-quality stream mirrors in its Inertia props
  *  (`streams.data[]` -> mirrors[] {driver, link} on well-known file hosts).
- *  Fetch the partial payload, then route each mirror of the best available
- *  quality through EmbedRouter. */
+ *  Fetch the partial payload, then route every mirror of every available
+ *  quality through EmbedRouter so slow networks can pick a lower rendition. */
 object MegaMaxExtractor {
     private const val TAG = "MegaMax"
     private val VERSION_REGEX = Regex(""""version"\s*:\s*"([0-9a-fA-F]{32,})"""")
@@ -372,6 +382,38 @@ object MegaMaxExtractor {
         if (label.contains("360", ignoreCase = true)) return 360
         if (label.contains("source", ignoreCase = true)) return 9999
         return 0
+    }
+
+    private fun megaQuality(height: Int): Int = when {
+        height >= 1080 -> Qualities.P1080.value
+        height >= 720 -> Qualities.P720.value
+        height >= 480 -> Qualities.P480.value
+        height >= 360 -> Qualities.P360.value
+        else -> Qualities.Unknown.value
+    }
+
+    private fun tagMegaQuality(link: ExtractorLink, label: String, height: Int): ExtractorLink {
+        val mapped = megaQuality(height)
+        val wantQuality =
+            if (link.quality == Qualities.Unknown.value && mapped != Qualities.Unknown.value) mapped
+            else link.quality
+        val wantName =
+            if (label.isBlank() || link.name.contains(label, ignoreCase = true)) link.name
+            else "${link.name} $label"
+        if (wantQuality == link.quality && wantName == link.name) return link
+        return runCatching {
+            @Suppress("DEPRECATION")
+            com.lagradost.cloudstream3.utils.ExtractorLink(
+                source = link.source,
+                name = wantName,
+                url = link.url,
+                referer = link.referer,
+                quality = wantQuality,
+                headers = link.headers,
+                extractorData = link.extractorData,
+                type = link.type,
+            )
+        }.getOrElse { link }
     }
 
     suspend fun extract(
@@ -440,17 +482,18 @@ object MegaMaxExtractor {
             Log.d(TAG, "[mega] qualities=${qualities.map { it.label }}")
             var emittedTotal = 0
             for (quality in qualities) {
-                var emittedQ = 0
                 for (mirror in quality.mirrors) {
                     var n = 0
-                    val counting: (ExtractorLink) -> Unit = { n++; emittedQ++; emittedTotal++; callback(it) }
+                    val counting: (ExtractorLink) -> Unit = { link ->
+                        n++; emittedTotal++
+                        callback(tagMegaQuality(link, quality.label, quality.height))
+                    }
                     Log.d(TAG, "[mega] ${quality.label} driver=${mirror.driver} link=${mirror.link}")
                     runCatching {
                         EmbedRouter.route(mirror.link, iframeUrl, subtitleCallback, counting, providerName)
                     }
                     Log.d(TAG, "[mega] driver=${mirror.driver} emitted=$n")
                 }
-                if (emittedQ > 0) break
             }
             emittedTotal > 0
         } catch (e: Exception) {
@@ -1884,7 +1927,7 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
 private fun faselHdHostOf(url: String): String =
     runCatching { URI(url.substringBefore("#")).host ?: url.take(48) }.getOrDefault(url.take(48))
 
-/** Shared emit for a resolved m3u8: single adaptive link for masters, expansion otherwise. */
+/** Shared emit for a resolved m3u8: always expand into per-quality variants. */
 private suspend fun faselHdEmitResolved(
     m3u8: String,
     iframe: String,
@@ -1892,35 +1935,32 @@ private suspend fun faselHdEmitResolved(
     callback: (ExtractorLink) -> Unit,
     label: String = "FaselHD",
 ) {
-    if (m3u8.contains("master.m3u8", ignoreCase = true)) {
-        // Emit the adaptive master only. Expanding it via generateM3u8
-        // yields 1080+720+360+master links; CloudStream auto-plays
-        // index 0 (forced 1080p) and thumbnails every variant via
-        // MediaMetadataRetriever without Referer headers, which
-        // stalls the UI (Slow Binder ~6s) and backpressures the
-        // decoder (pipelineFull/QueueBuffer timeout). One master link
-        // lets ExoPlayer adapt and cuts preview fetches to one.
-        Log.d(FASELHD_TAG, "[watch  ] master playlist, emitting single adaptive link")
-        callback(
-            newExtractorLink(label, label, url = m3u8) {
-                this.referer = iframe
-                this.quality = Qualities.Unknown.value
-                this.type = ExtractorLinkType.M3U8
-                this.headers = mapOf(
-                    "Referer" to iframe,
-                    "Origin" to base,
-                    "User-Agent" to CF_UA,
-                )
-            },
-        )
-    } else {
+    val variants = runCatching {
         generateM3u8(
             label,
             m3u8,
             referer = iframe,
             headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
-        ).forEach(callback)
+        )
+    }.getOrNull().orEmpty()
+    if (variants.isNotEmpty()) {
+        Log.d(FASELHD_TAG, "[watch  ] expanded ${variants.size} qualities for $label")
+        variants.forEach(callback)
+        return
     }
+    Log.d(FASELHD_TAG, "[watch  ] expansion failed, emitting single adaptive link for $label")
+    callback(
+        newExtractorLink(label, label, url = m3u8) {
+            this.referer = iframe
+            this.quality = Qualities.Unknown.value
+            this.type = ExtractorLinkType.M3U8
+            this.headers = mapOf(
+                "Referer" to iframe,
+                "Origin" to base,
+                "User-Agent" to CF_UA,
+            )
+        },
+    )
 }
 /** Find the episode anchor on a series (or season) page that matches `episode`. */
 private fun faselHdExactEpisode(scope: Document, episode: Int): String? {
@@ -2905,12 +2945,12 @@ private suspend fun egDeadWatchServers(
                 var n = 0
                 val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
                 if (link.contains("hgcloud", ignoreCase = true)) {
-                    // StreamHG renders its player in JS (static fetch only sees
-                    // a loader shell), so sniff the stream via the WebView.
-                    // Clear any Cloudflare wall first so the loader can run.
-                    val solved = cfSolve(link)
-                    Log.d(EGDEAD_TAG, "[watch  ] hgcloud cf clearance=${solved != null}")
-                    val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true)
+                    // The JS loader redirects to rotating player hosts. Use one
+                    // bounded WebView attempt, not the shared challenge queue.
+                    var playerUrl = link
+                    val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true) {
+                        playerUrl = it
+                    }
                     if (!hit.isNullOrBlank()) {
                         if (hit.substringBefore("?").endsWith(".mp4", ignoreCase = true)) {
                             counting(
@@ -2941,7 +2981,11 @@ private suspend fun egDeadWatchServers(
                         }
                     }.getOrNull()
                     if (!custom.isNullOrBlank()) {
-                        counting(
+                        val expanded = runCatching {
+                            generateM3u8("$name (Custom)", custom, egDeadBase())
+                        }.getOrNull().orEmpty()
+                        if (expanded.isNotEmpty()) expanded.forEach(counting)
+                        else counting(
                             newExtractorLink(providerLabel, "$name (Custom)", url = custom) {
                                 this.referer = egDeadBase()
                                 this.quality = Qualities.Unknown.value

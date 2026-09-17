@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper.Companion.generateM3u8
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.getPacked
@@ -20,49 +21,57 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 
 /**
  * Rebuilds [link] with the provider name prefixed so players show e.g.
- * "TopCinema - Vidtube". Passthrough when blank or already labeled.
+ * "TopCinema - Vidtube 1080p". Passthrough when blank or already labeled.
  *
- * Normalizes to a single auto-quality source: built-in extractors fan out
- * per-quality rows ("Strwush 800p", …) — strip the trailing quality token so
- * the entry reads "TopCinema - Strwush", and force Unknown (auto) for
- * adaptive M3U8 masters.
+ * Always-expand: per-quality rows stay distinct — quality/type/headers are
+ * preserved untouched so the player offers every variant for slow networks.
  */
 fun relabelLink(link: ExtractorLink, providerName: String?): ExtractorLink {
-    val cleanName = link.name.trim()
-        .replace(Regex("""\s+\d{3,4}p(\s*hls)?\s*$""", RegexOption.IGNORE_CASE), "")
-        .trim()
-        .ifBlank { link.name.trim() }
-    val autoQuality =
-        if (link.type == ExtractorLinkType.M3U8) Qualities.Unknown.value else link.quality
-    if (providerName.isNullOrBlank() || cleanName.startsWith("$providerName ")) {
-        if (cleanName == link.name.trim() && autoQuality == link.quality) return link
-        return runCatching {
-            @Suppress("DEPRECATION")
-            ExtractorLink(
-                source = link.source,
-                name = cleanName,
-                url = link.url,
-                referer = link.referer,
-                quality = autoQuality,
-                headers = link.headers,
-                extractorData = link.extractorData,
-                type = link.type,
-            )
-        }.getOrElse { link }
-    }
+    val baseName = link.name.trim().ifBlank { link.name.trim() }
+    if (providerName.isNullOrBlank() || baseName.startsWith("$providerName ")) return link
     return runCatching {
         @Suppress("DEPRECATION")
         ExtractorLink(
             source = link.source,
-            name = "$providerName - $cleanName",
+            name = "$providerName - $baseName",
             url = link.url,
             referer = link.referer,
-            quality = autoQuality,
+            quality = link.quality,
             headers = link.headers,
             extractorData = link.extractorData,
             type = link.type,
         )
     }.getOrElse { link }
+}
+
+/**
+ * Expands a master m3u8 into per-quality variants (1080/720/480/…) so slow
+ * networks can pick a lower rendition. Falls back to the single adaptive
+ * link when the playlist cannot be fetched/parsed (tokenized hosts, 403s).
+ */
+private suspend fun emitM3u8Variants(
+    sourceName: String,
+    m3u8Url: String,
+    referer: String,
+    headers: Map<String, String> = emptyMap(),
+    callback: (ExtractorLink) -> Unit,
+) {
+    val variants = runCatching {
+        if (headers.isEmpty()) generateM3u8(sourceName, m3u8Url, referer)
+        else generateM3u8(sourceName, m3u8Url, referer, headers)
+    }.getOrNull().orEmpty()
+    if (variants.isNotEmpty()) {
+        variants.forEach(callback)
+        return
+    }
+    callback(
+        newExtractorLink(sourceName, sourceName, url = m3u8Url) {
+            this.referer = referer
+            this.quality = Qualities.Unknown.value
+            this.type = ExtractorLinkType.M3U8
+            if (headers.isNotEmpty()) this.headers = headers
+        }
+    )
 }
 
 /**
@@ -98,14 +107,14 @@ open class PackedJwPlayer : ExtractorApi() {
 
         // Hosts like Vidtube 403 their stream CDN unless requests carry the
         // embed host as Referer, so it rides along in the headers map; the
-        // player uses it for playback too. One adaptive link per source — no
-        // quality list; ExoPlayer adapts from the master playlist itself.
+        // player uses it for playback too. Always expand the master into
+        // per-quality variants for manual selection on slow networks.
         val hlsHeaders = mapOf("Referer" to mainUrl)
 
         var emitted = 0
         sources.forEach { src ->
             if (src.contains(".m3u8")) {
-                callback(m3u8Link(src, hlsHeaders))
+                emitM3u8Variants(name, src, mainUrl, hlsHeaders, callback)
                 emitted++
             } else {
                 callback(fileLink(src, referer, getQualityFromName(src)))
@@ -119,7 +128,7 @@ open class PackedJwPlayer : ExtractorApi() {
                 .mapNotNull { it.groupValues[1] }
                 .forEach { src ->
                     if (src.contains(".m3u8")) {
-                        callback(m3u8Link(src))
+                        emitM3u8Variants(name, src, mainUrl, hlsHeaders, callback)
                     } else {
                         callback(
                             newExtractorLink(name, name, url = src) {
@@ -138,17 +147,6 @@ open class PackedJwPlayer : ExtractorApi() {
             this.referer = referer ?: mainUrl
             this.quality = quality
             this.type = ExtractorLinkType.VIDEO
-        }
-
-    // The master-playlist fallback must present the host's own referer: CDNs
-    // like Vidtube's reject cross-site (site-of-origin) referers with 403.
-    // Single adaptive link (no quality expansion) with playback headers.
-    private suspend fun m3u8Link(src: String, headers: Map<String, String> = emptyMap()): ExtractorLink =
-        newExtractorLink(name, name, url = src) {
-            this.referer = mainUrl
-            this.quality = Qualities.Unknown.value
-            this.type = ExtractorLinkType.M3U8
-            if (headers.isNotEmpty()) this.headers = headers
         }
 }
 
@@ -244,14 +242,12 @@ class AnaFast : ExtractorApi() {
             .find(text)?.groupValues?.get(1)
             ?: Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""").find(text)?.groupValues?.get(1)
             ?: return
-        // Tokenized master (?t=&s=&e=): single adaptive link, ExoPlayer
-        // adapts from the playlist itself.
-        callback(
-            newExtractorLink(name, name, url = src) {
-                this.referer = referer ?: mainUrl
-                this.quality = Qualities.Unknown.value
-                this.type = ExtractorLinkType.M3U8
-            }
+        // Tokenized master (?t=&s=&e=): expand into per-quality variants.
+        val ref = referer ?: mainUrl
+        emitM3u8Variants(
+            name, src, ref,
+            mapOf("Referer" to ref),
+            callback,
         )
     }
 }
@@ -292,13 +288,11 @@ class Uqload : ExtractorApi() {    override val name = "Uqload"
                 else -> null
             }
         }.toList().forEach { m3u8 ->
-            // Single adaptive link — no quality list.
-            callback(
-                newExtractorLink(name, name, url = m3u8) {
-                    this.referer = mainUrl
-                    this.quality = Qualities.Unknown.value
-                    this.type = ExtractorLinkType.M3U8
-                },
+            // Expand each playlist into per-quality variants.
+            emitM3u8Variants(
+                name, m3u8, mainUrl,
+                mapOf("Referer" to mainUrl),
+                callback,
             )
         }
     }
@@ -318,15 +312,11 @@ object EmbedRouter {
         providerName: String? = null,
     ) {
         val host = link.lowercase()
-        // Single simple link per embed: built-in extractors fan out into
-        // per-quality rows (Strwish 800p, …); keep the first and drop the
-        // rest. Subtitles still flow via subtitleCallback untouched.
-        var emittedLink = false
+        // Always-expand: forward every variant built-in extractors emit
+        // (Strwish 1080p/720p/…) so slow networks can pick a lower rendition.
+        // Subtitles still flow via subtitleCallback untouched.
         val out: (ExtractorLink) -> Unit = { l ->
-            if (!emittedLink) {
-                emittedLink = true
-                callback(relabelLink(l, providerName))
-            }
+            callback(relabelLink(l, providerName))
         }
         try {
             val extractorName = when {
