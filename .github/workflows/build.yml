@@ -11,6 +11,7 @@ on:
       - main
     paths-ignore:
       - '*.md'
+      - 'YacineTV/team_aliases.json'
   workflow_dispatch:
 
 jobs:

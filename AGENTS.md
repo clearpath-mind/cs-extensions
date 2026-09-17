@@ -12,7 +12,7 @@
 
 ## CI notes (`.github/workflows/build.yml`)
 
-- Triggers on push to `main` (`*.md` changes ignored) + `workflow_dispatch`.
+- Triggers on push to `main` (`*.md` and `YacineTV/team_aliases.json` changes ignored) + `workflow_dispatch`.
 - Needs JDK 17 and the `TMDB_API` secret (written to `local.properties` in CI).
 - Artifacts (`*.cs3`, `plugins.json`, `repo.json`) are force-pushed to the `builds` branch.
 
@@ -22,8 +22,8 @@
   (e.g. `YacineTV/build.gradle.kts`). Convention: `git commit` message
   `"<Plugin> v<N>: <what changed>"`.
 - `team_aliases.json` (YacineTV) is fetched at RUNTIME from `main` on every cold
-  start — alias-only updates apply without a rebuild, but still bump version,
-  push, and verify via CI.
+  start — alias-only updates need NO version bump and trigger NO build
+  (CI skips them via `paths-ignore`); just commit and push.
 
 ## YacineTV team aliases
 
