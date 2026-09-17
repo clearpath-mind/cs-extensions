@@ -2308,9 +2308,13 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
             }.distinct().take(15)
             Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' movieItem=${items.size} uls=$uls filmLinks=$filmLinks hrefKinds=$hrefKinds body='${body.take(200)}'")
             items.take(5).forEach { li ->
-                val chain = generateSequence(li.parent()) { it.parent() }.take(3)
-                    .map { p -> "${p.tagName()}.${p.className()}" }.toList()
-                Log.d(EGDEAD_TAG, "[search ] item parents=$chain html='${li.outerHtml().take(300)}'")
+                // Explicit Element? types: jsoup's @Nullable isn't on the compile classpath.
+                val chain: List<String> = generateSequence<Element?>(li.parent()) { it?.parent() }
+                    .take(3)
+                    .map { p: Element? -> p?.let { "${it.tagName()}.${it.className()}" } ?: "null" }
+                    .toList()
+                val html: String = li.toString().take(300)
+                Log.d(EGDEAD_TAG, "[search ] item parents=$chain html='$html'")
             }
             emptyList<Candidate>()
         } catch (e: Exception) {
