@@ -2259,16 +2259,33 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val fetchUrl = "$base/?s=$encoded"
             val doc = cfGetDoc(fetchUrl, timeout = 20000)
-            fun typeOk(href: String): Boolean {
-                if (type == "film") return "/film/" in href
-                return "/season/" in href || "/serie" in href
+            fun looksSeries(href: String, text: String): Boolean =
+                href.contains("/season/") || href.contains("/serie") || href.contains("/episode/") ||
+                text.contains("مسلسل")
+            fun looksFilm(href: String, text: String): Boolean =
+                href.contains("/film/") || text.contains("فيلم") || text.contains("افلام")
+            // The .live mirrors dropped the /film/ URL prefix: posts live at
+            // /<slug>/. Accept same-host single-segment post URLs for films
+            // unless series signals are present.
+            fun isPostUrl(href: String): Boolean = runCatching {
+                val u = URI(href)
+                val b = URI(base)
+                u.host.equals(b.host, ignoreCase = true) &&
+                u.path.trim('/').isNotEmpty() && '/' !in u.path.trim('/')
+            }.getOrDefault(false)
+            fun typeOk(href: String, text: String): Boolean {
+                return if (type == "film") {
+                    !looksSeries(href, text) && (looksFilm(href, text) || isPostUrl(href))
+                } else {
+                    looksSeries(href, text)
+                }
             }
             fun fromCard(li: Element): Candidate? {
                 val a = li.selectFirst("a[href]") ?: return null
                 val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") } ?: return null
-                if (!typeOk(href)) return null
                 val titleText = li.selectFirst("h1.BottomTitle")?.text()?.trim()
                     .takeIf { !it.isNullOrBlank() } ?: a.text().trim()
+                if (!typeOk(href, li.text() + " " + titleText)) return null
                 val slug = decodeSlug(href)
                 val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
                 if (latin.isBlank()) return null
@@ -2276,7 +2293,7 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
             }
             fun fromLink(rawHref: String, label: String): Candidate? {
                 val href = fixUrl(rawHref, base)
-                if (!href.startsWith("http") || !typeOk(href)) return null
+                if (!href.startsWith("http") || !typeOk(href, label)) return null
                 val slug = decodeSlug(href)
                 val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
                 if (latin.isBlank()) return null
