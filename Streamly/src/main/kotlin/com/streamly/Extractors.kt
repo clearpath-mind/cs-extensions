@@ -187,9 +187,38 @@ class Luluvdo : StreamWishExtractor() {
     override val mainUrl = "https://luluvdo.com"
 }
 
+/** AnaFast (anafast.cyou and rotations) — plain JWPlayer setup with a
+ * tokenized master m3u8 in `sources: [{file: "..."}]`. No packing, no DRM. */
+class AnaFast : ExtractorApi() {
+    override val name = "AnaFast"
+    override val mainUrl = "https://anafast.cyou"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val text = app.get(url, referer = referer).text
+        val src = Regex("""sources\s*:\s*\[\{\s*file\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
+            .find(text)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""").find(text)?.groupValues?.get(1)
+            ?: return
+        // Tokenized master (?t=&s=&e=): single adaptive link, ExoPlayer
+        // adapts from the playlist itself.
+        callback(
+            newExtractorLink(name, name, url = src) {
+                this.referer = referer ?: mainUrl
+                this.quality = Qualities.Unknown.value
+                this.type = ExtractorLinkType.M3U8
+            }
+        )
+    }
+}
+
 /** Uqload (uqload.is and rotations) */
-class Uqload : ExtractorApi() {
-    override val name = "Uqload"
+class Uqload : ExtractorApi() {    override val name = "Uqload"
     override val mainUrl = "https://uqload.is"
     override val requiresReferer = true
 
@@ -264,6 +293,7 @@ object EmbedRouter {
             val extractorName = when {
                 "vidtube" in host -> "Vidtube"
                 "updown" in host -> "UpDown"
+                "anafast" in host -> "AnaFast"
                 "filelion" in host -> "Filelion"
                 "lulu" in host || "fastvip" in host -> "Luluvdo"
                 "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host -> "Dood"
@@ -276,6 +306,7 @@ object EmbedRouter {
             when {
                 "vidtube" in host -> Vidtube().getUrl(link, referer, subtitleCallback, out)
                 "updown" in host -> UpDown().getUrl(link, referer, subtitleCallback, out)
+                "anafast" in host -> AnaFast().getUrl(link, referer, subtitleCallback, out)
                 "filelion" in host -> Filelion().getUrl(link, referer, subtitleCallback, out)
                 "lulu" in host || "fastvip" in host -> Luluvdo().getUrl(link, referer, subtitleCallback, out)
                 "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host ->

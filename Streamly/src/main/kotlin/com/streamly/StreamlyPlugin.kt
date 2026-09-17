@@ -19,6 +19,7 @@ class StreamlyPlugin : Plugin() {
         registerExtractorAPI(Filelion())
         registerExtractorAPI(Luluvdo())
         registerExtractorAPI(Uqload())
+        registerExtractorAPI(AnaFast())
 
         val sharedPref = context.getSharedPreferences("streamly_prefs", Context.MODE_PRIVATE)
         openSettings = { ctx ->

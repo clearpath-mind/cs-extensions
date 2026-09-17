@@ -2191,3 +2191,249 @@ suspend fun invokeEgyBest(
         emitted > 0
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shoof (shooflive.net) link source.
+//
+// WordPress (Kirmizi "shoof" theme): search is plain WP `?s=<query>` plus
+// /wp-json/wp/v2/search discovery; movie pages embed the player inline via
+// an AlbaPlayer iframe (shooof.site/albaplayer/<slug>); series pages list
+// per-episode posts whose slugs carry explicit season+episode numbers.
+// Each AlbaPlayer page serves 5 servers through `?serv=N` (AnaFast,
+// MP4Plus, VidSpeed, Vk, Voe); every server iframe is routed through
+// EmbedRouter. Final AnaFast pages are plain JWPlayer setups with a
+// tokenized master m3u8 in `sources: [{file: ...}]` (see AnaFast).
+// ---------------------------------------------------------------------------
+
+private const val SHOOF_MAIN_URL = "https://shooflive.net"
+private const val SHOOF_TAG = "Shoof"
+
+/** Shoof mirrors rotate; resolve the live origin once and reuse it. */
+private suspend fun shoofBase(): String = resolveOrigin(SHOOF_MAIN_URL)
+
+suspend fun invokeShoof(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(SHOOF_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "Shoof: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    return try {
+        val ok = if (res.isMovie) {
+            shoofResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            shoofResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(SHOOF_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "Shoof: ok" else "Shoof: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(SHOOF_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "Shoof: ${e.message}"
+        emitted > 0
+    }
+}
+
+private suspend fun shoofSearch(query: String, type: String): List<Candidate> {
+    val direct = shoofSearchOnce(query, type)
+    val api = shoofApiSearch(query, type)
+    val merged = (direct + api).distinctBy { it.url }
+    if (merged.isNotEmpty() || type == "all") return merged
+
+    // Some posts are not indexed under their section; try unfiltered search.
+    val fallback = (shoofSearchOnce(query, "all") + shoofApiSearch(query, "all"))
+        .distinctBy { it.url }
+    Log.d(SHOOF_TAG, "[search ] '$type' empty for '$query', fallback 'all' -> ${fallback.size} cards")
+    return fallback
+}
+
+/** Plain WordPress search: /?s=<query>; post links carry /movies/|/series/|/episode/. */
+private suspend fun shoofSearchOnce(query: String, type: String): List<Candidate> {
+    return withContext(Dispatchers.IO) {
+        try {
+            val want = when (type) {
+                "movies" -> "/movies/"
+                "series" -> "/series/"
+                else -> null
+            }
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val doc = cfGetDoc("${shoofBase()}/?s=$encoded", timeout = 15000)
+            doc.select("a[href]").mapNotNull { a ->
+                val href = a.absUrl("href").ifEmpty { a.attr("href") }
+                if (!href.startsWith("http")) return@mapNotNull null
+                if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) return@mapNotNull null
+                if (want != null && !href.contains(want)) return@mapNotNull null
+                val slug = decodeSlug(href)
+                if (slug.isBlank()) return@mapNotNull null
+                Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            }.filter { it.latinTitle.isNotBlank() }.distinctBy { it.url }
+        } catch (e: Exception) {
+            Log.e(SHOOF_TAG, "[search ] failed: ${e.message}")
+            emptyList()
+        }
+    }
+}
+
+/** WordPress REST discovery: /wp-json/wp/v2/search returns exact post URLs. */
+private suspend fun shoofApiSearch(query: String, type: String): List<Candidate> {
+    val out = ArrayList<Candidate>()
+    val want = when (type) {
+        "movies" -> "/movies/"
+        "series" -> "/series/"
+        else -> null
+    }
+    return try {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val endpoint = "${shoofBase()}/wp-json/wp/v2/search?search=$encoded&per_page=100"
+        val html = cfGetText(endpoint, timeout = 15000)
+        val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
+        if (jsonText.isBlank()) return emptyList()
+        val arr = org.json.JSONArray("[$jsonText]")
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val href = o.optString("url").trim()
+            if (!href.startsWith("http")) continue
+            if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) continue
+            if (want != null && !href.contains(want)) continue
+            val slug = decodeSlug(href)
+            if (slug.isBlank()) continue
+            val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            if (candidate.latinTitle.isBlank()) continue
+            if (out.any { it.url == href }) continue
+            out.add(candidate)
+        }
+        Log.d(SHOOF_TAG, "[api    ] $endpoint -> ${out.size} posts")
+        out
+    } catch (e: Exception) {
+        Log.e(SHOOF_TAG, "[api    ] Shoof WP search failed: ${e.message}")
+        out
+    }
+}
+
+private suspend fun shoofResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = shoofSearch(title, "movies")
+    Log.d(SHOOF_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+
+    val best = candidates.map { it to scoreCandidate(it, title, year) }
+        .maxByOrNull { it.second }
+        ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
+    if (best == null) {
+        Log.d(SHOOF_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(SHOOF_TAG, "[match  ] WINNER ${best.url}")
+    return shoofPostServers(best.url, subtitleCallback, callback)
+}
+
+private suspend fun shoofResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = shoofSearch(title, "series")
+    Log.d(SHOOF_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(SHOOF_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(SHOOF_TAG, "[match  ] anchor ${anchor.url}")
+
+    // Search also surfaces episode posts; only series posts list the season.
+    // A direct episode hit still wins when its slug numbers agree.
+    if ("/series/" !in anchor.url) {
+        val slugSeason = SEASON_DIGIT_REGEX.find(anchor.slug)?.groupValues?.get(1)?.toIntOrNull()
+        val slugEp = EPISODE_REGEX.find(anchor.slug)?.groupValues?.get(1)?.toIntOrNull()
+        if (slugSeason == season && slugEp == episode) {
+            return shoofPostServers(anchor.url, subtitleCallback, callback)
+        }
+        Log.d(SHOOF_TAG, "[match  ] anchor is not the requested episode")
+        return false
+    }
+    val doc = try {
+        cfGetDoc(anchor.url, timeout = 15000)
+    } catch (e: Exception) {
+        Log.e(SHOOF_TAG, "[anchor ] failed: ${e.message}")
+        return false
+    }
+    // Slugs carry explicit season+episode numbers; reuse the shared matcher.
+    val epUrl = exactEpisodeUrl(doc, season, episode)
+    if (epUrl == null) {
+        Log.d(SHOOF_TAG, "[match  ] E$episode not in series episode list")
+        return false
+    }
+    return shoofPostServers(epUrl, subtitleCallback, callback)
+}
+
+/** Movie post or episode post -> inline AlbaPlayer iframe -> all ?serv=N servers. */
+private suspend fun shoofPostServers(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    return try {
+        val text = cfGetText(postUrl, timeout = 15000)
+        val doc = Jsoup.parse(text, postUrl)
+        val alba = doc.select("iframe[src*=albaplayer]")
+            .map { it.absUrl("src").ifEmpty { it.attr("src") } }
+            .firstOrNull { it.startsWith("http") }
+            ?: extractIframeSources(doc, postUrl).firstOrNull { "albaplayer" in it }
+            ?: return false
+        Log.d(SHOOF_TAG, "[watch  ] alba=$alba")
+        shoofAlbaServers(alba, postUrl, subtitleCallback, callback)
+    } catch (e: Exception) {
+        Log.e(SHOOF_TAG, "[watch  ] post failed: ${e.message}")
+        false
+    }
+}
+
+/** One AlbaPlayer page serves 5 servers through `?serv=N`; route every iframe. */
+private suspend fun shoofAlbaServers(
+    albaUrl: String,
+    referer: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    try {
+        val base = albaUrl.substringBefore("?")
+        val seen = LinkedHashSet<String>()
+        // serv=1 is the default inline player; 2..5 need explicit fetch.
+        val pages = listOf(base) + (2..5).map { "$base?serv=$it" }
+        val embeds = pages.map { page ->
+            async {
+                runCatching {
+                    val t = cfGetText(page, referer = referer, timeout = 15000)
+                    Jsoup.parse(t, page).select("iframe[src]")
+                        .map { it.absUrl("src").ifEmpty { it.attr("src") } }
+                        .firstOrNull { it.startsWith("http") }
+                }.getOrNull()
+            }
+        }.awaitAll().filterNotNull().filter { seen.add(it) }
+        Log.d(SHOOF_TAG, "[watch  ] embeds=${embeds.size}/${pages.size}")
+        if (embeds.isEmpty()) return@coroutineScope false
+        embeds.amap { embed ->
+            async { EmbedRouter.route(embed, base, subtitleCallback, callback, "Shoof") }
+        }.awaitAll()
+        true
+    } catch (e: Exception) {
+        Log.e(SHOOF_TAG, "[watch  ] alba failed: ${e.message}")
+        false
+    }
+}

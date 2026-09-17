@@ -28,6 +28,9 @@ object ProvidersList {
             Provider("egybest", "EgyBest") { res, sub, cb ->
                 invokeEgyBest(res, sub, cb)
             },
+            Provider("shoof", "Shoof") { res, sub, cb ->
+                invokeShoof(res, sub, cb)
+            },
         )
     }
 }
