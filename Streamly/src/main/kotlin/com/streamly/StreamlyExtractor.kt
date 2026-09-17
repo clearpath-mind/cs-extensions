@@ -2259,24 +2259,51 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
             val encoded = URLEncoder.encode(query, "UTF-8")
             val fetchUrl = "$base/?s=$encoded"
             val doc = cfGetDoc(fetchUrl, timeout = 20000)
-            val cards = doc.select("ul.posts-list li.movieItem").mapNotNull { li ->
-                val a = li.selectFirst("a[href]") ?: return@mapNotNull null
-                val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") }
-                    ?: return@mapNotNull null
-                if (type == "film" && !href.contains("/film/")) return@mapNotNull null
-                if (type == "series" && !href.contains("/season/") && !href.contains("/serie")) return@mapNotNull null
+            fun typeOk(href: String): Boolean {
+                if (type == "film") return "/film/" in href
+                return "/season/" in href || "/serie" in href
+            }
+            fun fromCard(li: Element): Candidate? {
+                val a = li.selectFirst("a[href]") ?: return null
+                val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") } ?: return null
+                if (!typeOk(href)) return null
                 val titleText = li.selectFirst("h1.BottomTitle")?.text()?.trim()
                     .takeIf { !it.isNullOrBlank() } ?: a.text().trim()
                 val slug = decodeSlug(href)
                 val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
-                if (latin.isBlank()) return@mapNotNull null
-                Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
-            }.distinctBy { it.url }
-            if (cards.isEmpty()) {
-                val body = runCatching { doc.body()?.text().orEmpty() }.getOrDefault("")
-                Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' body='${body.take(200)}'")
+                if (latin.isBlank()) return null
+                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
             }
-            cards
+            fun fromLink(rawHref: String, label: String): Candidate? {
+                val href = fixUrl(rawHref, base)
+                if (!href.startsWith("http") || !typeOk(href)) return null
+                val slug = decodeSlug(href)
+                val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
+                if (latin.isBlank()) return null
+                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label))
+            }
+            val primary = doc.select("ul.posts-list li.movieItem").mapNotNull { fromCard(it) }.distinctBy { it.url }
+            if (primary.isNotEmpty()) return@withContext primary
+            // Mirror drift: cards rendered outside ul.posts-list on .live mirrors.
+            val anyItem = doc.select("li.movieItem").mapNotNull { fromCard(it) }.distinctBy { it.url }
+            if (anyItem.isNotEmpty()) {
+                Log.d(EGDEAD_TAG, "[search ] fallback li.movieItem -> ${anyItem.size} candidates")
+                return@withContext anyItem
+            }
+            // Last resort: harvest result links directly (card markup unknown).
+            val harvested = doc.select("a[href]").mapNotNull { a ->
+                fromLink(a.attr("href"), a.text().trim())
+            }.distinctBy { it.url }
+            if (harvested.isNotEmpty()) {
+                Log.d(EGDEAD_TAG, "[search ] fallback link-harvest -> ${harvested.size} candidates")
+                return@withContext harvested
+            }
+            // Structural dump so the next miss is classifiable from logcat.
+            val body = runCatching { doc.body()?.text().orEmpty() }.getOrDefault("")
+            val uls = doc.select("ul[class]").map { it.attr("class") }.distinct().take(10)
+            val filmLinks = doc.select("a[href*=/film/]").map { it.attr("href") }.take(3)
+            Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' movieItem=${doc.select("li.movieItem").size} uls=$uls filmLinks=$filmLinks body='${body.take(200)}'")
+            emptyList<Candidate>()
         } catch (e: Exception) {
             Log.e(EGDEAD_TAG, "[search ] failed: ${e.message}")
             emptyList()
