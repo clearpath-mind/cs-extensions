@@ -1232,7 +1232,12 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
         try {
             val base = mycimaBase()
             val encoded = URLEncoder.encode(query, "UTF-8")
-            val doc = cfGetDoc("$base/filtering/?keywords=$encoded", timeout = 15000)
+            val doc = cfGetDoc(
+                "$base/filtering/?keywords=$encoded",
+                referer = base,
+                headers = mapOf("Accept-Language" to "ar,en-US;q=0.9,en;q=0.8"),
+                timeout = 15000,
+            )
             val cards = doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) }
                 .distinctBy { it.url }
             if (cards.isEmpty()) {
@@ -1257,7 +1262,10 @@ private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
                     cfPostText(
                         "$base/filtering/",
                         data = mapOf(param to query),
-                        headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                        headers = mapOf(
+                            "X-Requested-With" to "XMLHttpRequest",
+                            "Accept-Language" to "ar,en-US;q=0.9,en;q=0.8",
+                        ),
                         referer = base,
                         timeout = 15000,
                     )
@@ -2899,6 +2907,9 @@ private suspend fun egDeadWatchServers(
                 if (link.contains("hgcloud", ignoreCase = true)) {
                     // StreamHG renders its player in JS (static fetch only sees
                     // a loader shell), so sniff the stream via the WebView.
+                    // Clear any Cloudflare wall first so the loader can run.
+                    val solved = cfSolve(link)
+                    Log.d(EGDEAD_TAG, "[watch  ] hgcloud cf clearance=${solved != null}")
                     val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true)
                     if (!hit.isNullOrBlank()) {
                         if (hit.substringBefore("?").endsWith(".mp4", ignoreCase = true)) {
