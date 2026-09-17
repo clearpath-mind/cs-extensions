@@ -112,7 +112,7 @@ fun extractIframeSources(doc: Document, base: String): List<String> {
 }
 
 @SuppressLint("SetJavaScriptEnabled")
-suspend fun faselHdResolveWebView(iframeUrl: String, referer: String): String? =
+suspend fun faselHdResolveWebView(iframeUrl: String, referer: String, sniffMp4: Boolean = false): String? =
     suspendCancellableCoroutine { cont ->
         val activity = StreamlyRuntime.context as? Activity
         if (activity == null || activity.isFinishing) {
@@ -161,6 +161,7 @@ suspend fun faselHdResolveWebView(iframeUrl: String, referer: String): String? =
                 .build()
             val mainUrlForHeader = FASELHD_MAIN_URL
             val foundM3u8 = LinkedHashSet<String>()
+            val foundMp4 = LinkedHashSet<String>()
             var finished = false
             val finishLock = Any()
             val handler = Handler(Looper.getMainLooper())
@@ -185,13 +186,23 @@ suspend fun faselHdResolveWebView(iframeUrl: String, referer: String): String? =
                 cleanup()
             }
             fun chooseAndFinish() {
-                if (foundM3u8.isEmpty()) { safeFinish(null); return }
+                if (foundM3u8.isEmpty() && (!sniffMp4 || foundMp4.isEmpty())) { safeFinish(null); return }
                 val strict = foundM3u8.firstOrNull { val c = it.substringBefore("?"); c.endsWith(".m3u8") && (c.contains("master") || c.contains("playlist") || c.contains("index")) } ?: foundM3u8.firstOrNull { it.substringBefore("?").endsWith(".m3u8") }
-                safeFinish(strict ?: foundM3u8.first())
+                safeFinish(strict ?: foundM3u8.firstOrNull() ?: foundMp4.first())
             }
             fun handleFoundLink(url: String) {
                 val clean = url.substringBefore("?")
-                if (!clean.endsWith(".m3u8")) return
+                if (!clean.endsWith(".m3u8")) {
+                    // Optional mp4 fallback (hgcloud serves progressive files).
+                    if (sniffMp4 && clean.endsWith(".mp4")) {
+                        synchronized(foundMp4) {
+                            if (foundMp4.add(url) && finishRunnable == null) {
+                                finishRunnable = Runnable { chooseAndFinish() }; handler.postDelayed(finishRunnable!!, 4000)
+                            }
+                        }
+                    }
+                    return
+                }
                 synchronized(foundM3u8) {
                     if (!foundM3u8.contains(url)) {
                         foundM3u8.add(url)
@@ -208,7 +219,8 @@ suspend fun faselHdResolveWebView(iframeUrl: String, referer: String): String? =
                 attemptTimeoutRunnable?.let { handler.removeCallbacks(it) }
                 attemptTimeoutRunnable = Runnable {
                     synchronized(foundM3u8) {
-                        if (foundM3u8.isEmpty()) { currentAttempt++; startNextAttempt() } else chooseAndFinish()
+                        val empty = foundM3u8.isEmpty() && (!sniffMp4 || foundMp4.isEmpty())
+                        if (empty) { currentAttempt++; startNextAttempt() } else chooseAndFinish()
                     }
                 }
                 handler.postDelayed(attemptTimeoutRunnable!!, attemptTimeoutMs)
@@ -265,6 +277,9 @@ suspend fun faselHdResolveWebView(iframeUrl: String, referer: String): String? =
                             val contentType = response.header("content-type")?.split(";")?.first() ?: "application/vnd.apple.mpegurl"
                             return WebResourceResponse(contentType, "utf-8", response.body?.byteStream())
                         } catch (_: Exception) { return null }
+                    }
+                    if (sniffMp4 && method.equals("GET", ignoreCase = true) && lower.substringBefore("?").endsWith(".mp4")) {
+                        handleFoundLink(url)
                     }
                     if (method.equals("GET", ignoreCase = true) && (lower.contains("fasel") || lower.contains("jwplayer") || lower.contains("config") || lower.contains("player"))) {
                         try {
@@ -1231,28 +1246,48 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
         }
     }
 
-/** Theme live-filter via POST (the GET keywords page renders an empty shell). */
+/** Theme live-filter via POST (the GET keywords page renders an empty shell).
+ *  Tries several param names; logs per-param counts to find the live one. */
 private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
     withContext(Dispatchers.IO) {
         try {
             val base = mycimaBase()
-            val html = cfPostText(
-                "$base/filtering/",
-                data = mapOf("keywords" to query),
-                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-                referer = base,
-                timeout = 15000,
-            )
-            if (html.isBlank()) return@withContext emptyList<Candidate>()
-            val doc = Jsoup.parse(html, base)
-            doc.select("div#MainFiltar div.GridItem").ifEmpty { doc.select("div.GridItem") }
-                .mapNotNull { mycimaFromGridItem(it, base) }
-                .distinctBy { it.url }
+            for (param in listOf("keywords", "s", "keyword", "search", "q", "query")) {
+                val html = runCatching {
+                    cfPostText(
+                        "$base/filtering/",
+                        data = mapOf(param to query),
+                        headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                        referer = base,
+                        timeout = 15000,
+                    )
+                }.getOrNull()
+                if (html.isNullOrBlank()) continue
+                val doc = Jsoup.parse(html, base)
+                val cards = doc.select("div#MainFiltar div.GridItem").ifEmpty { doc.select("div.GridItem") }
+                    .mapNotNull { mycimaFromGridItem(it, base) }
+                    .distinctBy { it.url }
+                val first = cards.firstOrNull()?.latinTitle
+                Log.d(MYCIMA_TAG, "[search ] filter POST param=$param -> ${cards.size} first='$first'")
+                if (cards.isNotEmpty()) return@withContext cards
+            }
+            emptyList()
         } catch (e: Exception) {
             Log.e(MYCIMA_TAG, "[search ] filter POST failed: ${e.message}")
             emptyList()
         }
     }
+
+/** Token gate: every significant query token must appear in the candidate's
+ *  Latin slug. Skipped for Arabic-only slugs (nothing to judge). Prevents
+ *  wrong-show anchors when the site returns unfiltered latest items. */
+private fun mycimaPassesGate(c: Candidate, title: String): Boolean {
+    if (!c.latinTitle.any { it in 'a'..'z' || it in 'A'..'Z' }) return true
+    val qtokens = title.lowercase().replace('-', ' ').split(Regex("\\s+")).filter { it.length > 2 }
+    if (qtokens.isEmpty()) return true
+    val ctokens = c.latinTitle.lowercase().replace('-', ' ').split(Regex("\\s+")).toSet()
+    return qtokens.all { q -> ctokens.any { t -> t.contains(q) || q.contains(t) } }
+}
 
 /** Section/archive slugs that are never posts (nav harvest must skip them). */
 private val MYCIMA_SKIP_SLUGS = setOf(
@@ -1370,7 +1405,7 @@ private suspend fun mycimaResolveMovie(
     scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
         Log.d(MYCIMA_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
     }
-    val best = scored.filter { it.second >= MIN_SCORE_MOVIE }
+    val best = scored.filter { it.second >= MIN_SCORE_MOVIE && mycimaPassesGate(it.first, title) }
         .maxByOrNull { it.second }?.first
     if (best == null) {
         Log.d(MYCIMA_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
@@ -1429,7 +1464,7 @@ private suspend fun mycimaResolveEpisode(
     scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
         Log.d(MYCIMA_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
     }
-    val anchor = scored.filter { it.second >= MIN_SCORE_SERIES }
+    val anchor = scored.filter { it.second >= MIN_SCORE_SERIES && mycimaPassesGate(it.first, title) }
         .maxByOrNull { it.second }?.first
     if (anchor == null) {
         Log.d(MYCIMA_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
@@ -2864,11 +2899,21 @@ private suspend fun egDeadWatchServers(
                 if (link.contains("hgcloud", ignoreCase = true)) {
                     // StreamHG renders its player in JS (static fetch only sees
                     // a loader shell), so sniff the stream via the WebView.
-                    val m3u8 = faselHdResolveWebView(link, watchUrl)
-                    if (!m3u8.isNullOrBlank()) {
-                        faselHdEmitResolved(m3u8, link, getBaseUrl(link), counting, providerLabel)
+                    val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true)
+                    if (!hit.isNullOrBlank()) {
+                        if (hit.substringBefore("?").endsWith(".mp4", ignoreCase = true)) {
+                            counting(
+                                newExtractorLink(providerLabel, providerLabel, url = hit) {
+                                    this.referer = link
+                                    this.quality = getQualityFromName(hit)
+                                    this.type = ExtractorLinkType.VIDEO
+                                },
+                            )
+                        } else {
+                            faselHdEmitResolved(hit, link, getBaseUrl(link), counting, providerLabel)
+                        }
                     }
-                    Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n webview=${!m3u8.isNullOrBlank()}")
+                    Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n webview=${!hit.isNullOrBlank()}")
                     return@async
                 }
                 if (link.contains("megamax.me", ignoreCase = true)) {
