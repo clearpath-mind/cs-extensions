@@ -22,7 +22,7 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
         "status": 1,
-        "version": 43,
+        "version": 44,
         "name": "YacineTV",
         "internalName": "YacineTV",
         "authors": [
@@ -37,6 +37,6 @@
         ],
         "iconUrl": "https://yt3.googleusercontent.com/ulm35tweg3do5istps0TgCjMmJSVczGUL2NIrXMwI1DDRi5ty29BIzQSUHVgqZN5CSo1PHhiA6M=s900-c-k-c0x00ffffff-no-rj",
         "apiVersion": 1,
-        "fileHash": "sha256-a4113e83b31d4b91b781f5e4129ec98de8f5db5880628002fc573b2fdb5e5df3"
+        "fileHash": "sha256-2551f0d235db57e792325d8384b848bb5add611861fe113e77a41268bf5edde5"
     }
 ]
