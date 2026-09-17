@@ -2484,17 +2484,16 @@ private suspend fun egDeadResolveMovie(
         Log.d(EGDEAD_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
         return false
     }
-    // Prefer the Arabic-dubbed post when one clears the threshold.
-    val best = above.filter { it.first.isDub }.maxByOrNull { it.second }
-        ?.also { Log.d(EGDEAD_TAG, "[match  ] dubbed version available, preferring it") }
-        ?: above.maxByOrNull { it.second }
-    val winner = best?.first
-    if (winner == null) {
-        Log.d(EGDEAD_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
-        return false
+    // Include every top qualifying post (cap 3): subtitled + dubbed
+    // versions resolve side by side, tagged "EgyDead" / "EgyDead Dub".
+    val winners = above.sortedByDescending { it.second }.take(3).map { it.first }
+    var ok = false
+    winners.forEachIndexed { i, post ->
+        Log.d(EGDEAD_TAG, "[match  ] WINNER ${i + 1}/${winners.size} ${post.url} dub=${post.isDub}")
+        val label = if (post.isDub) "EgyDead Dub" else "EgyDead"
+        ok = egDeadWatchServers(post.url, subtitleCallback, callback, label) || ok
     }
-    Log.d(EGDEAD_TAG, "[match  ] WINNER ${winner.url} dub=${winner.isDub}")
-    return egDeadWatchServers(winner.url, subtitleCallback, callback)
+    return ok
 }
 
 private suspend fun egDeadResolveEpisode(
@@ -2575,6 +2574,7 @@ private suspend fun egDeadWatchServers(
     postUrl: String,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
+    providerLabel: String = "EgyDead",
 ): Boolean = coroutineScope {
     try {
         val watchUrl = postUrl.trimEnd('/') + "?view=watch"
@@ -2660,7 +2660,7 @@ private suspend fun egDeadWatchServers(
                 var n = 0
                 val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
                 if (link.contains("megamax.me", ignoreCase = true)) {
-                    val ok = MegaMaxExtractor.extract(link, watchUrl, subtitleCallback, counting, "EgyDead")
+                    val ok = MegaMaxExtractor.extract(link, watchUrl, subtitleCallback, counting, providerLabel)
                     Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n megamax=$ok")
                     return@async
                 }
@@ -2674,7 +2674,7 @@ private suspend fun egDeadWatchServers(
                     }.getOrNull()
                     if (!custom.isNullOrBlank()) {
                         counting(
-                            newExtractorLink("EgyDead", "$name (Custom)", url = custom) {
+                            newExtractorLink(providerLabel, "$name (Custom)", url = custom) {
                                 this.referer = egDeadBase()
                                 this.quality = Qualities.Unknown.value
                                 this.type = ExtractorLinkType.M3U8
@@ -2682,7 +2682,7 @@ private suspend fun egDeadWatchServers(
                         )
                     }
                 }
-                EmbedRouter.route(link, watchUrl, subtitleCallback, counting, "EgyDead")
+                EmbedRouter.route(link, watchUrl, subtitleCallback, counting, providerLabel)
                 Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n")
             }
         }.awaitAll()
