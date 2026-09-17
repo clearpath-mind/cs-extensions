@@ -462,25 +462,10 @@ class YacineTvProvider : MainAPI() {
                 // Cricify-style: no cache, every card fetches fresh.
                 val arts = events.map { e ->
                     async {
+                        // No team-logo fallback: cards show the TheSportsDB
+                        // banner or render empty (null poster).
                         val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
-                        // Badge fallback follows the displayed (home-first) order.
-                        val firstBadge = art.orderedTitle?.let { ordered ->
-                            val t1a = teamAlias(e.team1?.id)
-                            val t2a = teamAlias(e.team2?.id)
-                            when {
-                                t1a != null && ordered.startsWith("$t1a vs") -> t1a to t2a
-                                t2a != null && ordered.startsWith("$t2a vs") -> t2a to t1a
-                                else -> t1a to t2a
-                            }
-                        } ?: (teamAlias(e.team1?.id) to teamAlias(e.team2?.id))
-                        val poster = art.thumb
-                            ?: withTimeoutOrNull(8_000) {
-                                firstBadge.first?.let { teamBadge(it) }
-                                    ?: firstBadge.second?.let { teamBadge(it) }
-                            }
-                            ?: e.team1?.logo?.takeIf { it.isNotBlank() }
-                            ?: e.team2?.logo?.takeIf { it.isNotBlank() }
-                        art to poster
+                        art to art.thumb
                     }
                 }.awaitAll()
                 val matchLinks = events.zip(arts).mapNotNull { (e, artAndPoster) ->
@@ -492,23 +477,14 @@ class YacineTvProvider : MainAPI() {
                     // title adds live minute + score inline (option a).
                     val matchup = art.orderedTitle ?: eventBaseTitle(e)
                     val displayName = eventDisplayName(e, nowSec, art)
-                    // TheSportsDB banner, else 500px team badge, else API
-                    // team logos. Detail page shows both (poster + background).
-                    // poster2 is the second team's logo in displayed order.
-                    val t1Logo = e.team1?.logo?.takeIf { it.isNotBlank() }
-                    val t2Logo = e.team2?.logo?.takeIf { it.isNotBlank() }
-                    val flipped = art.orderedTitle?.let { ordered ->
-                        val t1a = teamAlias(e.team1?.id)
-                        val t2a = teamAlias(e.team2?.id)
-                        t1a != null && t2a != null && ordered == "$t2a vs $t1a"
-                    } == true
-                    val poster2 = if (flipped) t1Logo ?: t2Logo else t2Logo ?: t1Logo
+                    // TheSportsDB banner or empty (no team-logo fallback);
+                    // poster2 stays null so detail shows banner or empty.
                     LinkData(
                         kind = "event",
                         id = id,
                         name = displayName,
                         poster = poster,
-                        poster2 = poster2,
+                        poster2 = null,
                         channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                         competition = competitionEnglish(league, e.champions),
                         commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
@@ -676,8 +652,8 @@ class YacineTvProvider : MainAPI() {
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
      * (free key). Cricify-style: no cache — every build fetches fresh
      * (Cache-Control: no-cache), same request also carrying the home-first
-     * title and live state. Null art falls back to API team logos
-     * (thumb) / Arabic champions (league).
+     * title and live state. No banner renders empty (null poster, no
+     * team-logo fallback); league falls back to Arabic champions.
      * orderedTitle is the home-first "A vs B" from TheSportsDB
      * (strHomeTeam/strAwayTeam, else strEvent order): Yacine team_1/team_2
      * is not reliably home-first (e.g. 2026-09-16 Everton-Wolves and
@@ -1015,21 +991,14 @@ class YacineTvProvider : MainAPI() {
                 val matchup = art?.orderedTitle ?: eventBaseTitle(e)
                 val displayName = eventDisplayName(e, nowSec, art)
                 val id = e.id ?: return@forEach
-                val t1Logo = e.team1?.logo?.takeIf { it.isNotBlank() }
-                val t2Logo = e.team2?.logo?.takeIf { it.isNotBlank() }
-                val flipped = art?.orderedTitle?.let { ordered ->
-                    val t1a = teamAlias(e.team1?.id)
-                    val t2a = teamAlias(e.team2?.id)
-                    t1a != null && t2a != null && ordered == "$t2a vs $t1a"
-                } == true
-                val poster = if (flipped) t2Logo ?: t1Logo else t1Logo ?: t2Logo
-                val poster2 = if (flipped) t1Logo ?: t2Logo else t2Logo ?: t1Logo
+                // TheSportsDB banner or empty (no team-logo fallback).
+                val poster = art?.thumb
                 val data = LinkData(
                     kind = "event",
                     id = id,
                     name = displayName,
                     poster = poster,
-                    poster2 = poster2,
+                    poster2 = null,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                     competition = competitionEnglish(art?.league, e.champions),
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
