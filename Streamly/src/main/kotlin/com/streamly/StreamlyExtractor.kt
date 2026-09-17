@@ -463,6 +463,8 @@ private data class Candidate(
     val latinTitle: String,
     val year: Int?,
     val isDub: Boolean = false,
+    /** Series signal from card/URL (mycima): true/false when known, null when unknown. */
+    val isSeries: Boolean? = null,
 )
 
 private val EPISODE_REGEX = Regex("""الحلقة[-\s]*(\d+)""")
@@ -1201,7 +1203,12 @@ private fun mycimaFromGridItem(el: Element, base: String): Candidate? {
     val slug = decodeSlug(href)
     val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
     if (latin.isBlank()) return null
-    return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
+    val series = el.selectFirst("div.Episode--number") != null || href.contains("/series/")
+    val movie = href.contains("/movies/")
+    return Candidate(
+        href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText),
+        isSeries = if (series) true else if (movie) false else null,
+    )
 }
 
 /** Theme live-filter: /filtering/?keywords=<query> -> div#MainFiltar cards. */
@@ -1228,8 +1235,22 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
 private val MYCIMA_SKIP_SLUGS = setOf(
     "movies", "movie", "series", "seriestv", "tv", "episodes", "episode",
     "seasons", "season", "categories", "category", "tags", "tag",
-    "actors", "actor", "home", "main", "filtering",
+    "actors", "actor", "home", "main", "filtering", "watch", "download",
+    "login", "register", "contact", "dmca", "privacy", "sitemap", "feed",
+    "comments", "author", "page", "search", "go", "govid",
 )
+
+/** Single-segment same-host post URLs (mycima slugs carry no /series/ prefix). */
+private fun mycimaIsPostUrl(href: String, base: String): Boolean = runCatching {
+    val u = URI(href)
+    val b = URI(base)
+    if (!u.host.equals(b.host, ignoreCase = true)) return false
+    val seg = u.path.trim('/').split('/')
+    seg.size == 1 && seg[0].isNotEmpty() && seg[0].lowercase() !in MYCIMA_SKIP_SLUGS
+}.getOrDefault(false)
+
+private fun mycimaLooksSeries(href: String): Boolean =
+    href.contains("/series/") || href.contains("/episode/")
 
 /** Plain WordPress search: /?s=<query>; posts carry /movies/|/series/|/episode/. */
 private suspend fun mycimaWpSearch(query: String): List<Candidate> =
@@ -1238,18 +1259,24 @@ private suspend fun mycimaWpSearch(query: String): List<Candidate> =
             val base = mycimaBase()
             val encoded = URLEncoder.encode(query, "UTF-8")
             val doc = cfGetDoc("$base/?s=$encoded", timeout = 15000)
-            doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) } +
-                doc.select("a[href]").mapNotNull { a ->
+            val cards = doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) }
+            val links = doc.select("a[href]").mapNotNull { a ->
                     val href = fixUrl(a.attr("href"), base)
                     if (!href.startsWith("http")) return@mapNotNull null
-                    if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) return@mapNotNull null
+                    val seriesHit = mycimaLooksSeries(href)
+                    if (!seriesHit && !href.contains("/movies/") && !mycimaIsPostUrl(href, base)) return@mapNotNull null
                     val slug = decodeSlug(href)
                     if (slug.isBlank() || slug.lowercase() in MYCIMA_SKIP_SLUGS) return@mapNotNull null
                     val label = a.text().trim()
                     val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
                     if (latin.isBlank()) return@mapNotNull null
-                    Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label))
+                    Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label), isSeries = if (seriesHit) true else null)
                 }.distinctBy { it.url }
+            val out = (cards + links).distinctBy { it.url }
+            if (out.isEmpty()) {
+                Log.d(MYCIMA_TAG, "[search ] ?s= 0 results title='${doc.title()}' links=${doc.select("a[href]").size}")
+            }
+            out
         } catch (e: Exception) {
             Log.e(MYCIMA_TAG, "[search ] ?s= failed: ${e.message}")
             emptyList()
@@ -1271,10 +1298,14 @@ private suspend fun mycimaApiSearch(query: String): List<Candidate> {
             val o = arr.optJSONObject(i) ?: continue
             val href = o.optString("url").trim()
             if (!href.startsWith("http")) continue
-            if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) continue
+            val seriesHit = mycimaLooksSeries(href)
+            if (!seriesHit && !href.contains("/movies/") && !mycimaIsPostUrl(href, base)) continue
             val slug = decodeSlug(href)
             if (slug.isBlank() || slug.lowercase() in MYCIMA_SKIP_SLUGS) continue
-            val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            val candidate = Candidate(
+                href, slug, latinTitleFromSlug(slug), yearFromSlug(slug),
+                isSeries = if (seriesHit) true else if (href.contains("/movies/")) false else null,
+            )
             if (candidate.latinTitle.isBlank()) continue
             if (out.any { it.url == href }) continue
             out.add(candidate)
@@ -1304,7 +1335,9 @@ private suspend fun mycimaResolveMovie(
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
     val candidates = mycimaSearch(title)
-    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    // Prefer non-series posts; fall back to the full pool when unknown.
+    val pool = candidates.filter { it.isSeries != true }.ifEmpty { candidates }
+    val scored = pool.map { it to scoreCandidate(it, title, year) }
     scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
         Log.d(MYCIMA_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
     }
@@ -1361,7 +1394,9 @@ private suspend fun mycimaResolveEpisode(
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
     val candidates = mycimaSearch(title)
-    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    // Prefer series posts; fall back to the full pool when unknown.
+    val pool = candidates.filter { it.isSeries != false }.ifEmpty { candidates }
+    val scored = pool.map { it to scoreCandidate(it, title, year) }
     scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
         Log.d(MYCIMA_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
     }
