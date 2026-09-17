@@ -25,7 +25,7 @@ private const val READINESS_JS =
     """(function(){try{
         var html = document.documentElement.innerHTML || "";
         var t = document.body ? document.body.innerText : "";
-        var ch = /just a moment|checking your browser|verify you are human|performing security verification/i.test(html);
+        var ch = /just a moment|checking your browser|verify you are human|verifying you are human|i'm not a robot|performing security verification|challenge-platform|cf-chl|turnstile/i.test(html);
         return document.readyState + "|" + t.length + "|" + ch + "|" + location.href;
     }catch(e){ return "loading|0|true|"; }})();"""
 
@@ -225,6 +225,43 @@ object CloudflareSolver {
                 val targetCssPath = "html > body > div:nth-of-type(1) > div > div:nth-of-type(2) > div"
 
                 fun startPolling() {
+                    // Managed ("I'm not a robot") checkbox lives in a cross-origin
+                    // CF iframe — unreachable from JS inside, but the iframe
+                    // element itself exposes a rect we can tap (box at its left).
+                    val jsChallengeCoords = """
+                        (function(){
+                            try{
+                                var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                                if(!f) return "NO_BOX";
+                                var r = f.getBoundingClientRect();
+                                if(r.width === 0 && r.height === 0) return "NO_BOX";
+                                var y = r.top + (r.height / 2);
+                                var lx = r.left + 28;
+                                var cx = r.left + (r.width / 2);
+                                return lx + "," + y + "|" + cx + "," + y;
+                            }catch(e){ return "ERROR"; }
+                        })();
+                    """.trimIndent()
+                    var lastTapLogAt = 0L
+                    fun tapPair(clean: String) {
+                        isProcessingClick = true
+                        if (SystemClock.uptimeMillis() - lastTapLogAt > 10000) {
+                            lastTapLogAt = SystemClock.uptimeMillis()
+                            Log.d(TAG, "tap $clean")
+                        }
+                        try {
+                            val sides = clean.split("|")
+                            val (rx, ry) = sides[0].split(",").map { it.toFloatOrNull() }
+                            val (lx, ly) = sides[1].split(",").map { it.toFloatOrNull() }
+                            if (rx != null && ry != null && lx != null && ly != null) {
+                                simulateRealTouch(webView, rx, ry)
+                                pollingHandler.postDelayed({
+                                    simulateRealTouch(webView, lx, ly)
+                                    pollingHandler.postDelayed({ isProcessingClick = false }, 3000)
+                                }, 250)
+                            } else { isProcessingClick = false }
+                        } catch (e: Exception) { isProcessingClick = false }
+                    }
                     val runnable = object : Runnable {
                         override fun run() {
                             if (isSolved || isProcessingClick) {
@@ -249,23 +286,20 @@ object CloudflareSolver {
                                 })();
                             """.trimIndent()
 
-                            webView.evaluateJavascript(jsGetCoords) { res ->
+                            webView.evaluateJavascript(jsChallengeCoords) { res ->
                                 try {
                                     val clean = res?.removeSurrounding("\"")
                                     if (clean != null && clean.contains("|")) {
-                                        isProcessingClick = true
-                                        val sides = clean.split("|")
-                                        val (rx, ry) = sides[0].split(",").map { it.toFloatOrNull() }
-                                        val (lx, ly) = sides[1].split(",").map { it.toFloatOrNull() }
-                                        if (rx != null && ry != null && lx != null && ly != null) {
-                                            simulateRealTouch(webView, rx, ry)
-                                            pollingHandler.postDelayed({
-                                                simulateRealTouch(webView, lx, ly)
-                                                pollingHandler.postDelayed({ isProcessingClick = false }, 3000)
-                                            }, 250)
-                                        } else { isProcessingClick = false }
+                                        tapPair(clean)
+                                    } else {
+                                        webView.evaluateJavascript(jsGetCoords) { res2 ->
+                                            try {
+                                                val clean2 = res2?.removeSurrounding("\"")
+                                                if (clean2 != null && clean2.contains("|")) tapPair(clean2)
+                                            } catch (e: Exception) { }
+                                        }
                                     }
-                                } catch (e: Exception) { isProcessingClick = false }
+                                } catch (e: Exception) { }
                             }
                             pollingHandler.postDelayed(this, 2000)
                         }
