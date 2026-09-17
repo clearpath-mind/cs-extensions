@@ -589,10 +589,23 @@ private fun cfHeaders(
     extra: Map<String, String>,
 ): MutableMap<String, String> = extra.toMutableMap().apply {
     putIfAbsent("User-Agent", CF_UA)
+    // Full browser header set (re-3arabi MyCima pattern): Cloudflare bot
+    // score penalizes missing Accept/Accept-Language, so a bare OkHttp
+    // retry keeps failing the challenge even with a valid cf_clearance
+    // while the WebView (which sends these) passes.
+    putIfAbsent("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    putIfAbsent("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+    putIfAbsent("Upgrade-Insecure-Requests", "1")
+    putIfAbsent("Cache-Control", "no-cache")
+    putIfAbsent("Pragma", "no-cache")
     val c = cfCookies(url)
     if (c.isNotBlank()) putIfAbsent("Cookie", c)
     if (referer != null) put("Referer", referer)
 }
+
+/** Post-solve retries get a longer window (re-3arabi uses 30s): the origin
+ *  is slower to answer once challenged than on a clean fetch. */
+private fun cfRetryTimeout(timeout: Long): Long = maxOf(timeout, 30000)
 
 /** Use the solver's rendered DOM when it solved this exact page (avoids a
  *  redundant OkHttp round-trip whose bridged clearance CF may reject). */
@@ -673,7 +686,7 @@ private suspend fun cfGetDoc(
     }
     val ck = cfCookies(retryUrl)
     val second = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true)
     }.getOrNull()
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
     return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
@@ -710,7 +723,7 @@ private suspend fun cfGetText(
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true)
     }.getOrNull()
     val second: String? = secondResp?.text
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
@@ -740,7 +753,7 @@ private suspend fun cfPostText(
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = timeout)
+        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = cfRetryTimeout(timeout))
     }.getOrNull()
     val retry: String? = secondResp?.text
     Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
