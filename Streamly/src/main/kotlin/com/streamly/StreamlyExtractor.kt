@@ -2213,8 +2213,11 @@ private suspend fun shoofResolveEpisode(
 ): Boolean {
     val candidates = shoofSearch(title, "series")
     Log.d(SHOOF_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
-    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
-        .filter { it.second >= MIN_SCORE_SERIES }
+    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
+        Log.d(SHOOF_TAG, "[match  ] score=$s latin='${c.latinTitle}' url=${c.url}")
+    }
+    val anchor = scored.filter { it.second >= MIN_SCORE_SERIES }
         .maxByOrNull { it.second }?.first
     if (anchor == null) {
         Log.d(SHOOF_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
@@ -2331,15 +2334,38 @@ private fun egDeadIsDub(slug: String, text: String): Boolean {
     if (slug.trimEnd('/').endsWith("-ar", ignoreCase = true)) return true
     return false
 }
-/** Arabic-aware season/episode numbers (SxxExx, xN, حلقة/الموسم). */
+/** Arabic-aware season/episode numbers (SxxExx, xN, حلقة/الموسم).
+ *  Season hrefs use bare موسم-10 (no ال); hub card titles spell S1-S9 out
+ *  (الموسم الاول..التاسع), so ordinals are mapped explicitly. */
 private val EGDEAD_SEASON_REGEX =
-    Regex("""(?ix)(?:الموسم[\s:\-_.]*0*(\d+))|(?:S(?:eason)?[\s:\-_.]*0*(\d+))""")
+    Regex("""(?ix)(?:(?:ال)?موسم[\s:\-_.]*0*(\d+))|(?:S(?:eason)?[\s:\-_.]*0*(\d+))""")
+private val EGDEAD_SEASON_WORDS = mapOf(
+    "الاول" to 1, "الأول" to 1, "الاولى" to 1, "الأولى" to 1,
+    "الثاني" to 2, "الثانى" to 2, "الثانية" to 2, "الثانيه" to 2,
+    "الثالث" to 3, "الثالثة" to 3, "الثالثه" to 3,
+    "الرابع" to 4, "الرابعة" to 4, "الرابعه" to 4,
+    "الخامس" to 5, "الخامسة" to 5, "الخامسه" to 5,
+    "السادس" to 6, "السادسة" to 6, "السادسه" to 6,
+    "السابع" to 7, "السابعة" to 7, "السابعه" to 7,
+    "الثامن" to 8, "الثامنة" to 8, "الثامنه" to 8,
+    "التاسع" to 9, "التاسعة" to 9, "التاسعه" to 9,
+    "العاشر" to 10, "العاشرة" to 10, "العاشره" to 10,
+)
 private val EGDEAD_EPISODE_REGEX =
     Regex("""(?ix)(?:حلقة[\s:\-_.]*0*(\d+))|(?:Episode[\s:\-_.]*0*(\d+))|(?:EP[\s:\-_.]*0*(\d+))|(?:\d+[xX]0*(\d+))|(?:S(?:eason)?[\s:\-_.]*\d+[\s\-_.,]*E(?:p(?:isode)?)?[\s:\-_.]*0*(\d+))""")
 
 private fun egDeadNum(re: Regex, s: String?): Int? {
     if (s.isNullOrBlank()) return null
     return re.find(s)?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }?.toIntOrNull()
+}
+
+/** Season number from decoded slug + card text: digits first, then Arabic
+ *  ordinals (الموسم الاول has no digit to match). */
+private fun egDeadSeasonNum(href: String, text: String): Int? {
+    val decoded = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
+    egDeadNum(EGDEAD_SEASON_REGEX, "$decoded $text")?.let { return it }
+    val combined = "$decoded $text"
+    return EGDEAD_SEASON_WORDS.entries.firstOrNull { (w, _) -> combined.contains(w) }?.value
 }
 
 suspend fun invokeEgyDead(
@@ -2535,12 +2561,14 @@ private suspend fun egDeadResolveEpisode(
             return false
         }
         val seasonsCont = hub.selectFirst("div.seasons-list") ?: hub.selectFirst("div.seasons")
-        val link = seasonsCont?.select("a[href]")?.mapNotNull { a ->
+        val seasonLinks = seasonsCont?.select("a[href]").orEmpty()
+        Log.d(EGDEAD_TAG, "[season ] ${seasonLinks.size} season links on hub")
+        val link = seasonLinks.mapNotNull { a ->
             val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") }
                 ?: return@mapNotNull null
             if ("/season/" !in href) return@mapNotNull null
-            href to (egDeadNum(EGDEAD_SEASON_REGEX, href + " " + a.text()) ?: 9999)
-        }?.firstOrNull { it.second == season }?.first
+            href to (egDeadSeasonNum(href, a.text()) ?: 9999)
+        }.firstOrNull { it.second == season }?.first
         if (link == null) {
             Log.d(EGDEAD_TAG, "[match  ] S$season not in seasons list")
             return false
@@ -2560,7 +2588,8 @@ private suspend fun egDeadResolveEpisode(
             ?: return@mapNotNull null
         if ("/season/" in href || "/film/" in href) return@mapNotNull null
         val label = (a.attr("title").takeIf { it.isNotBlank() } ?: a.text()).trim()
-        href to (egDeadNum(EGDEAD_EPISODE_REGEX, "$href $label") ?: 9999)
+        val decodedHref = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
+        href to (egDeadNum(EGDEAD_EPISODE_REGEX, "$decodedHref $label") ?: 9999)
     }?.firstOrNull { it.second == episode }?.first
     if (epUrl == null) {
         Log.d(EGDEAD_TAG, "[match  ] E$episode not in season episode list")
