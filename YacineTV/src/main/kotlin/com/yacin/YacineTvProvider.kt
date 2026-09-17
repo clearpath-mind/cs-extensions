@@ -1072,18 +1072,24 @@ class YacineTvProvider : MainAPI() {
         // Cricify-style emoji plot, no tags: one line per available
         // field in fixed order. UPCOMING gets no status line (the kickoff
         // line covers it); channels keep their watch plot below.
+        // NOTE: the app renders plot as HTML (Html.fromHtml), where \n
+        // collapses — so lines join with <br><br> and values are escaped.
+        fun escapeHtml(s: String): String = s
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
         val matchPlotLines = if (data.kind == "event") listOfNotNull(
             when (status) {
                 "LIVE" -> "🔴 مباشر الآن"
                 "ENDED" -> "✅ انتهت المباراة"
                 else -> null
             },
-            competition?.let { "🏆 $it" },
-            kickoff?.let { "🕐 $it" },
-            data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
-            data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
+            competition?.let { "🏆 ${escapeHtml(it)}" },
+            kickoff?.let { "🕐 ${escapeHtml(it)}" },
+            data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ ${escapeHtml(it)}" },
+            data.channel?.takeIf { it.isNotBlank() }?.let { "📺 ${escapeHtml(it)}" },
         ) else emptyList()
-        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("<br><br>")
             ?: data.plot
             ?: if (data.kind == "event") matchPlot(name)
             else "شاهد البث المباشر لقناة ${data.name}"
