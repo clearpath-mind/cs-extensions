@@ -394,7 +394,12 @@ private fun cfCookies(url: String): String =
 private fun isCfChallenge(text: String): Boolean =
     text.contains("just a moment", ignoreCase = true) ||
         text.contains("checking your browser", ignoreCase = true) ||
-        text.contains("verify you are human", ignoreCase = true)
+        text.contains("verify you are human", ignoreCase = true) ||
+        text.contains("verifying you are human", ignoreCase = true) ||
+        text.contains("i'm not a robot", ignoreCase = true) ||
+        text.contains("challenge-platform", ignoreCase = true) ||
+        text.contains("cf-chl", ignoreCase = true) ||
+        text.contains("turnstile", ignoreCase = true)
 
 /** Solve a CloudFlare challenge via the WebView solver, sharing one lock so
  *  only a single solve runs at a time. Cookies land in the shared
@@ -2252,8 +2257,9 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
         try {
             val base = egDeadBase()
             val encoded = URLEncoder.encode(query, "UTF-8")
-            val doc = cfGetDoc("$base/?s=$encoded", timeout = 20000)
-            doc.select("ul.posts-list li.movieItem").mapNotNull { li ->
+            val fetchUrl = "$base/?s=$encoded"
+            val doc = cfGetDoc(fetchUrl, timeout = 20000)
+            val cards = doc.select("ul.posts-list li.movieItem").mapNotNull { li ->
                 val a = li.selectFirst("a[href]") ?: return@mapNotNull null
                 val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") }
                     ?: return@mapNotNull null
@@ -2266,6 +2272,11 @@ private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
                 if (latin.isBlank()) return@mapNotNull null
                 Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
             }.distinctBy { it.url }
+            if (cards.isEmpty()) {
+                val body = runCatching { doc.body()?.text().orEmpty() }.getOrDefault("")
+                Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' body='${body.take(200)}'")
+            }
+            cards
         } catch (e: Exception) {
             Log.e(EGDEAD_TAG, "[search ] failed: ${e.message}")
             emptyList()
