@@ -187,6 +187,45 @@ class Luluvdo : StreamWishExtractor() {
     override val mainUrl = "https://luluvdo.com"
 }
 
+/** VidSpeed (vidspeed.cyou and rotations) — packed JWPlayer, master m3u8 in `file:` after unpack */
+class VidSpeed : PackedJwPlayer() {
+    override val name = "VidSpeed"
+    override val mainUrl = "https://vidspeed.cyou"
+}
+
+/** CdnPlus (cdnplus.space and rotations) — packed JWPlayer, master m3u8 in `file:` after unpack */
+class CdnPlus : PackedJwPlayer() {
+    override val name = "CdnPlus"
+    override val mainUrl = "https://cdnplus.space"
+}
+
+/** MP4Plus (mp4plus.cyou / mp4plus.org) — plain JWPlayer setup with labeled direct mp4s */
+class Mp4Plus : ExtractorApi() {
+    override val name = "Mp4Plus"
+    override val mainUrl = "https://mp4plus.cyou"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val text = app.get(url, referer = referer).text
+        Regex("""file\s*:\s*["']([^"']+\.mp4[^"']*)["']\s*,\s*label\s*:\s*["']([^"']+)["']""")
+            .findAll(text)
+            .forEach { m ->
+                callback(
+                    newExtractorLink(name, name, url = m.groupValues[1]) {
+                        this.referer = referer ?: mainUrl
+                        this.quality = getQualityFromName(m.groupValues[2])
+                        this.type = ExtractorLinkType.VIDEO
+                    }
+                )
+            }
+    }
+}
+
 /** AnaFast (anafast.cyou and rotations) — plain JWPlayer setup with a
  * tokenized master m3u8 in `sources: [{file: "..."}]`. No packing, no DRM. */
 class AnaFast : ExtractorApi() {
@@ -294,6 +333,9 @@ object EmbedRouter {
                 "vidtube" in host -> "Vidtube"
                 "updown" in host -> "UpDown"
                 "anafast" in host -> "AnaFast"
+                "vidspeed" in host -> "VidSpeed"
+                "cdnplus" in host -> "CdnPlus"
+                "mp4plus" in host -> "Mp4Plus"
                 "filelion" in host -> "Filelion"
                 "lulu" in host || "fastvip" in host -> "Luluvdo"
                 "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host -> "Dood"
@@ -307,6 +349,9 @@ object EmbedRouter {
                 "vidtube" in host -> Vidtube().getUrl(link, referer, subtitleCallback, out)
                 "updown" in host -> UpDown().getUrl(link, referer, subtitleCallback, out)
                 "anafast" in host -> AnaFast().getUrl(link, referer, subtitleCallback, out)
+                "vidspeed" in host -> VidSpeed().getUrl(link, referer, subtitleCallback, out)
+                "cdnplus" in host -> CdnPlus().getUrl(link, referer, subtitleCallback, out)
+                "mp4plus" in host -> Mp4Plus().getUrl(link, referer, subtitleCallback, out)
                 "filelion" in host -> Filelion().getUrl(link, referer, subtitleCallback, out)
                 "lulu" in host || "fastvip" in host -> Luluvdo().getUrl(link, referer, subtitleCallback, out)
                 "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host ->
