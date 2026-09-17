@@ -1344,12 +1344,18 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
     }
 
 /** Theme live-filter via POST (the GET keywords page renders an empty shell).
- *  Tries several param names; logs per-param counts to find the live one. */
+ *  The /filtering/ endpoint answers 200 (not CF-walled) but ignores unknown
+ *  params and returns unfiltered latest items — so probe every param name and
+ *  keep the set that actually matches the query instead of the first
+ *  non-empty one. */
 private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
     withContext(Dispatchers.IO) {
         try {
             val base = mycimaBase()
-            for (param in listOf("keywords", "s", "keyword", "search", "q", "query")) {
+            var best: List<Candidate> = emptyList()
+            var bestScore = -1
+            var bestParam = ""
+            for (param in listOf("keywords", "s", "keyword", "search", "q", "query", "key", "term")) {
                 val html = runCatching {
                     cfPostText(
                         "$base/filtering/",
@@ -1367,11 +1373,20 @@ private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
                 val cards = doc.select("div#MainFiltar div.GridItem").ifEmpty { doc.select("div.GridItem") }
                     .mapNotNull { mycimaFromGridItem(it, base) }
                     .distinctBy { it.url }
-                val first = cards.firstOrNull()?.latinTitle
-                Log.d(MYCIMA_TAG, "[search ] filter POST param=$param -> ${cards.size} first='$first'")
-                if (cards.isNotEmpty()) return@withContext cards
+                if (cards.isEmpty()) continue
+                // Judge by match quality, not count: unfiltered latest items
+                // score low against the query and lose to the true filter.
+                val top = cards.map { scoreCandidate(it, query, null) }.maxOrNull() ?: 0
+                val gated = cards.count { mycimaPassesGate(it, query) }
+                Log.d(MYCIMA_TAG, "[search ] filter POST param=$param -> ${cards.size} top=$top gated=$gated first='${cards.firstOrNull()?.latinTitle}'")
+                if (top > bestScore) {
+                    bestScore = top
+                    bestParam = param
+                    best = cards
+                }
             }
-            emptyList()
+            if (best.isNotEmpty()) Log.d(MYCIMA_TAG, "[search ] filter POST winner=$bestParam top=$bestScore n=${best.size}")
+            best
         } catch (e: Exception) {
             Log.e(MYCIMA_TAG, "[search ] filter POST failed: ${e.message}")
             emptyList()
@@ -2659,7 +2674,7 @@ private suspend fun shoofAlbaServers(
 // clears it).
 // ---------------------------------------------------------------------------
 
-private const val EGDEAD_SEED_URL = "https://egydead.skin"
+private const val EGDEAD_SEED_URL = "https://egydead.beer"
 private const val EGDEAD_TAG = "EgyDead"
 
 /** EgyDead rotates domains; resolve the live origin once and reuse it. */
