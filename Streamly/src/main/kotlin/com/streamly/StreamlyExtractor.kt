@@ -2782,6 +2782,16 @@ private suspend fun egDeadWatchServers(
             async {
                 var n = 0
                 val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
+                if (link.contains("hgcloud", ignoreCase = true)) {
+                    // StreamHG renders its player in JS (static fetch only sees
+                    // a loader shell), so sniff the stream via the WebView.
+                    val m3u8 = faselHdResolveWebView(link, watchUrl)
+                    if (!m3u8.isNullOrBlank()) {
+                        faselHdEmitResolved(m3u8, link, getBaseUrl(link), counting, providerLabel)
+                    }
+                    Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n webview=${!m3u8.isNullOrBlank()}")
+                    return@async
+                }
                 if (link.contains("megamax.me", ignoreCase = true)) {
                     val ok = MegaMaxExtractor.extract(link, watchUrl, subtitleCallback, counting, providerLabel)
                     Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n megamax=$ok")
