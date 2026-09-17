@@ -1211,13 +1211,25 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
             val base = mycimaBase()
             val encoded = URLEncoder.encode(query, "UTF-8")
             val doc = cfGetDoc("$base/filtering/?keywords=$encoded", timeout = 15000)
-            doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) }
+            val cards = doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) }
                 .distinctBy { it.url }
+            if (cards.isEmpty()) {
+                val body = runCatching { doc.body()?.text().orEmpty() }.getOrDefault("")
+                Log.d(MYCIMA_TAG, "[search ] filter 0 cards title='${doc.title()}' mainFiltar=${doc.select("div#MainFiltar").size} gridItem=${doc.select("div.GridItem").size} body='${body.take(200)}'")
+            }
+            cards
         } catch (e: Exception) {
             Log.e(MYCIMA_TAG, "[search ] filter failed: ${e.message}")
             emptyList()
         }
     }
+
+/** Section/archive slugs that are never posts (nav harvest must skip them). */
+private val MYCIMA_SKIP_SLUGS = setOf(
+    "movies", "movie", "series", "seriestv", "tv", "episodes", "episode",
+    "seasons", "season", "categories", "category", "tags", "tag",
+    "actors", "actor", "home", "main", "filtering",
+)
 
 /** Plain WordPress search: /?s=<query>; posts carry /movies/|/series/|/episode/. */
 private suspend fun mycimaWpSearch(query: String): List<Candidate> =
@@ -1232,7 +1244,7 @@ private suspend fun mycimaWpSearch(query: String): List<Candidate> =
                     if (!href.startsWith("http")) return@mapNotNull null
                     if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) return@mapNotNull null
                     val slug = decodeSlug(href)
-                    if (slug.isBlank()) return@mapNotNull null
+                    if (slug.isBlank() || slug.lowercase() in MYCIMA_SKIP_SLUGS) return@mapNotNull null
                     val label = a.text().trim()
                     val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
                     if (latin.isBlank()) return@mapNotNull null
@@ -1261,7 +1273,7 @@ private suspend fun mycimaApiSearch(query: String): List<Candidate> {
             if (!href.startsWith("http")) continue
             if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) continue
             val slug = decodeSlug(href)
-            if (slug.isBlank()) continue
+            if (slug.isBlank() || slug.lowercase() in MYCIMA_SKIP_SLUGS) continue
             val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
             if (candidate.latinTitle.isBlank()) continue
             if (out.any { it.url == href }) continue
@@ -1275,11 +1287,14 @@ private suspend fun mycimaApiSearch(query: String): List<Candidate> {
     }
 }
 
-private suspend fun mycimaSearch(query: String): List<Candidate> {
-    val merged = (mycimaFilterSearch(query) + mycimaWpSearch(query) + mycimaApiSearch(query))
-        .distinctBy { it.url }
+private suspend fun mycimaSearch(query: String): List<Candidate> = coroutineScope {
+    // Sequential CF-challenged fetches stall the whole plugin run; fan out.
+    val f = async { mycimaFilterSearch(query) }
+    val w = async { mycimaWpSearch(query) }
+    val a = async { mycimaApiSearch(query) }
+    val merged = (f.await() + w.await() + a.await()).distinctBy { it.url }
     Log.d(MYCIMA_TAG, "[search ] '$query' -> ${merged.size} candidates")
-    return merged
+    merged
 }
 
 private suspend fun mycimaResolveMovie(
