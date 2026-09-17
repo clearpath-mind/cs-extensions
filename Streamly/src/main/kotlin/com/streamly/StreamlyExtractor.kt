@@ -30,7 +30,6 @@ import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import okhttp3.Request as OkRequest
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -67,7 +66,7 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, WeCima, FaselHD, Shoof. One adaptive link is
+// Currently: TopCinema, MyCima, FaselHD, Shoof, EgyDead. One adaptive link is
 // emitted per server (no per-quality lists); ExoPlayer adapts itself.
 // ---------------------------------------------------------------------------
 
@@ -1147,40 +1146,30 @@ private fun unwrapPlayUrl(url: String): String {
 }
 
 // ---------------------------------------------------------------------------
-// WeCima (wecima.cx) link source.
-//
-// Custom theme (not WordPress): search is a JSON API (POST /search returning
-// {slug, istv, year}), watch servers are base64-encoded inside
-// `ul.WatchServersList li btn[data-url]`, downloads in `.openLinkDown[data-href]`.
-// Multi-season shows list seasons on the series page
-// (`a.SeasonsEpisodes[data-id][data-season]`) and resolve episodes via
-// POST /ajax/Episode; single-season shows list episodes inline.
+// MyCima (mycima.gdn) link source. Port of re-3arabi MyCimaProvider, adapted
+// to Streamly's TMDB-title matching. WordPress site (wp-content/themes/mycima):
+// search via /filtering/?keywords= GridItem cards, with plain WP ?s= and WP
+// REST discovery merged in. Series resolve through div.SeasonsList season tabs
+// plus POST .../Ajaxt/Single/Episodes.php; watch servers come from
+// ul#watch li[data-watch] (+ the download list), govid//go/ payloads
+// base64-decoded, everything routed through EmbedRouter. All traffic uses
+// cfGet*/cfPost*: the site sits behind Cloudflare.
 // ---------------------------------------------------------------------------
 
-private const val WECIMA_MAIN_URL = "https://wecima.ac"
-private const val WECIMA_TAG = "WeCima"
+private const val MYCIMA_SEED_URL = "https://mycima.gdn"
+private const val MYCIMA_TAG = "MyCima"
 
-data class WecimaSearchItem(
-    val title: String? = null,
-    val slug: String? = null,
-    val year: String? = null,
-    val istv: Int? = null,
-    val rating: String? = null,
-)
+/** MyCima rotates domains; resolve the live origin once and reuse it. */
+private suspend fun mycimaBase(): String = resolveOrigin(MYCIMA_SEED_URL)
 
-data class WecimaSearchResponse(
-    val status: Boolean? = null,
-    val results: List<WecimaSearchItem>? = null,
-)
-
-suspend fun invokeWecima(
+suspend fun invokeMyCima(
     res: LinkData,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
     val title = res.title?.trim().orEmpty()
-    Log.d(WECIMA_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
-    StreamlyDiag.lastStage = "WeCima: start"
+    Log.d(MYCIMA_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "MyCima: start"
     if (title.isEmpty()) return false
 
     var emitted = 0
@@ -1188,160 +1177,167 @@ suspend fun invokeWecima(
 
     return try {
         val ok = if (res.isMovie) {
-            wecimaResolveMovie(title, res.year, subtitleCallback, countingCallback)
+            mycimaResolveMovie(title, res.year, subtitleCallback, countingCallback)
         } else {
-            wecimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, countingCallback)
+            mycimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, countingCallback)
         }
-        Log.d(WECIMA_TAG, "[done  ] emitted=$emitted")
-        StreamlyDiag.lastStage = if (emitted > 0) "WeCima: ok" else "WeCima: no links"
+        Log.d(MYCIMA_TAG, "[done  ] emitted=$emitted")
+        StreamlyDiag.lastStage = if (emitted > 0) "MyCima: ok" else "MyCima: no links"
         ok || emitted > 0
     } catch (e: Exception) {
-        Log.e(WECIMA_TAG, "[invoke] failed: ${e.message}")
-        StreamlyDiag.lastStage = "WeCima: ${e.message}"
+        Log.e(MYCIMA_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "MyCima: ${e.message}"
         emitted > 0
     }
 }
 
-/** Search API returns JSON; slugs are hyphen-separated Latin/Arabic mixes. */
-private suspend fun wecimaSearch(query: String): List<WecimaSearchItem> =
+/** One GridItem card (filtering / home grids) -> Candidate. Series signal is
+ *  an explicit episode number or /series/ in the URL. */
+private fun mycimaFromGridItem(el: Element, base: String): Candidate? {
+    val a = el.selectFirst("div.Thumb--GridItem a[href]") ?: return null
+    val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") } ?: return null
+    val titleEl = a.selectFirst("strong") ?: return null
+    val titleText = titleEl.ownText().trim().ifBlank { return null }
+    val slug = decodeSlug(href)
+    val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
+    if (latin.isBlank()) return null
+    return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
+}
+
+/** Theme live-filter: /filtering/?keywords=<query> -> div#MainFiltar cards. */
+private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
     withContext(Dispatchers.IO) {
         try {
-            val base = resolveOrigin(WECIMA_MAIN_URL)
-            val text = cfPostText(
-                "$base/search",
-                data = mapOf("q" to query),
-                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-                referer = base,
-                timeout = 15000,
-            )
-            parseJson<WecimaSearchResponse>(text).results.orEmpty()
+            val base = mycimaBase()
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val doc = cfGetDoc("$base/filtering/?keywords=$encoded", timeout = 15000)
+            doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) }
+                .distinctBy { it.url }
         } catch (e: Exception) {
-            Log.e(WECIMA_TAG, "[search ] failed: ${e.message}")
+            Log.e(MYCIMA_TAG, "[search ] filter failed: ${e.message}")
             emptyList()
         }
     }
 
-/**
- * WeCima slugs are token-reversed with Arabic noise words interleaved
- * ("2023-مترجم-oppenheimer-مشاهدة-فيلم"), so the prefix/suffix stripping in
- * latinTitleFromSlug doesn't apply. Keep only tokens without Arabic chars.
- */
-private fun wecimaLatinFromSlug(slug: String): String =
-    slug.split('-')
-        .filter { token ->
-            token.isNotBlank() && token.none { ch -> ch.code in 0x0600..0x06FF }
-        }
-        .joinToString(" ")
-        .trim()
-
-/**
- * Scores a search item against the TMDB title/year using the Latin part of
- * the slug (see wecimaLatinFromSlug).
- */
-private fun scoreWecimaItem(item: WecimaSearchItem, title: String, year: Int?): Int {
-    val slug = item.slug.orEmpty()
-    var score = FuzzySearch.weightedRatio(
-        wecimaLatinFromSlug(slug).lowercase().replace('-', ' '),
-        title.lowercase().replace('-', ' '),
-    )
-    val itemYear = item.year?.toIntOrNull() ?: yearFromSlug(slug)
-    if (itemYear != null && year != null && Math.abs(itemYear - year) > 1) {
-        score -= YEAR_PENALTY
-    } else if (itemYear != null && year != null) {
-        score += 5
-    }
-    return score
-}
-
-/** Servers are base64 ("aHR0c..." = "http...") with '+' stripped. */
-private fun wecimaDecode(encoded: String): String? {
-    if (encoded.isBlank()) return null
-    val cleaned = encoded.replace("+", "").trim()
-    val b64 = if (cleaned.startsWith("aHR0c")) cleaned else "aHR0c$cleaned"
-    val padded = b64.padEnd((b64.length + 3) / 4 * 4, '=')
-    return runCatching {
-        String(android.util.Base64.decode(padded, android.util.Base64.DEFAULT))
-    }.getOrNull()?.takeIf { it.startsWith("http") }
-}
-
-private fun normalizeWeCimaEmbed(url: String): String {
-    var u = url.trim()
-    runCatching {
-        val uri = URI(u)
-        val host = uri.host?.lowercase()
-        if (host != null) {
-            val scheme = (uri.scheme ?: "https").lowercase()
-            val port = if (uri.port != -1) ":${uri.port}" else ""
-            var path = (uri.rawPath ?: "").trimEnd('/')
-            // WeCima lists same video as /e/<id> and /d/<id> or /f/<id> - collapse to same ID
-            path = path.replace(Regex("/[edf]/"), "/x/")
-            u = "$scheme://$host$port$path"
+/** Plain WordPress search: /?s=<query>; posts carry /movies/|/series/|/episode/. */
+private suspend fun mycimaWpSearch(query: String): List<Candidate> =
+    withContext(Dispatchers.IO) {
+        try {
+            val base = mycimaBase()
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val doc = cfGetDoc("$base/?s=$encoded", timeout = 15000)
+            doc.select("div#MainFiltar div.GridItem").mapNotNull { mycimaFromGridItem(it, base) } +
+                doc.select("a[href]").mapNotNull { a ->
+                    val href = fixUrl(a.attr("href"), base)
+                    if (!href.startsWith("http")) return@mapNotNull null
+                    if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) return@mapNotNull null
+                    val slug = decodeSlug(href)
+                    if (slug.isBlank()) return@mapNotNull null
+                    val label = a.text().trim()
+                    val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
+                    if (latin.isBlank()) return@mapNotNull null
+                    Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label))
+                }.distinctBy { it.url }
+        } catch (e: Exception) {
+            Log.e(MYCIMA_TAG, "[search ] ?s= failed: ${e.message}")
+            emptyList()
         }
     }
-    return u.trimEnd('/').lowercase().let { if (it.isBlank()) url.trim() else it }
-}
 
-private suspend fun wecimaExtractPost(
-    postUrl: String,
-    subtitleCallback: (SubtitleFile) -> Unit,
-    callback: (ExtractorLink) -> Unit,
-): Boolean = coroutineScope {
-    try {
-        val doc = cfGetDoc(postUrl, timeout = 15000)
-        // Dedup by normalized host+path to collapse http/https, trailing slash, query variants.
-        val seenNorm = HashSet<String>()
-        val embeds = LinkedHashSet<String>()
-        fun addEmbed(raw: String?) {
-            if (raw.isNullOrBlank()) return
-            val fixed = fixUrl(raw.trim(), postUrl)
-            if (!fixed.startsWith("http")) return
-            val norm = normalizeWeCimaEmbed(fixed)
-            if (seenNorm.add(norm)) embeds.add(fixed) else Log.d(WECIMA_TAG, "[dedup ] wecima embed dup $fixed -> $norm")
+/** WordPress REST discovery: /wp-json/wp/v2/search returns exact post URLs. */
+private suspend fun mycimaApiSearch(query: String): List<Candidate> {
+    val out = ArrayList<Candidate>()
+    return try {
+        val base = mycimaBase()
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val endpoint = "$base/wp-json/wp/v2/search?search=$encoded&per_page=100"
+        val html = cfGetText(endpoint, timeout = 15000)
+        val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
+        if (jsonText.isBlank()) return emptyList()
+        val arr = org.json.JSONArray("[$jsonText]")
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val href = o.optString("url").trim()
+            if (!href.startsWith("http")) continue
+            if (!href.contains("/movies/") && !href.contains("/series/") && !href.contains("/episode/")) continue
+            val slug = decodeSlug(href)
+            if (slug.isBlank()) continue
+            val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            if (candidate.latinTitle.isBlank()) continue
+            if (out.any { it.url == href }) continue
+            out.add(candidate)
         }
-        doc.select("ul.WatchServersList li btn[data-url]").forEach { btn ->
-            wecimaDecode(btn.attr("data-url"))?.let { addEmbed(it) }
-        }
-        // Download-quality servers are base64-encoded in .openLinkDown[data-href].
-        doc.select(".openLinkDown[data-href]").forEach { el ->
-            wecimaDecode(el.attr("data-href"))?.let { addEmbed(it) }
-        }
-        // Older layouts expose plain iframes instead of encoded buttons.
-        doc.select("iframe[src]").forEach { fr ->
-            addEmbed(fr.attr("src"))
-        }
-        Log.d(WECIMA_TAG, "[servers] ${embeds.size} distinct (norm ${seenNorm.size}) on $postUrl")
-        embeds.toList().amap { embed ->
-            async { EmbedRouter.route(embed, postUrl, subtitleCallback, callback, "WeCima") }
-        }.awaitAll()
-        true
+        Log.d(MYCIMA_TAG, "[api    ] $endpoint -> ${out.size} posts")
+        out
     } catch (e: Exception) {
-        Log.e(WECIMA_TAG, "[servers] failed for $postUrl: ${e.message}")
-        false
+        Log.e(MYCIMA_TAG, "[api    ] WP search failed: ${e.message}")
+        out
     }
 }
 
-private suspend fun wecimaResolveMovie(
+private suspend fun mycimaSearch(query: String): List<Candidate> {
+    val merged = (mycimaFilterSearch(query) + mycimaWpSearch(query) + mycimaApiSearch(query))
+        .distinctBy { it.url }
+    Log.d(MYCIMA_TAG, "[search ] '$query' -> ${merged.size} candidates")
+    return merged
+}
+
+private suspend fun mycimaResolveMovie(
     title: String,
     year: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val base = resolveOrigin(WECIMA_MAIN_URL)
-    val best = wecimaSearch(title)
-        .filter { it.istv == 0 && !it.slug.isNullOrBlank() }
-        .map { it to scoreWecimaItem(it, title, year) }
-        .filter { it.second >= MIN_SCORE_MOVIE }
+    val candidates = mycimaSearch(title)
+    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
+        Log.d(MYCIMA_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
+    }
+    val best = scored.filter { it.second >= MIN_SCORE_MOVIE }
         .maxByOrNull { it.second }?.first
     if (best == null) {
-        Log.d(WECIMA_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
+        Log.d(MYCIMA_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
         return false
     }
-    val url = "$base/watch/${java.net.URLEncoder.encode(best.slug, "UTF-8")}"
-    Log.d(WECIMA_TAG, "[match  ] WINNER $url")
-    return wecimaExtractPost(url, subtitleCallback, callback)
+    Log.d(MYCIMA_TAG, "[match  ] WINNER ${best.url}")
+    return mycimaExtractPost(best.url, subtitleCallback, callback)
 }
 
-private suspend fun wecimaResolveEpisode(
+/** Season tab number: data-season attrs first, then digits, then Arabic
+ *  ordinals (الموسم الاول has no digit). */
+private fun mycimaSeasonNum(el: Element): Int? {
+    val attr = el.attr("data-season").ifBlank { el.attr("data-season-id") }
+    Regex("""\d+""").find(attr)?.value?.toIntOrNull()?.let { return it }
+    val text = el.text()
+    Regex("""\d+""").find(text)?.value?.toIntOrNull()?.let { return it }
+    return arabicOrdinalNum(text)
+}
+
+private fun mycimaPostId(doc: Document): String? {
+    doc.selectFirst("input[name=post_id]")?.attr("value")?.takeIf { it.isNotBlank() }?.let { return it }
+    doc.selectFirst("[data-post_id]")?.attr("data-post_id")?.takeIf { it.isNotBlank() }?.let { return it }
+    val scripts = doc.select("script").joinToString(" ") { it.data() }
+    return Regex("""post_?id['"]?\s*[:=]\s*['"]?(\d{3,})['"]?""").find(scripts)?.groupValues?.get(1)
+}
+
+/** Exact episode match: .episodetitle / title / text label, else slug number. */
+private fun mycimaExactEpisode(scope: Document, episode: Int): String? {
+    val anchors = scope.select("div.EpisodesList a[href]").takeIf { it.isNotEmpty() }
+        ?: scope.select("a[href]")
+    for (a in anchors) {
+        val href = a.absUrl("href").ifEmpty { a.attr("href") }
+        if (!href.startsWith("http")) continue
+        if ("/series/" in href || href.contains("/season")) continue
+        val raw = a.selectFirst(".episodetitle")?.text()
+            ?: a.attr("title").takeIf { it.isNotBlank() } ?: a.text()
+        val num = EPISODE_REGEX.find(raw)?.groupValues?.get(1)?.toIntOrNull()
+            ?: EPISODE_REGEX.find(decodeSlug(href))?.groupValues?.get(1)?.toIntOrNull()
+        if (num == episode) return href
+    }
+    return null
+}
+
+private suspend fun mycimaResolveEpisode(
     title: String,
     season: Int,
     episode: Int,
@@ -1349,79 +1345,171 @@ private suspend fun wecimaResolveEpisode(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val base = resolveOrigin(WECIMA_MAIN_URL)
-    val best = wecimaSearch(title)
-        .filter { it.istv == 1 && !it.slug.isNullOrBlank() }
-        .map { it to scoreWecimaItem(it, title, year) }
-        .filter { it.second >= MIN_SCORE_SERIES }
+    val candidates = mycimaSearch(title)
+    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
+        Log.d(MYCIMA_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
+    }
+    val anchor = scored.filter { it.second >= MIN_SCORE_SERIES }
         .maxByOrNull { it.second }?.first
-    if (best == null) {
-        Log.d(WECIMA_TAG, "[match  ] no series above $MIN_SCORE_SERIES")
+    if (anchor == null) {
+        Log.d(MYCIMA_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
         return false
     }
-    val seriesUrl = "$base/series/${java.net.URLEncoder.encode(best.slug, "UTF-8")}"
-    Log.d(WECIMA_TAG, "[match  ] anchor $seriesUrl")
+    Log.d(MYCIMA_TAG, "[match  ] anchor ${anchor.url}")
 
-    val doc = cfGetDoc(seriesUrl, timeout = 15000)
+    val doc = try {
+        cfGetDoc(anchor.url, timeout = 15000)
+    } catch (e: Exception) {
+        Log.e(MYCIMA_TAG, "[anchor ] failed: ${e.message}")
+        return false
+    }
 
-    // Multi-season: season tabs carry the AJAX params for /ajax/Episode.
-    val seasonTabs = doc.select("a.SeasonsEpisodes[data-id][data-season]")
-    if (seasonTabs.isEmpty()) {
+    // Multi-season: tabs carry data-season for Episodes.php.
+    var tabs = doc.select("div.SeasonsList ul li a")
+    if (tabs.isEmpty()) tabs = doc.select(".Seasons--Episodes ul li a")
+    if (tabs.isEmpty()) {
         // Single-season show: episodes listed inline on the page itself.
-        val epUrl = wecimaExactEpisode(doc, episode) ?: run {
-            Log.d(WECIMA_TAG, "[match  ] E$episode not in inline list")
+        val epUrl = mycimaExactEpisode(doc, episode) ?: run {
+            Log.d(MYCIMA_TAG, "[match  ] E$episode not in inline list")
             return false
         }
-        return wecimaExtractPost(epUrl, subtitleCallback, callback)
+        Log.d(MYCIMA_TAG, "[match  ] E$episode -> $epUrl")
+        return mycimaExtractPost(epUrl, subtitleCallback, callback)
     }
 
-    val tab = seasonTabs.firstOrNull { el ->
-        val fromAttr = Regex("""\d+""").find(el.attr("data-season"))?.value?.toIntOrNull()
-        val fromText = Regex("""الموسم\s*(\d+)""").find(el.text())?.groupValues?.get(1)?.toIntOrNull()
-        fromAttr == season || fromText == season
-    } ?: run {
-        Log.d(WECIMA_TAG, "[season ] S$season not among ${seasonTabs.size} tabs")
+    val tab = tabs.firstOrNull { mycimaSeasonNum(it) == season } ?: run {
+        Log.d(MYCIMA_TAG, "[season ] S$season not among ${tabs.size} tabs")
         return false
+    }
+    val seasonId = tab.attr("data-season").ifBlank { tab.attr("data-season-id") }
+    val postId = mycimaPostId(doc)
+    val seasonHref = tab.attr("href").ifBlank { tab.attr("data-href") }
+    val base = mycimaBase()
+
+    // Preferred: full episode list via the theme's Episodes.php endpoint.
+    if (seasonId.isNotBlank() && !postId.isNullOrBlank()) {
+        val listHtml = runCatching {
+            cfPostText(
+                "$base/wp-content/themes/mycima/Ajaxt/Single/Episodes.php",
+                data = mapOf("season" to seasonId, "post_id" to postId),
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                referer = anchor.url,
+                timeout = 15000,
+            )
+        }.getOrNull()
+        if (!listHtml.isNullOrBlank()) {
+            val epUrl = mycimaExactEpisode(Jsoup.parse(listHtml, anchor.url), episode)
+            if (epUrl != null) {
+                Log.d(MYCIMA_TAG, "[match  ] E$episode -> $epUrl")
+                return mycimaExtractPost(epUrl, subtitleCallback, callback)
+            }
+            Log.d(MYCIMA_TAG, "[match  ] E$episode not in S$season ajax list")
+        } else {
+            Log.e(MYCIMA_TAG, "[season ] ajax failed")
+        }
     }
 
-    val listHtml = runCatching {
-        cfPostText(
-            "$base/ajax/Episode",
-            data = mapOf(
-                "post_id" to tab.attr("data-id"),
-                "season" to tab.attr("data-season"),
-            ),
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-            referer = seriesUrl,
-            timeout = 15000,
-        )
-    }.getOrElse {
-        Log.e(WECIMA_TAG, "[season ] ajax failed: ${it.message}")
-        return false
+    // Fallback: dedicated season page.
+    if (seasonHref.isNotBlank()) {
+        val seasonUrl = fixUrl(seasonHref, anchor.url)
+        val seasonDoc = runCatching { cfGetDoc(seasonUrl, timeout = 15000) }.getOrNull()
+        val epUrl = seasonDoc?.let { mycimaExactEpisode(it, episode) }
+        if (epUrl != null) {
+            Log.d(MYCIMA_TAG, "[match  ] E$episode -> $epUrl")
+            return mycimaExtractPost(epUrl, subtitleCallback, callback)
+        }
     }
-
-    val listDoc = Jsoup.parse(listHtml, seriesUrl)
-    val epUrl = wecimaExactEpisode(listDoc, episode) ?: run {
-        Log.d(WECIMA_TAG, "[match  ] E$episode not in S$season ajax list")
-        return false
-    }
-    Log.d(WECIMA_TAG, "[match  ] WINNER S${season}E${episode} $epUrl")
-    return wecimaExtractPost(epUrl, subtitleCallback, callback)
+    Log.d(MYCIMA_TAG, "[match  ] E$episode not resolved for S$season")
+    return false
 }
 
-/** Exact episode match by episodetitle label or slug number. */
-private fun wecimaExactEpisode(scope: Document, episode: Int): String? {
-    val anchors = scope.select(".EpisodesList a[href], a.hoverable.activable[href]")
-        .takeIf { it.isNotEmpty() } ?: scope.select("a[href]")
-    for (a in anchors) {
-        val href = a.absUrl("href").ifEmpty { a.attr("href") }
-        if (!href.contains("/watch/")) continue
-        val num = a.selectFirst("episodetitle")?.text()
-            ?.let { EPISODE_REGEX.find(it)?.groupValues?.get(1)?.toIntOrNull() }
-            ?: EPISODE_REGEX.find(decodeSlug(href))?.groupValues?.get(1)?.toIntOrNull()
-        if (num == episode) return href
+/** govid//go/ payloads: base64, sometimes reversed, padding often stripped. */
+private fun mycimaSmartDecode(payload: String): String? {
+    fun padded(s: String): String {
+        val clean = s.trim().replace(" ", "").replace("\n", "")
+        val miss = clean.length % 4
+        return if (miss > 0) clean + "=".repeat(4 - miss) else clean
     }
-    return null
+    fun tryDecode(s: String): String? = runCatching {
+        String(android.util.Base64.decode(padded(s), android.util.Base64.DEFAULT), Charsets.UTF_8)
+    }.getOrNull()?.takeIf { it.contains("http") }
+    tryDecode(payload)?.let { return it }
+    return tryDecode(payload.reversed())
+}
+
+/** Resolve a govid page to its embed: atob() payloads, iframe, or direct file. */
+private suspend fun mycimaDeepGovid(pageUrl: String, referer: String): String {
+    return try {
+        val html = cfGetText(pageUrl, referer = referer, timeout = 15000)
+        for (m in Regex("""atob\s*\(\s*["']([^"']+)["']\s*\)""").findAll(html)) {
+            mycimaSmartDecode(m.groupValues[1])?.let { return it }
+        }
+        val iframe = Jsoup.parse(html, pageUrl).selectFirst("iframe[src]")?.attr("src")
+        if (!iframe.isNullOrBlank()) return fixUrl(iframe, pageUrl)
+        Regex("""["'](https?://[^"']+\.(?:m3u8|mp4|php)[^"']*)["']""").find(html)
+            ?.groupValues?.get(1)?.replace("\\/", "/")?.let { return it }
+        pageUrl
+    } catch (_: Exception) {
+        pageUrl
+    }
+}
+
+/** Episode/movie post -> ul#watch servers (+ downloads) -> EmbedRouter. */
+private suspend fun mycimaExtractPost(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    try {
+        val doc = cfGetDoc(postUrl, timeout = 15000)
+        val servers = LinkedHashSet<Pair<String, String?>>()
+        doc.select("ul#watch li[data-watch]").forEach { li ->
+            val link = li.attr("data-watch").trim()
+            if (link.isNotBlank()) servers.add(link to li.text().trim().takeIf { it.isNotBlank() })
+        }
+        doc.select("ul.List--Download--Wecima--Single li a[href]").forEach { a ->
+            val link = a.attr("href").trim()
+            if (link.isNotBlank()) {
+                servers.add(link to (a.selectFirst("quality")?.text()?.trim() ?: "تحميل"))
+            }
+        }
+        doc.select("iframe[src]").forEach { fr ->
+            val src = fr.attr("src").trim()
+            if (src.isNotBlank()) servers.add(src to null)
+        }
+        Log.d(MYCIMA_TAG, "[watch  ] servers=${servers.size} on $postUrl")
+        if (servers.isEmpty()) return@coroutineScope false
+        servers.forEach { (link, name) ->
+            Log.d(MYCIMA_TAG, "[watch  ] server name=${name ?: "?"} link=$link")
+        }
+        servers.amap { (rawLink, name) ->
+            async {
+                var link = rawLink.trim()
+                if ("govid" in link) {
+                    link = if ("=" in link && "pic=" !in link) {
+                        mycimaSmartDecode(link.substringAfterLast("=")) ?: mycimaDeepGovid(link, postUrl)
+                    } else {
+                        mycimaDeepGovid(link, postUrl)
+                    }
+                } else if ("/go/" in link) {
+                    link = mycimaSmartDecode(link.substringAfterLast("/go/").trimEnd('/')) ?: link
+                }
+                if (link.startsWith("http")) {
+                    var n = 0
+                    val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
+                    EmbedRouter.route(link, postUrl, subtitleCallback, counting, "MyCima")
+                    Log.d(MYCIMA_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n")
+                } else {
+                    Log.d(MYCIMA_TAG, "[watch  ] server skip name=${name ?: "?"} link=$link")
+                }
+            }
+        }.awaitAll()
+        true
+    } catch (e: Exception) {
+        Log.e(MYCIMA_TAG, "[watch  ] failed for $postUrl: ${e.message}")
+        false
+    }
 }
 
 // ===========================================================================
@@ -2364,8 +2452,13 @@ private fun egDeadNum(re: Regex, s: String?): Int? {
 private fun egDeadSeasonNum(href: String, text: String): Int? {
     val decoded = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
     egDeadNum(EGDEAD_SEASON_REGEX, "$decoded $text")?.let { return it }
-    val combined = "$decoded $text"
-    return EGDEAD_SEASON_WORDS.entries.firstOrNull { (w, _) -> combined.contains(w) }?.value
+    return arabicOrdinalNum("$decoded $text")
+}
+
+/** Arabic ordinal words (الاول..العاشر) -> number; shared season-tab helper. */
+private fun arabicOrdinalNum(s: String?): Int? {
+    if (s.isNullOrBlank()) return null
+    return EGDEAD_SEASON_WORDS.entries.firstOrNull { (w, _) -> s.contains(w) }?.value
 }
 
 suspend fun invokeEgyDead(
