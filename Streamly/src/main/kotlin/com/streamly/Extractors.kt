@@ -58,7 +58,7 @@ private suspend fun emitM3u8Variants(
 ) {
     val variants = runCatching {
         if (headers.isEmpty()) generateM3u8(sourceName, m3u8Url, referer)
-        else generateM3u8(sourceName, m3u8Url, referer, headers)
+        else generateM3u8(source = sourceName, streamUrl = m3u8Url, referer = referer, headers = headers)
     }.getOrNull().orEmpty()
     if (variants.isNotEmpty()) {
         variants.forEach(callback)
