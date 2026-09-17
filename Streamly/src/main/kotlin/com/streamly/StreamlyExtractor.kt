@@ -2595,6 +2595,7 @@ private suspend fun egDeadResolveEpisode(
         Log.d(EGDEAD_TAG, "[match  ] E$episode not in season episode list")
         return false
     }
+    Log.d(EGDEAD_TAG, "[match  ] E$episode -> $epUrl")
     return egDeadWatchServers(epUrl, subtitleCallback, callback)
 }
 
