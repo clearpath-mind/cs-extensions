@@ -617,34 +617,66 @@ private fun takeSolverHtml(solved: SolverResult, url: String): String? {
     return html
 }
 
+/** Hosts drift across solves (CF redirect chains land the solver on a live
+ *  mirror); clearance cookies are host-scoped, so retrying at the stale
+ *  origin goes out naked and hits the wall again (re-3arabi DOMAIN-UPDATE
+ *  pattern). Remember working hosts per process and retry where solved. */
+private val cfHostOverride = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+private fun applyHostOverride(url: String): String {
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull() ?: return url
+    val better = cfHostOverride[host] ?: return url
+    if (better.equals(host, ignoreCase = true)) return url
+    return runCatching {
+        val u = java.net.URI(url)
+        java.net.URI(u.scheme, u.userInfo, better, u.port, u.path, u.query, u.fragment).toString()
+    }.getOrDefault(url)
+}
+
+/** Retry target after a solve: same path/query on the solver's landing host
+ *  when it moved, remembering the move for later calls. */
+private fun solvedRetryUrl(solved: SolverResult, url: String): String {
+    val newHost = runCatching { java.net.URI(solved.finalUrl).host }.getOrNull()
+    val oldHost = runCatching { java.net.URI(url).host }.getOrNull()
+    if (newHost.isNullOrBlank() || oldHost.isNullOrBlank() || newHost.equals(oldHost, ignoreCase = true)) return url
+    runCatching { cfHostOverride[oldHost.lowercase()] = newHost }
+    Log.d(TAG, "[cfGet  ] solver moved $oldHost -> $newHost, retrying there")
+    return runCatching {
+        val u = java.net.URI(url)
+        java.net.URI(u.scheme, u.userInfo, newHost, u.port, u.path, u.query, u.fragment).toString()
+    }.getOrDefault(url)
+}
+
 private suspend fun cfGetDoc(
     url: String,
     referer: String? = null,
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
 ): Document {
+    val target = applyHostOverride(url)
     val first = runCatching {
-        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.document.toString())) {
         return first.document
     }
-    Log.d(TAG, "[cfGet  ] wall ($url code=${first?.code}), solving…")
-    val solved = cfSolve(url)
+    Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
+    val solved = cfSolve(target)
+    val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
-        takeSolverHtml(solved, url)?.let { html ->
-            Log.d(TAG, "[cfGet  ] solved-page DOM for $url (${html.length} chars)")
-            return Jsoup.parse(html, url)
+        takeSolverHtml(solved, retryUrl)?.let { html ->
+            Log.d(TAG, "[cfGet  ] solved-page DOM for $retryUrl (${html.length} chars)")
+            return Jsoup.parse(html, retryUrl)
         }
     } else if (first != null) {
         return first.document
     }
-    val ck = cfCookies(url)
+    val ck = cfCookies(retryUrl)
     val second = runCatching {
-        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
     }.getOrNull()
-    Log.d(TAG, "[cfGet  ] retry $url code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
-    return second?.document ?: first?.document ?: Jsoup.parse("", url)
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
+    return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
 }
 
 private suspend fun cfGetText(
@@ -653,17 +685,19 @@ private suspend fun cfGetText(
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
 ): String {
+    val target = applyHostOverride(url)
     val first = runCatching {
-        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.text)) {
         return first.text
     }
-    Log.d(TAG, "[cfGet  ] wall ($url code=${first?.code}), solving…")
-    val solved = cfSolve(url)
+    Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
+    val solved = cfSolve(target)
+    val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
-        takeSolverHtml(solved, url)?.let { html ->
-            Log.d(TAG, "[cfGet  ] solved-page DOM for $url (${html.length} chars)")
+        takeSolverHtml(solved, retryUrl)?.let { html ->
+            Log.d(TAG, "[cfGet  ] solved-page DOM for $retryUrl (${html.length} chars)")
             return html
         }
     } else if (first != null) {
@@ -672,14 +706,14 @@ private suspend fun cfGetText(
         val t: String? = first.text
         return t ?: ""
     }
-    val ck = cfCookies(url)
+    val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.get(url, referer = referer, headers = cfHeaders(url, referer, headers), timeout = timeout, allowRedirects = true)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = timeout, allowRedirects = true)
     }.getOrNull()
     val second: String? = secondResp?.text
-    Log.d(TAG, "[cfGet  ] retry $url code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
     return second ?: first?.text ?: ""
 }
 
@@ -693,21 +727,23 @@ private suspend fun cfPostText(
     val baseHeaders = headers.toMutableMap().apply {
         putIfAbsent("X-Requested-With", "XMLHttpRequest")
     }
+    val target = applyHostOverride(url)
     val first = runCatching {
-        app.post(url, data = data, referer = referer, headers = cfHeaders(url, referer, baseHeaders), timeout = timeout).text
+        app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout).text
     }.getOrNull()
     if (first != null && !isCfChallenge(first)) return first
     // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
-    Log.d(TAG, "[cfPost ] wall ($url), solving…")
-    cfSolve(url)
-    val ck = cfCookies(url)
+    Log.d(TAG, "[cfPost ] wall ($target), solving…")
+    val solved = cfSolve(target)
+    val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
+    val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
     val secondResp = runCatching {
-        app.post(url, data = data, referer = referer, headers = cfHeaders(url, referer, baseHeaders), timeout = timeout)
+        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = timeout)
     }.getOrNull()
     val retry: String? = secondResp?.text
-    Log.d(TAG, "[cfPost ] retry $url code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
+    Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
     return retry ?: first ?: ""
 }
 
@@ -2359,7 +2395,15 @@ suspend fun invokeShoof(
 private suspend fun shoofSearch(query: String, type: String): List<Candidate> {
     val direct = shoofSearchOnce(query, type)
     val api = shoofApiSearch(query, type)
-    val merged = (direct + api).distinctBy { it.url }
+    // Post-type REST is the primary path: episode/movie titles carry the
+    // Latin show name ("مسلسل Reacher الموسم 4 الحلقة 9"), while the HTML
+    // ?s= page is always search-no-results for Latin queries.
+    val rest = when (type) {
+        "movies" -> shoofRestTypeSearch(query, "movies")
+        "series" -> shoofRestTypeSearch(query, "episodes")
+        else -> shoofRestTypeSearch(query, "movies") + shoofRestTypeSearch(query, "episodes")
+    }
+    val merged = (direct + api + rest).distinctBy { it.url }
     if (merged.isNotEmpty() || type == "all") return merged
 
     // Some posts are not indexed under their section; try unfiltered search.
@@ -2393,6 +2437,38 @@ private suspend fun shoofSearchOnce(query: String, type: String): List<Candidate
             Log.e(SHOOF_TAG, "[search ] failed: ${e.message}")
             emptyList()
         }
+    }
+}
+
+/** Post-type REST discovery: /wp-json/wp/v2/{movies,episodes}?search= returns
+ *  exact post URLs with rendered titles. Verified: movies?search=moana hits,
+ *  and episode titles/slugs carry Latin show names ("reacher", S/E numbers). */
+private suspend fun shoofRestTypeSearch(query: String, restBase: String): List<Candidate> {
+    val out = ArrayList<Candidate>()
+    return try {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val endpoint = "${shoofBase()}/wp-json/wp/v2/$restBase?search=$encoded&per_page=100&_fields=link,slug,title"
+        val text = cfGetText(endpoint, timeout = 15000).trim()
+        if (!text.startsWith("[")) return emptyList()
+        val arr = org.json.JSONArray(text)
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val href = o.optString("link").trim()
+            if (!href.startsWith("http")) continue
+            val titleHtml = o.optJSONObject("title")?.optString("rendered").orEmpty()
+            val titleText = runCatching { Jsoup.parse(titleHtml).body().text() }.getOrDefault(titleHtml)
+            val slug = decodeSlug(href)
+            val latin = (latinTitleFromSlug(slug) + " " + latinTitleFromSlug(titleText)).trim()
+            if (latin.isBlank()) continue
+            val candidate = Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
+            if (out.any { it.url == candidate.url }) continue
+            out.add(candidate)
+        }
+        Log.d(SHOOF_TAG, "[rest   ] $restBase '$query' -> ${out.size} posts")
+        out
+    } catch (e: Exception) {
+        Log.e(SHOOF_TAG, "[rest   ] $restBase search failed: ${e.message}")
+        out
     }
 }
 
