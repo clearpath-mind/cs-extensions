@@ -336,6 +336,116 @@ object ExternalEarnVidsExtractor {
     }
 }
 
+/** megamax.me (EgyDead's primary server) is a Vue/Inertia app: the
+ *  /iframe/{id} page carries per-quality stream mirrors in its Inertia props
+ *  (`streams.data[]` -> mirrors[] {driver, link} on well-known file hosts).
+ *  Fetch the partial payload, then route each mirror of the best available
+ *  quality through EmbedRouter. */
+object MegaMaxExtractor {
+    private const val TAG = "MegaMax"
+    private val VERSION_REGEX = Regex(""""version"\s*:\s*"([0-9a-fA-F]{32,})"""")
+
+    private data class Mirror(val driver: String, val link: String)
+    private data class Quality(val label: String, val height: Int, val mirrors: List<Mirror>)
+
+    private fun heightOf(label: String, resolution: String): Int {
+        Regex("""(\d{3,4})[xX](\d{3,4})""").find(resolution)?.let {
+            return it.groupValues[2].toIntOrNull() ?: 0
+        }
+        if (label.contains("1080", ignoreCase = true)) return 1080
+        if (label.contains("720", ignoreCase = true)) return 720
+        if (label.contains("480", ignoreCase = true)) return 480
+        if (label.contains("360", ignoreCase = true)) return 360
+        if (label.contains("source", ignoreCase = true)) return 9999
+        return 0
+    }
+
+    suspend fun extract(
+        pageUrl: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+        providerName: String = "EgyDead",
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val iframeUrl = pageUrl.replace("/download/", "/iframe/")
+            val headers = mapOf(
+                "User-Agent" to CF_UA,
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.5",
+            )
+            val html: String? = app.get(iframeUrl, headers = headers, referer = referer, timeout = 15000).text
+            if (html.isNullOrBlank()) return@withContext false
+            val version = VERSION_REGEX.find(html)?.groupValues?.get(1)
+            if (version.isNullOrBlank()) {
+                Log.d(TAG, "[mega] no inertia version for $iframeUrl")
+                return@withContext false
+            }
+            val partial: String? = app.get(
+                iframeUrl,
+                referer = iframeUrl,
+                headers = headers + mapOf(
+                    "X-Inertia" to "true",
+                    "X-Inertia-Version" to version,
+                    "X-Inertia-Partial-Component" to "files/mirror/video",
+                    "X-Inertia-Partial-Data" to "streams",
+                    "X-Requested-With" to "XMLHttpRequest",
+                ),
+                timeout = 15000,
+            ).text
+            if (partial.isNullOrBlank()) return@withContext false
+            val qualities = ArrayList<Quality>()
+            try {
+                val data = JSONObject(partial).optJSONObject("props")
+                    ?.optJSONObject("streams")?.optJSONArray("data")
+                    ?: return@withContext false
+                for (i in 0 until data.length()) {
+                    val q = data.optJSONObject(i) ?: continue
+                    val marr = q.optJSONArray("mirrors") ?: continue
+                    val mirrors = ArrayList<Mirror>()
+                    for (j in 0 until marr.length()) {
+                        val m = marr.optJSONObject(j) ?: continue
+                        var link = m.optString("link").trim()
+                        if (link.startsWith("//")) link = "https:$link"
+                        if (!link.startsWith("http")) continue
+                        mirrors.add(Mirror(m.optString("driver"), link))
+                    }
+                    if (mirrors.isEmpty()) continue
+                    val label = q.optString("label")
+                    qualities.add(Quality(label, heightOf(label, q.optString("resolution")), mirrors))
+                }
+            } catch (e: Exception) {
+                Log.d(TAG, "[mega] parse failed: ${e.message}")
+                return@withContext false
+            }
+            if (qualities.isEmpty()) {
+                Log.d(TAG, "[mega] no qualities for $iframeUrl")
+                return@withContext false
+            }
+            qualities.sortByDescending { it.height }
+            Log.d(TAG, "[mega] qualities=${qualities.map { it.label }}")
+            var emittedTotal = 0
+            for (quality in qualities) {
+                var emittedQ = 0
+                for (mirror in quality.mirrors) {
+                    var n = 0
+                    val counting: (ExtractorLink) -> Unit = { n++; emittedQ++; emittedTotal++; callback(it) }
+                    Log.d(TAG, "[mega] ${quality.label} driver=${mirror.driver} link=${mirror.link}")
+                    runCatching {
+                        EmbedRouter.route(mirror.link, iframeUrl, subtitleCallback, counting, providerName)
+                    }
+                    Log.d(TAG, "[mega] driver=${mirror.driver} emitted=$n")
+                }
+                if (emittedQ > 0) break
+            }
+            emittedTotal > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "[mega] failed: ${e.message}")
+            false
+        }
+    }
+}
+
 private const val TOPCINEMA_MAIN_URL = "https://web8.topcinema.cam"
 private const val TOPCINEMA_AJAX_SERVER =
     "$TOPCINEMA_MAIN_URL/wp-content/themes/movies2023/Ajaxat/Single/Server.php"
@@ -2465,7 +2575,10 @@ private suspend fun egDeadWatchServers(
             if (raw.isNullOrBlank()) return null
             val t = raw.trim()
             if (t.startsWith("#") || t.startsWith("javascript:", ignoreCase = true)) return null
-            return fixUrl(t, watchUrl).takeIf { it.startsWith("http") }
+            val fixed = fixUrl(t, watchUrl).takeIf { it.startsWith("http") } ?: return null
+            // Same file behind both pages; collapse to the iframe variant so
+            // the pair doesn't extract (and emit) twice.
+            return if (fixed.contains("megamax.me")) fixed.replace("/download/", "/iframe/") else fixed
         }
         val candidates = ArrayList<Pair<String, String?>>()
         fun add(link: String?, name: String?) {
@@ -2528,6 +2641,11 @@ private suspend fun egDeadWatchServers(
             async {
                 var n = 0
                 val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
+                if (link.contains("megamax.me", ignoreCase = true)) {
+                    val ok = MegaMaxExtractor.extract(link, watchUrl, subtitleCallback, counting, "EgyDead")
+                    Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n megamax=$ok")
+                    return@async
+                }
                 val isEarn = name != null &&
                     (name.equals("EarnVids", true) || name.equals("StreamHG", true))
                 if (isEarn) {
