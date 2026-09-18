@@ -2120,7 +2120,7 @@ private suspend fun faselHdEmitResolved(
     }.getOrNull().orEmpty()
     if (variants.isNotEmpty()) {
         Log.d(FASELHD_TAG, "[watch  ] expanded ${variants.size} qualities for $label")
-        variants.forEach(callback)
+        dropRedundantMasters(variants).forEach(callback)
         return
     }
     Log.d(FASELHD_TAG, "[watch  ] expansion failed, emitting single adaptive link for $label")
@@ -3230,7 +3230,7 @@ private suspend fun egDeadWatchServers(
                         val expanded = runCatching {
                             generateM3u8("$name (Custom)", custom, egDeadBase())
                         }.getOrNull().orEmpty()
-                        if (expanded.isNotEmpty()) expanded.forEach(counting)
+                        if (expanded.isNotEmpty()) dropRedundantMasters(expanded).forEach(counting)
                         else counting(
                             newExtractorLink(providerLabel, "$name (Custom)", url = custom) {
                                 this.referer = egDeadBase()

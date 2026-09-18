@@ -56,6 +56,24 @@ internal fun isDeadLocker(url: String): Boolean {
 }
 
 /**
+ * Drops redundant `master.m3u8` links: when a master sits in the same
+ * directory as its own rendition playlists (e.g. Luluvdo
+ * `..._h/index-v1-a1.m3u8` + `..._h/master.m3u8`), the player list shows the
+ * same quality twice. Keeps lone masters and masters covering other
+ * directories (true multi-rendition urlsets).
+ */
+internal fun dropRedundantMasters(links: List<ExtractorLink>): List<ExtractorLink> {
+    if (links.size < 2) return links
+    fun isMaster(l: ExtractorLink): Boolean =
+        l.type == ExtractorLinkType.M3U8 &&
+            l.url.substringBefore("?").substringAfterLast("/").equals("master.m3u8", ignoreCase = true)
+    fun dirOf(l: ExtractorLink): String = l.url.substringBefore("?").substringBeforeLast("/")
+    val hasNonMasterDir = links.filterNot(::isMaster).map(::dirOf).toSet()
+    if (hasNonMasterDir.isEmpty()) return links
+    return links.filter { l -> !isMaster(l) || dirOf(l) !in hasNonMasterDir }
+}
+
+/**
  * Expands a master m3u8 into per-quality variants (1080/720/480/…) so slow
  * networks can pick a lower rendition. Falls back to the single adaptive
  * link when the playlist cannot be fetched/parsed (tokenized hosts, 403s).
@@ -72,7 +90,7 @@ private suspend fun emitM3u8Variants(
         else generateM3u8(source = sourceName, streamUrl = m3u8Url, referer = referer, headers = headers)
     }.getOrNull().orEmpty()
     if (variants.isNotEmpty()) {
-        variants.forEach(callback)
+        dropRedundantMasters(variants).forEach(callback)
         return
     }
     callback(
@@ -366,12 +384,10 @@ object EmbedRouter {
         val host = link.lowercase()
         // Always-expand: forward every variant built-in extractors emit
         // (Strwish 1080p/720p/…) so slow networks can pick a lower rendition.
-        // Subtitles still flow via subtitleCallback untouched.
-        var emittedN = 0
-        val out: (ExtractorLink) -> Unit = { l ->
-            emittedN++
-            callback(relabelLink(l, providerName))
-        }
+        // Subtitles still flow via subtitleCallback untouched. Buffer to drop
+        // same-directory master.m3u8 dupes before emitting.
+        val buffered = ArrayList<ExtractorLink>()
+        val out: (ExtractorLink) -> Unit = { l -> buffered.add(l) }
         try {
             val extractorName = when {
                 "vidtube" in host -> "Vidtube"
@@ -418,7 +434,12 @@ object EmbedRouter {
                     loadExtractor(routedLink, referer, subtitleCallback, out)
                 }
             }
-            Log.d(TAG, "[route  ] $host -> $extractorName emitted=$emittedN")
+            var emittedN = 0
+            dropRedundantMasters(buffered).forEach { l ->
+                emittedN++
+                callback(relabelLink(l, providerName))
+            }
+            Log.d(TAG, "[route  ] $host -> $extractorName emitted=$emittedN (raw=${buffered.size})")
         } catch (e: Exception) {
             Log.e(TAG, "[route  ] Failed to extract $link: ${e.message}")
         }
