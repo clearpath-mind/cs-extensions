@@ -1890,8 +1890,21 @@ private suspend fun mycimaDeepGovid(pageUrl: String, referer: String): String {
     }
 }
 
+/** Display names: CloudStream renders ExtractorLink.name verbatim, and we
+ *  build it as "<provider> - <the site's own button label>" so rows can be
+ *  matched back to site buttons. The site's buttons are Arabic, hence
+ *  "MyCima - تحميل مباشر". Normalize the known ones to English. */
+private fun mycimaDisplayName(raw: String?): String = when (raw?.trim()) {
+    "سيرفر ماي سيما" -> "Server"
+    "تحميل مباشر", "تحميل" -> "Direct"
+    null, "" -> "مشاهدة"
+    else -> raw.trim()
+}
+
 /** mycima-my.com: the site's own player + direct-download gate.
  *  - ?my_player=X -> Artplayer page embedding `const videoUrl = "<file>"`.
+ *    The page returns HTTP 200 with a challenge body, so a solve + one
+ *    refetch with fresh clearance may be needed.
  *  - ?secure_stream=<blob> -> 302 straight to the video file: follow
  *    redirects headers-only (never the body), emit the final URL. */
 private suspend fun mycimaResolveOwnHost(
@@ -1912,7 +1925,7 @@ private suspend fun mycimaResolveOwnHost(
         )
         n++
     }
-    val baseLabel = "MyCima - ${name ?: "مشاهدة"}"
+    val baseLabel = "MyCima - ${mycimaDisplayName(name)}"
     if ("secure_stream=" in rawLink) {
         val target = runCatching {
             val req = OkRequest.Builder().url(rawLink).header("Referer", postUrl)
@@ -1925,9 +1938,16 @@ private suspend fun mycimaResolveOwnHost(
         }
         return n
     }
-    val html = runCatching { cfGetText(rawLink, referer = postUrl, timeout = 15000) }.getOrNull()
-    val videoUrl = html?.let { Regex("""videoUrl\s*=\s*["']([^"']+)""").find(it)?.groupValues?.get(1) }
-    Log.d(MYCIMA_TAG, "[watch  ] my_player videoUrl=${videoUrl?.take(80)}")
+    var html = runCatching { cfGetText(rawLink, referer = postUrl, timeout = 15000) }.getOrNull()
+    var videoUrl = html?.let { Regex("""videoUrl\s*=\s*["']([^"']+)""").find(it)?.groupValues?.get(1) }
+    if (videoUrl.isNullOrBlank() && html != null && isCfChallenge(html)) {
+        // 200-with-challenge: the solve ran but the DOM never settled.
+        // Clearance cookies are fresh now — one plain refetch often passes.
+        Log.d(MYCIMA_TAG, "[watch  ] my_player challenged (${html.length} chars), refetching once")
+        html = runCatching { cfGetText(rawLink, referer = postUrl, timeout = 15000) }.getOrNull()
+        videoUrl = html?.let { Regex("""videoUrl\s*=\s*["']([^"']+)""").find(it)?.groupValues?.get(1) }
+    }
+    Log.d(MYCIMA_TAG, "[watch  ] my_player videoUrl=${videoUrl?.take(80)} page=${html?.length ?: -1} challenged=${html?.let { isCfChallenge(it) }}")
     if (videoUrl.isNullOrBlank()) return n
     emit(baseLabel, videoUrl, rawLink)
     // Site convention: v.mp4 siblings per quality.
