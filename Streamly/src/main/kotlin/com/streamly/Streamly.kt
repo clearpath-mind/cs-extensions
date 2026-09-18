@@ -556,11 +556,13 @@ open class Streamly : MainAPI() {
                     success = withTimeoutOrNull(budget) {
                         deferred.await()
                     } == true
+                    var allowedMs = budget
                     if (!success && StreamlyCache.hasEpisodeMatched(provider.id)) {
                         val remaining =
                             StreamlyCache.EXTRACTION_BUDGET_MS - (System.currentTimeMillis() - startTime)
                         if (remaining > 0) {
                             Log.d(TAG, "${provider.name} matched, extending budget by ${remaining}ms")
+                            allowedMs = StreamlyCache.EXTRACTION_BUDGET_MS
                             success = withTimeoutOrNull(remaining) {
                                 deferred.await()
                             } == true
@@ -568,7 +570,7 @@ open class Streamly : MainAPI() {
                     }
                     if (!success) {
                         if (!deferred.isCompleted) deferred.cancel()
-                        Log.w(TAG, "${provider.name} budget exceeded (${budget}ms)")
+                        Log.w(TAG, "${provider.name} budget exceeded (${allowedMs}ms)")
                     }
                 }.onFailure { e ->
                     Log.e(TAG, "${provider.name} failed: ${e.message}")
