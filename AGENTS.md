@@ -56,3 +56,19 @@
   - Upstream `StreamWishExtractor` already has packed-parse + 15s WebView
     fallback; route wish-family hosts to a same-host subclass before custom
     WebView sniffing.
+
+## Local reference repos (`/home/imad/Projects/cs-repos`, read-only)
+
+- `StreamPlay/` (`com.Phisher98`) — architecture template Streamly mirrors.
+  Port patterns from here, don't re-derive: `StreamPlayCache.kt`
+  (adaptive timeout + circuit breaker → `StreamlyCache.kt`),
+  `StreamPlayConcurrency.kt` (→ `StreamlyConcurrency.kt`),
+  `ProvidersList.kt`, `Extractors.kt`.
+- `re-3arabi/` — per-site provider implementations. Streamly's
+  FaselHD/MyCima/EgyDead/TopCinema logic tracks `Faselhd/`,
+  `MyCimaProvider/`, `Egydead/`, `Topcinema/`, `Wecima/` respectively.
+  Check here first when a site changes selectors, headers, or AJAX flows
+  (e.g. client-hint + fetch-metadata headers were ported from re-3arabi Faselhd).
+- `CricifyProvider/` (`com.cncverse`) — live-sports provider
+  (Firebase Remote Config, crypto utils, event manager). Reference for live
+  event patterns only, not VOD extractor work.
