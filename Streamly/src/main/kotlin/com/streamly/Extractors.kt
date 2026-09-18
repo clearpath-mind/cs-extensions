@@ -44,6 +44,17 @@ fun relabelLink(link: ExtractorLink, providerName: String?): ExtractorLink {
     }.getOrElse { link }
 }
 
+/** Premium file lockers: no extractor can pull streams from their file pages
+ *  (login/API only) — routing them just burns timeouts. Observed 0/15+ via
+ *  loadExtractor across runs. */
+internal fun isDeadLocker(url: String): Boolean {
+    val h = url.lowercase()
+    return listOf(
+        "nitroflare.com", "rapidgator.net", "1fichier.com", "frdl.io",
+        "1cloudfile.com", "ddownload.com", "mdiaload.com",
+    ).any { it in h }
+}
+
 /**
  * Expands a master m3u8 into per-quality variants (1080/720/480/…) so slow
  * networks can pick a lower rendition. Falls back to the single adaptive
@@ -370,7 +381,6 @@ object EmbedRouter {
                 isDoodHost(host) -> "Dood"
                 else -> "loadExtractor"
             }
-            Log.d(TAG, "[route  ] $host -> $extractorName")
             // MixDrop file pages (/f/<id>) carry no embed: use the /e/ player.
             val routedLink = if (("mixdrop" in host || "mxdrop" in host) && "/f/" in host) {
                 link.replace("/f/", "/e/")

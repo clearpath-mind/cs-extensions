@@ -560,7 +560,15 @@ object StreamlyDiag {
     var lastStage: String = ""
 }
 
-private val cfSolveLock = Mutex()
+/** One lock per host: solves on different sites proceed in parallel while
+ *  same-host solves still serialize (CF rate-limits per host). Previously a
+ *  single global lock queued MyCima behind EgyDead and vice versa. */
+private val cfHostLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+
+private fun cfLockFor(url: String): Mutex {
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("global")
+    return cfHostLocks.getOrPut(host) { Mutex() }
+}
 internal const val CF_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
@@ -589,7 +597,7 @@ private suspend fun cfSolve(url: String): SolverResult? {
         Log.w(TAG, "[cf     ] no Activity context available, skipping WebView solver for $url")
         return null
     }
-    return cfSolveLock.withLock { CloudflareSolver.solve(activity, url, CF_UA) }
+    return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, CF_UA) }
 }
 
 private fun cfHeaders(
@@ -1234,10 +1242,19 @@ private suspend fun topcinemaDownloadLinks(
             .mapNotNull { it.absUrl("href").ifEmpty { it.attr("href") } }
             .filter { it.startsWith("http") }
         Log.d(TAG, "[download] ${links.size} links on $downloadUrl")
-        links.forEach { raw ->
+        // Premium lockers never yield streams (login/API only) — skip them
+        // instead of burning a loadExtractor timeout each. The rest resolve
+        // concurrently: these are independent IO-bound fetches.
+        val routable = links.mapNotNull { raw ->
             val url = unwrapPlayUrl(raw)
-            EmbedRouter.route(url, downloadUrl, subtitleCallback, callback, "TopCinema")
+            if (isDeadLocker(url)) {
+                Log.d(TAG, "[download] skip locker $url")
+                null
+            } else url
         }
+        routable.amap { url ->
+            async { EmbedRouter.route(url, downloadUrl, subtitleCallback, callback, "TopCinema") }
+        }.awaitAll()
         links.isNotEmpty()
     } catch (e: Exception) {
         Log.e(TAG, "[download] failed: ${e.message}")
@@ -1385,18 +1402,15 @@ private suspend fun mycimaFilterSearch(query: String): List<Candidate> =
     }
 
 /** Theme live-filter via POST (the GET keywords page renders an empty shell).
- *  The /filtering/ endpoint answers 200 (not CF-walled) but ignores unknown
- *  params and returns unfiltered latest items — so probe every param name and
- *  keep the set that actually matches the query instead of the first
- *  non-empty one. */
+ *  The endpoint answers 200 but ignores unknown params (unfiltered latest
+ *  items). Probe `keywords` first — every other name has returned identical
+ *  junk across runs — and only fall through to the rest when it comes back
+ *  empty, picking the best-matching set. */
 private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
     withContext(Dispatchers.IO) {
         try {
             val base = mycimaBase()
-            var best: List<Candidate> = emptyList()
-            var bestScore = -1
-            var bestParam = ""
-            for (param in listOf("keywords", "s", "keyword", "search", "q", "query", "key", "term")) {
+            suspend fun probe(param: String): List<Candidate> {
                 val html = runCatching {
                     cfPostText(
                         "$base/filtering/",
@@ -1409,11 +1423,22 @@ private suspend fun mycimaFilterPostSearch(query: String): List<Candidate> =
                         timeout = 15000,
                     )
                 }.getOrNull()
-                if (html.isNullOrBlank()) continue
+                if (html.isNullOrBlank()) return emptyList()
                 val doc = Jsoup.parse(html, base)
-                val cards = doc.select("div#MainFiltar div.GridItem").ifEmpty { doc.select("div.GridItem") }
+                return doc.select("div#MainFiltar div.GridItem").ifEmpty { doc.select("div.GridItem") }
                     .mapNotNull { mycimaFromGridItem(it, base) }
                     .distinctBy { it.url }
+            }
+            val first = probe("keywords")
+            if (first.isNotEmpty()) {
+                Log.d(MYCIMA_TAG, "[search ] filter POST keywords -> ${first.size} first='${first.firstOrNull()?.latinTitle}'")
+                return@withContext first
+            }
+            var best: List<Candidate> = emptyList()
+            var bestScore = -1
+            var bestParam = ""
+            for (param in listOf("s", "keyword", "search", "q", "query", "key", "term")) {
+                val cards = probe(param)
                 if (cards.isEmpty()) continue
                 // Judge by match quality, not count: unfiltered latest items
                 // score low against the query and lose to the true filter.
@@ -2101,9 +2126,8 @@ private suspend fun faselHdExtractServers(
 
     // Direct download path: .downloadLinks a -> POST -> .dl-link a (final video).
     // The href is often relative — absolutize it or the POST below throws.
-    // Capped: the locker host (t7meel.site) hung to its 60s timeout in the
-    // v8 capture, blocking all iframe work. A locker that doesn't answer in
-    // 15s won't yield a usable stream link anyway.
+    // Hard-capped at 6s: the locker host (t7meel.site) has timed out on every
+    // observed run and never produced a link; don't let it stall the path.
     val downloadAnchor = doc.selectFirst(".downloadLinks a")
     var downloadHref = ""
     if (downloadAnchor != null) {
@@ -2113,7 +2137,7 @@ private suspend fun faselHdExtractServers(
     if (downloadHref.isNotBlank()) {
         val tDl = SystemClock.elapsedRealtime()
         try {
-            val playerDoc = withTimeout(15_000) {
+            val playerDoc = withTimeout(6_000) {
                 cfPostDoc(downloadHref, referer = postUrl, timeout = 60000)
             }
             val dlLink = playerDoc.select("div.dl-link a").attr("href")
@@ -3087,6 +3111,10 @@ private suspend fun egDeadWatchServers(
         }
         candidates.amap { (link, name) ->
             async {
+                if (isDeadLocker(link)) {
+                    Log.d(EGDEAD_TAG, "[watch  ] skip locker name=${name ?: "?"}")
+                    return@async
+                }
                 var n = 0
                 val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
                 if (link.contains("hgcloud", ignoreCase = true)) {
