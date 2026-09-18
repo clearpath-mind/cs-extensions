@@ -1890,6 +1890,55 @@ private suspend fun mycimaDeepGovid(pageUrl: String, referer: String): String {
     }
 }
 
+/** mycima-my.com: the site's own player + direct-download gate.
+ *  - ?my_player=X -> Artplayer page embedding `const videoUrl = "<file>"`.
+ *  - ?secure_stream=<blob> -> 302 straight to the video file: follow
+ *    redirects headers-only (never the body), emit the final URL. */
+private suspend fun mycimaResolveOwnHost(
+    rawLink: String,
+    name: String?,
+    postUrl: String,
+    callback: (ExtractorLink) -> Unit,
+): Int {
+    var n = 0
+    suspend fun emit(label: String, url: String, referer: String) {
+        callback(
+            newExtractorLink(label, label, url) {
+                this.referer = referer
+                this.quality = getQualityFromName(url)
+                this.type = if (".m3u8" in url) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                this.headers = mapOf("Referer" to referer, "User-Agent" to effectiveUa())
+            },
+        )
+        n++
+    }
+    val baseLabel = "MyCima - ${name ?: "مشاهدة"}"
+    if ("secure_stream=" in rawLink) {
+        val target = runCatching {
+            val req = OkRequest.Builder().url(rawLink).header("Referer", postUrl)
+                .header("User-Agent", effectiveUa()).build()
+            app.baseClient.newCall(req).execute().use { it.request.url.toString() }
+        }.getOrNull()
+        Log.d(MYCIMA_TAG, "[watch  ] secure_stream -> ${target?.take(100)}")
+        if (!target.isNullOrBlank() && target != rawLink) {
+            emit(baseLabel, target, postUrl)
+        }
+        return n
+    }
+    val html = runCatching { cfGetText(rawLink, referer = postUrl, timeout = 15000) }.getOrNull()
+    val videoUrl = html?.let { Regex("""videoUrl\s*=\s*["']([^"']+)""").find(it)?.groupValues?.get(1) }
+    Log.d(MYCIMA_TAG, "[watch  ] my_player videoUrl=${videoUrl?.take(80)}")
+    if (videoUrl.isNullOrBlank()) return n
+    emit(baseLabel, videoUrl, rawLink)
+    // Site convention: v.mp4 siblings per quality.
+    if (".m3u8" !in videoUrl && "v.mp4" in videoUrl) {
+        for (q in listOf("1080", "720", "480", "360")) {
+            emit("$baseLabel $q", videoUrl.replace("v.mp4", "$q.mp4"), rawLink)
+        }
+    }
+    return n
+}
+
 /** Episode/movie post -> ul#watch servers (+ downloads) -> EmbedRouter. */
 private suspend fun mycimaExtractPost(
     postUrl: String,
@@ -1922,6 +1971,11 @@ private suspend fun mycimaExtractPost(
         servers.toList().amap { (rawLink, name) ->
             async {
                 var link = rawLink.trim()
+                if ("mycima-my.com" in link) {
+                    val n = mycimaResolveOwnHost(link, name, postUrl, callback)
+                    Log.d(MYCIMA_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n (own host)")
+                    return@async
+                }
                 if ("govid" in link) {
                     link = if ("=" in link && "pic=" !in link) {
                         mycimaSmartDecode(link.substringAfterLast("=")) ?: mycimaDeepGovid(link, postUrl)
