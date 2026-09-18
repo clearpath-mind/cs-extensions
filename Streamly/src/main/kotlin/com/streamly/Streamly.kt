@@ -544,12 +544,32 @@ open class Streamly : MainAPI() {
                 // blind full retry — a failing provider would otherwise run
                 // twice and double the worst case.
                 val budget = StreamlyCache.getAdaptiveTimeout(provider.id)
+                StreamlyCache.clearRunState(provider.id)
                 var success = false
                 runCatching {
-                    success = withTimeoutOrNull(budget) {
+                    // Run detached from the timeout so a provider that matched
+                    // something can be granted extraction room below instead of
+                    // being cancelled at the first deadline.
+                    val deferred = async {
                         provider.invoke(res, dedupSub, dedupCallback)
+                    }
+                    success = withTimeoutOrNull(budget) {
+                        deferred.await()
                     } == true
-                    if (!success) Log.w(TAG, "${provider.name} budget exceeded (${budget}ms)")
+                    if (!success && StreamlyCache.hasEpisodeMatched(provider.id)) {
+                        val remaining =
+                            StreamlyCache.EXTRACTION_BUDGET_MS - (System.currentTimeMillis() - startTime)
+                        if (remaining > 0) {
+                            Log.d(TAG, "${provider.name} matched, extending budget by ${remaining}ms")
+                            success = withTimeoutOrNull(remaining) {
+                                deferred.await()
+                            } == true
+                        }
+                    }
+                    if (!success) {
+                        if (!deferred.isCompleted) deferred.cancel()
+                        Log.w(TAG, "${provider.name} budget exceeded (${budget}ms)")
+                    }
                 }.onFailure { e ->
                     Log.e(TAG, "${provider.name} failed: ${e.message}")
                 }
