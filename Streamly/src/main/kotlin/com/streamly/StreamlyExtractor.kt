@@ -2192,38 +2192,9 @@ private suspend fun faselHdExtractServers(
     Log.d(FASELHD_TAG, "[watch  ] post page in ${SystemClock.elapsedRealtime() - tPost}ms")
     var found = false
 
-    // Direct download path: .downloadLinks a -> POST -> .dl-link a (final video).
-    // The href is often relative — absolutize it or the POST below throws.
-    // Hard-capped at 6s: the locker host (t7meel.site) has timed out on every
-    // observed run and never produced a link; don't let it stall the path.
-    val downloadAnchor = doc.selectFirst(".downloadLinks a")
-    var downloadHref = ""
-    if (downloadAnchor != null) {
-        val raw = downloadAnchor.absUrl("href").ifEmpty { downloadAnchor.attr("href") }
-        if (raw.isNotBlank()) downloadHref = fixUrl(raw, base)
-    }
-    if (downloadHref.isNotBlank()) {
-        val tDl = SystemClock.elapsedRealtime()
-        try {
-            val playerDoc = withTimeout(6_000) {
-                cfPostDoc(downloadHref, referer = postUrl, timeout = 60000)
-            }
-            val dlLink = playerDoc.select("div.dl-link a").attr("href")
-            if (dlLink.isNotBlank()) {
-                found = true
-                callback(
-                    newExtractorLink("FaselHD - Direct", "FaselHD - Direct", dlLink) {
-                        this.referer = postUrl
-                        this.quality = getQualityFromName(dlLink)
-                        this.type = ExtractorLinkType.VIDEO
-                    },
-                )
-            }
-            Log.d(FASELHD_TAG, "[direct ] done in ${SystemClock.elapsedRealtime() - tDl}ms hit=${dlLink.isNotBlank()}")
-        } catch (e: Exception) {
-            Log.w(FASELHD_TAG, "[direct ] capped/failed in ${SystemClock.elapsedRealtime() - tDl}ms: ${e.message}")
-        }
-    }
+    // Direct download path runs LAST (see below): the locker POST's blocking
+    // I/O ignores coroutine cancellation, so it must not starve the iframe
+    // passes that actually carry the links.
 
     // Player iframes: WebView jwplayer decryption (enc: sources) + m3u8 sniff
     // first — the fast inline scan never hits on encrypted embeds (v7 capture:
@@ -2344,6 +2315,42 @@ private suspend fun faselHdExtractServers(
             } catch (e: Exception) {
                 Log.e(FASELHD_TAG, "[scan   ] failed: ${e.message}")
             }
+        }
+    }
+
+    // Direct download path, LAST by design: .downloadLinks a -> POST ->
+    // .dl-link a (final video). The href is often relative — absolutize it
+    // or the POST below throws. Runs after the iframe passes because the
+    // locker POST's blocking I/O ignores coroutine cancellation:
+    // withTimeout(6s) measured 50.3s on a dead locker (Blacklist S1E13 v76
+    // run), starving the passes that carry the links. The inner timeout is
+    // 6s so even a stuck POST bounds itself without relying on cancellation.
+    val downloadAnchor = doc.selectFirst(".downloadLinks a")
+    var downloadHref = ""
+    if (downloadAnchor != null) {
+        val raw = downloadAnchor.absUrl("href").ifEmpty { downloadAnchor.attr("href") }
+        if (raw.isNotBlank()) downloadHref = fixUrl(raw, base)
+    }
+    if (downloadHref.isNotBlank()) {
+        val tDl = SystemClock.elapsedRealtime()
+        try {
+            val playerDoc = withTimeout(6_000) {
+                cfPostDoc(downloadHref, referer = postUrl, timeout = 6000)
+            }
+            val dlLink = playerDoc.select("div.dl-link a").attr("href")
+            if (dlLink.isNotBlank()) {
+                found = true
+                callback(
+                    newExtractorLink("FaselHD - Direct", "FaselHD - Direct", dlLink) {
+                        this.referer = postUrl
+                        this.quality = getQualityFromName(dlLink)
+                        this.type = ExtractorLinkType.VIDEO
+                    },
+                )
+            }
+            Log.d(FASELHD_TAG, "[direct ] done in ${SystemClock.elapsedRealtime() - tDl}ms hit=${dlLink.isNotBlank()}")
+        } catch (e: Exception) {
+            Log.w(FASELHD_TAG, "[direct ] capped/failed in ${SystemClock.elapsedRealtime() - tDl}ms: ${e.message}")
         }
     }
 
