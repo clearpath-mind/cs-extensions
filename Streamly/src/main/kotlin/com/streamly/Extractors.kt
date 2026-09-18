@@ -64,9 +64,14 @@ internal fun isDeadLocker(url: String): Boolean {
  */
 internal fun dropRedundantMasters(links: List<ExtractorLink>): List<ExtractorLink> {
     if (links.size < 2) return links
-    fun isMaster(l: ExtractorLink): Boolean =
-        l.type == ExtractorLinkType.M3U8 &&
-            l.url.substringBefore("?").substringAfterLast("/").equals("master.m3u8", ignoreCase = true)
+    fun isMaster(l: ExtractorLink): Boolean {
+        if (l.type != ExtractorLinkType.M3U8) return false
+        // Wish-family hosts serve playlists as .txt (upstream intercepts
+        // `txt|m3u8`); treat both as masters.
+        val file = l.url.substringBefore("?").substringAfterLast("/")
+        return file.equals("master.m3u8", ignoreCase = true) ||
+            file.equals("master.txt", ignoreCase = true)
+    }
     fun dirOf(l: ExtractorLink): String = l.url.substringBefore("?").substringBeforeLast("/")
     val hasNonMasterDir = links.filterNot(::isMaster).map(::dirOf).toSet()
     if (hasNonMasterDir.isEmpty()) return links
