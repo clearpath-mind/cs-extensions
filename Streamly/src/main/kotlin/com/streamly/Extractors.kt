@@ -389,10 +389,18 @@ object EmbedRouter {
         val host = link.lowercase()
         // Always-expand: forward every variant built-in extractors emit
         // (Strwish 1080p/720p/…) so slow networks can pick a lower rendition.
-        // Subtitles still flow via subtitleCallback untouched. Buffer to drop
-        // same-directory master.m3u8 dupes before emitting.
+        // Subtitles still flow via subtitleCallback untouched, except the
+        // StreamWish placeholder ("Upload captions" -> empty.srt): an empty
+        // file on videos that already carry hardcoded Arabic subs.
         val buffered = ArrayList<ExtractorLink>()
         val out: (ExtractorLink) -> Unit = { l -> buffered.add(l) }
+        val subOut: (SubtitleFile) -> Unit = { s ->
+            if (s.url.contains("empty.srt", ignoreCase = true)) {
+                Log.d(TAG, "[route  ] skip placeholder subtitle ${s.url}")
+            } else {
+                subtitleCallback(s)
+            }
+        }
         try {
             val extractorName = when {
                 "vidtube" in host -> "Vidtube"
@@ -416,27 +424,27 @@ object EmbedRouter {
                 link.replace("/f/", "/e/")
             } else link
             when {
-                "vidtube" in host -> Vidtube().getUrl(routedLink, referer, subtitleCallback, out)
-                "updown" in host -> UpDown().getUrl(routedLink, referer, subtitleCallback, out)
-                "anafast" in host -> AnaFast().getUrl(routedLink, referer, subtitleCallback, out)
-                "vidspeed" in host -> VidSpeed().getUrl(routedLink, referer, subtitleCallback, out)
-                "cdnplus" in host -> CdnPlus().getUrl(routedLink, referer, subtitleCallback, out)
-                "mp4plus" in host -> Mp4Plus().getUrl(routedLink, referer, subtitleCallback, out)
-                "filelion" in host -> Filelion().getUrl(routedLink, referer, subtitleCallback, out)
-                "lulu" in host || "fastvip" in host || "streamwish" in host || "strwish" in host || "wish" in host -> Luluvdo().getUrl(routedLink, referer, subtitleCallback, out)
-                "hgcloud" in host -> Hgcloud().getUrl(routedLink, referer, subtitleCallback, out)
+                "vidtube" in host -> Vidtube().getUrl(routedLink, referer, subOut, out)
+                "updown" in host -> UpDown().getUrl(routedLink, referer, subOut, out)
+                "anafast" in host -> AnaFast().getUrl(routedLink, referer, subOut, out)
+                "vidspeed" in host -> VidSpeed().getUrl(routedLink, referer, subOut, out)
+                "cdnplus" in host -> CdnPlus().getUrl(routedLink, referer, subOut, out)
+                "mp4plus" in host -> Mp4Plus().getUrl(routedLink, referer, subOut, out)
+                "filelion" in host -> Filelion().getUrl(routedLink, referer, subOut, out)
+                "lulu" in host || "fastvip" in host || "streamwish" in host || "strwish" in host || "wish" in host -> Luluvdo().getUrl(routedLink, referer, subOut, out)
+                "hgcloud" in host -> Hgcloud().getUrl(routedLink, referer, subOut, out)
                 // Dood mirrors pin same-host mainUrl for playback Referer
                 // (upstream DoodExtractor design).
-                "playmogo" in host -> DoodPlaymogo().getUrl(routedLink, referer, subtitleCallback, out)
-                "dsvplay" in host -> DoodDsvplay().getUrl(routedLink, referer, subtitleCallback, out)
-                "ds2play" in host -> DoodDs2play().getUrl(routedLink, referer, subtitleCallback, out)
-                "doodstream" in host -> DoodStreamCom().getUrl(routedLink, referer, subtitleCallback, out)
-                isDoodHost(host) -> Dooood().getUrl(routedLink, referer, subtitleCallback, out)
-                "mixdrop" in host || "mxdrop" in host -> MixDropPs().getUrl(routedLink, referer, subtitleCallback, out)
-                "uqload" in host -> Uqload().getUrl(routedLink, referer, subtitleCallback, out)
-                "streamtape" in host -> StreamTape().getUrl(routedLink, referer, subtitleCallback, out)
+                "playmogo" in host -> DoodPlaymogo().getUrl(routedLink, referer, subOut, out)
+                "dsvplay" in host -> DoodDsvplay().getUrl(routedLink, referer, subOut, out)
+                "ds2play" in host -> DoodDs2play().getUrl(routedLink, referer, subOut, out)
+                "doodstream" in host -> DoodStreamCom().getUrl(routedLink, referer, subOut, out)
+                isDoodHost(host) -> Dooood().getUrl(routedLink, referer, subOut, out)
+                "mixdrop" in host || "mxdrop" in host -> MixDropPs().getUrl(routedLink, referer, subOut, out)
+                "uqload" in host -> Uqload().getUrl(routedLink, referer, subOut, out)
+                "streamtape" in host -> StreamTape().getUrl(routedLink, referer, subOut, out)
                 else -> {
-                    loadExtractor(routedLink, referer, subtitleCallback, out)
+                    loadExtractor(routedLink, referer, subOut, out)
                 }
             }
             var emittedN = 0

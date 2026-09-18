@@ -2026,11 +2026,21 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
     Log.d(FASELHD_TAG, "[search ] base=$base in ${SystemClock.elapsedRealtime() - tBase}ms")
 
     // Primary: theme live-search AJAX (matches Arabic titles server-side).
+    // When circuit-broken the AJAX endpoint is what's walled (each round
+    // burns ~30s for nothing) while `?s=` still answers — skip AJAX and go
+    // straight to the fallback so the probe budget isn't wasted.
+    val skipAjax = StreamlyCache.getProviderStats("faselhd").isCircuitBroken
+    if (skipAjax) {
+        Log.d(FASELHD_TAG, "[search ] broken: skipping AJAX, ?s= direct")
+    }
     // A CF wall (not a genuine empty) skips the stripped round: another
     // ~30s AJAX cycle is pointless, the `?s=` fallback answers in ~15s.
     val tAjax = SystemClock.elapsedRealtime()
     var walled = false
-    val primary = try {
+    val primary = if (skipAjax) {
+        walled = true
+        emptyList()
+    } else try {
         faselHdAjaxSearch(query, base)
     } catch (e: CfWalledException) {
         walled = true

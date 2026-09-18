@@ -86,7 +86,10 @@ object StreamlyCache {
         if (stats.successCount == 0) {
             return if (stats.isCircuitBroken) 20000L else baseTimeoutMs
         }
-        if (stats.isCircuitBroken) return 20000L
+        // Broken but previously successful: probe with room to repeat the
+        // slowest success (capped) — a flat 20s kills FaselHD mid-resolve
+        // when walled, locking it broken forever.
+        if (stats.isCircuitBroken) return minOf(maxOf(20000L, stats.maxTimeMs), 120000L)
         val avg = stats.avgTimeMs
         if (avg == 0L && stats.maxTimeMs == 0L) return baseTimeoutMs
         return minOf(maxOf(avg + 5000, stats.maxTimeMs, 20000L), 120000L)
