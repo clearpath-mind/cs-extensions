@@ -104,7 +104,11 @@ object CloudflareSolver {
         poll()
     }
 
-    suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String): SolverResult? {
+    /** @param awaitContent when false, deliver cookies as soon as clearance
+     *  is captured without waiting for rendered DOM (episode-post fetches
+     *  only need cookies for the OkHttp retry; the 30s content wait is pure
+     *  waste when the challenge platform can't load). */
+    suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String, awaitContent: Boolean = true): SolverResult? {
         return suspendCoroutine { continuation ->
             if (activity == null || activity.isFinishing) {
                 continuation.resume(null)
@@ -326,7 +330,7 @@ object CloudflareSolver {
 
                         if (currentCookies != null && currentCookies.contains("cf_clearance")) {
                             bypassWatching = false
-                            finishSuccess(currentLiveUrl, "cf_clearance captured")
+                            finishSuccess(currentLiveUrl, "cf_clearance captured", awaitContent)
                             return
                         }
 
