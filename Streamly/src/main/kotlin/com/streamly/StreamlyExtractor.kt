@@ -1061,6 +1061,7 @@ private suspend fun resolveEpisode(
         return false
     }
     Log.d(TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("topcinema")
 
     val doc = try {
         cfGetDoc(anchor.url, timeout = 15000)
@@ -1693,6 +1694,7 @@ private suspend fun mycimaResolveEpisode(
         return false
     }
     Log.d(MYCIMA_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("wecima")
 
     val doc = try {
         cfGetDoc(anchor.url, timeout = 15000)
@@ -2484,6 +2486,7 @@ private suspend fun faselHdResolveEpisode(
         return false
     }
     Log.d(FASELHD_TAG, "[match  ] anchor ${best.url}")
+    StreamlyCache.markEpisodeMatched("faselhd")
 
     val doc = try {
         faselHdGet(best.url)
@@ -2751,6 +2754,7 @@ private suspend fun shoofResolveEpisode(
         return false
     }
     Log.d(SHOOF_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("shoof")
 
     // Search also surfaces episode posts; only series posts list the season.
     // A direct episode hit still wins when its slug numbers agree.
@@ -3073,6 +3077,7 @@ private suspend fun egDeadResolveEpisode(
         return false
     }
     Log.d(EGDEAD_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("egydead")
 
     // A direct episode hit still wins when its numbers agree.
     if ("/episode/" in anchor.url) {

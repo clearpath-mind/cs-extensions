@@ -77,20 +77,22 @@ object StreamlyCache {
      * Per-provider time budget from history (StreamPlay adaptive-timeout
      * pattern, widened for WebView sources): a provider gets its slowest
      * success or avg+5s (never below 20s, never above 120s). Broken providers
-     * get 20s recovery probes — 5s made recovery impossible since a healthy
-     * FaselHD/MyCima run needs 15-70s and always timed out, locking them
-     * broken forever.
+     * without history get 30s recovery probes — dead ends return in seconds
+     * anyway, while a walled search needs ~25s just to anchor.
      *
-     * Phase-gated extension (v76): a broken never-successful provider that
-     * actually matched something (episode/post URL found, extraction started
+     * Phase-gated extension (v76+): a broken never-successful provider that
+     * actually matched something (series anchor or episode/post URL, signalled
      * via [markEpisodeMatched]) may keep running up to [EXTRACTION_BUDGET_MS]
-     * total — see loadLinks. Providers that never matched stay at 20s so
-     * dead ends (MyCima junk results, Shoof no-anchor) fail fast.
+     * total — see loadLinks. Providers that never matched stay at the 30s
+     * probe so dead ends (MyCima junk results, Shoof no-anchor) fail fast.
      */
     fun getAdaptiveTimeout(providerId: String, baseTimeoutMs: Long = 90000): Long {
         val stats = getProviderStats(providerId)
         if (stats.successCount == 0) {
-            return if (stats.isCircuitBroken) 20000L else baseTimeoutMs
+            // Broken without history gets 30s, not 20s: dead ends return in
+            // seconds anyway (MyCima/Shoof fail at ~5s), while a walled
+            // search needs ~25s just to anchor (FaselHD ?s= 24s on S1E13).
+            return if (stats.isCircuitBroken) 30000L else baseTimeoutMs
         }
         // Broken but previously successful: probe with room to repeat the
         // slowest success (capped) — a flat 20s kills FaselHD mid-resolve
