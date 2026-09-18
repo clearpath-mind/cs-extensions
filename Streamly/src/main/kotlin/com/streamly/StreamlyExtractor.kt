@@ -654,9 +654,11 @@ private fun cfHeaders(
     if (referer != null) put("Referer", referer)
 }
 
-/** Post-solve retries get a longer window (re-3arabi uses 30s): the origin
- *  is slower to answer once challenged than on a clean fetch. */
-private fun cfRetryTimeout(timeout: Long): Long = maxOf(timeout, 30000)
+/** Post-solve retry bound: with fresh clearance a healthy origin answers
+ *  HTML in seconds — a longer hang is a rate-limit tarpit (fasel-hd.co held
+ *  the retry the full 30s on Blacklist S1E13, then threw), not worth waiting
+ *  out when a bounded refetch can try again instead. */
+private fun cfRetryTimeout(timeout: Long): Long = maxOf(timeout, 12000)
 
 /** Use the solver's rendered DOM when it solved this exact page (avoids a
  *  redundant OkHttp round-trip whose bridged clearance CF may reject). */
@@ -748,10 +750,11 @@ private suspend fun cfGetDoc(
         return first.document
     }
     val ck = cfCookies(retryUrl)
+    var retryErr: String? = null
     val second = runCatching {
         app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0)
-    }.getOrNull()
-    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }}")
+    }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }} err=$retryErr")
     return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
 }
 
@@ -795,11 +798,12 @@ private suspend fun cfGetText(
     val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
+    var retryErr: String? = null
     val secondResp = runCatching {
         app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0)
-    }.getOrNull()
+    }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     val second: String? = secondResp?.text
-    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }}")
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }} err=$retryErr")
     return second ?: first?.text ?: ""
 }
 
@@ -835,11 +839,12 @@ private suspend fun cfPostText(
     val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
     // @Nullable annotation that isn't on the compile classpath.
+    var postErr: String? = null
     val secondResp = runCatching {
         app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = cfRetryTimeout(timeout), cacheTime = 0)
-    }.getOrNull()
+    }.onFailure { postErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     val retry: String? = secondResp?.text
-    Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }}")
+    Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }} err=$postErr")
     return retry ?: first ?: ""
 }
 
@@ -2175,6 +2180,16 @@ private fun faselHdExactEpisode(scope: Document, episode: Int): String? {
     return null
 }
 
+/** Error/challenge pages parse to near-empty docs: no player iframe, no
+ *  download anchor, tiny body. A legit episode page always carries watch
+ *  servers, so a doc failing all three is a stale walled fetch, not content. */
+private fun isFaselHdWalled(doc: Document): Boolean {
+    if (isCfChallenge(doc.toString())) return true
+    if (doc.selectFirst("iframe") != null) return false
+    if (doc.selectFirst(".downloadLinks a") != null) return false
+    return doc.body().text().length < 3000
+}
+
 private suspend fun faselHdExtractServers(
     postUrl: String,
     subtitleCallback: (SubtitleFile) -> Unit,
@@ -2183,13 +2198,26 @@ private suspend fun faselHdExtractServers(
     StreamlyCache.markEpisodeMatched("faselhd")
     val base = faselHdBase()
     val tPost = SystemClock.elapsedRealtime()
-    val doc = try {
+    var doc = try {
         faselHdGet(postUrl)
     } catch (e: Exception) {
         Log.e(FASELHD_TAG, "[watch  ] post page failed in ${SystemClock.elapsedRealtime() - tPost}ms: ${e.message}")
         return false
     }
     Log.d(FASELHD_TAG, "[watch  ] post page in ${SystemClock.elapsedRealtime() - tPost}ms")
+    if (isFaselHdWalled(doc)) {
+        // Post-solve retries can throw and leave cfGetDoc's stale walled
+        // document behind (429 page: no player, no embeds). Clearance cookies
+        // are fresh now, so one refetch usually passes — bounded by the same
+        // timeouts, and the solve itself is milliseconds when re-walled.
+        Log.d(FASELHD_TAG, "[watch  ] walled/empty page (${doc.body().text().length} chars), refetching once")
+        doc = try {
+            faselHdGet(postUrl)
+        } catch (e: Exception) {
+            Log.e(FASELHD_TAG, "[watch  ] refetch failed: ${e.message}")
+            return false
+        }
+    }
     var found = false
 
     // Direct download path runs LAST (see below): the locker POST's blocking

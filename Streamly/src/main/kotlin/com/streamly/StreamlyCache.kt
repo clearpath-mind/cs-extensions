@@ -109,10 +109,12 @@ object StreamlyCache {
 
     /**
      * Total wall-clock room for a provider run that matched something and
-     * entered extraction: walled search (~18s) plus episode extraction
-     * (~25s) must fit, cf. FaselHD Blacklist S1E13 needing ~46s end to end.
+     * entered extraction: walled search plus episode extraction plus one
+     * walled-page refetch plus WebView resolution must fit (a walled
+     * Blacklist S1E13 needs ~60s end to end; clean runs take ~35s and are
+     * unaffected since this is a cap, not a wait).
      */
-    const val EXTRACTION_BUDGET_MS = 45000L
+    const val EXTRACTION_BUDGET_MS = 75000L
 
     /** Providers that reached extraction in the current loadLinks run. */
     private val matchedProviders = ConcurrentHashMap.newKeySet<String>()
