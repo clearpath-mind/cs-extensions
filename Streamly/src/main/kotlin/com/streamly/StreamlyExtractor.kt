@@ -1368,6 +1368,43 @@ private fun unwrapPlayUrl(url: String): String {
 private const val MYCIMA_SEED_URL = "https://mycima.gdn"
 private const val MYCIMA_TAG = "MyCima"
 
+/** TMDB Arabic title: mycima.gdn's search backend matches Arabic titles only
+ *  (Latin queries render server-side no-results). One lookup per id. */
+private val mycimaArTitleCache = java.util.concurrent.ConcurrentHashMap<Int, String>()
+
+private suspend fun mycimaArabicTitle(tmdbId: Int?, isMovie: Boolean, latinTitle: String): String? {
+    if (tmdbId == null || tmdbId <= 0) return null
+    mycimaArTitleCache[tmdbId]?.let { return it }
+    val kind = if (isMovie) "movie" else "tv"
+    val ar = runCatching {
+        val o = JSONObject(
+            app.get(
+                "https://api.themoviedb.org/3/$kind/$tmdbId?api_key=${BuildConfig.TMDB_API}&language=ar-SA",
+                timeout = 8000,
+            ).text
+        )
+        (if (isMovie) o.optString("title") else o.optString("name")).trim()
+            .takeIf { it.isNotBlank() && !it.equals(latinTitle, ignoreCase = true) }
+    }.getOrNull()
+    if (ar != null) {
+        mycimaArTitleCache[tmdbId] = ar
+        Log.d(MYCIMA_TAG, "[search ] ar title for $tmdbId: '$ar'")
+    }
+    return ar
+}
+
+/** Arabic containment: significant query tokens all present in the slug.
+ *  Latin-tuned FuzzySearch can't see Arabic; the slug carries the full
+ *  Arabic title (مشاهدة-مسلسل-القائمة-السوداء-حلقة-13), so containment is exact. */
+private fun mycimaArabicHit(c: Candidate, arTitle: String, year: Int?): Boolean {
+    val tokens = arTitle.replace('-', ' ').split(Regex("\\s+")).filter { it.length >= 3 }
+    if (tokens.isEmpty()) return false
+    val slug = decodeSlug(c.url)
+    if (!tokens.all { slug.contains(it) }) return false
+    val cy = c.year
+    return cy == null || year == null || Math.abs(cy - year) <= 2
+}
+
 /** MyCima rotates domains; resolve the live origin once and reuse it. */
 private suspend fun mycimaBase(): String = resolveOrigin(MYCIMA_SEED_URL)
 
@@ -1385,10 +1422,11 @@ suspend fun invokeMyCima(
     val countingCallback: (ExtractorLink) -> Unit = { emitted++; callback(it) }
 
     return try {
+        val arTitle = mycimaArabicTitle(res.id, res.isMovie, title)
         val ok = if (res.isMovie) {
-            mycimaResolveMovie(title, res.year, subtitleCallback, countingCallback)
+            mycimaResolveMovie(title, res.year, subtitleCallback, countingCallback, arTitle)
         } else {
-            mycimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, countingCallback)
+            mycimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, countingCallback, arTitle)
         }
         Log.d(MYCIMA_TAG, "[done  ] emitted=$emitted")
         StreamlyDiag.lastStage = if (emitted > 0) "MyCima: ok" else "MyCima: no links"
@@ -1620,8 +1658,22 @@ private suspend fun mycimaResolveMovie(
     year: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
+    arTitle: String? = null,
 ): Boolean {
-    val candidates = mycimaSearch(title)
+    val candidates = mycimaSearch(arTitle ?: title)
+    if (arTitle != null) {
+        // Arabic discovery: containment on the slug, shortest URL wins
+        // (series main posts beat per-episode posts).
+        val best = candidates.filter { mycimaArabicHit(it, arTitle, year) }
+            .minByOrNull { it.url.length }
+        if (best == null) {
+            Log.d(MYCIMA_TAG, "[match  ] no arabic movie for '$arTitle'")
+            return false
+        }
+        Log.d(MYCIMA_TAG, "[match  ] WINNER ${best.url}")
+        StreamlyCache.markEpisodeMatched("wecima")
+        return mycimaExtractPost(best.url, subtitleCallback, callback)
+    }
     // Prefer non-series posts; fall back to the full pool when unknown.
     val pool = candidates.filter { it.isSeries != true }.ifEmpty { candidates }
     val scored = pool.map { it to scoreCandidate(it, title, year) }
@@ -1679,8 +1731,35 @@ private suspend fun mycimaResolveEpisode(
     year: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
+    arTitle: String? = null,
 ): Boolean {
-    val candidates = mycimaSearch(title)
+    val candidates = mycimaSearch(arTitle ?: title)
+    if (arTitle != null) {
+        // Arabic discovery returns per-episode posts: a slug episode hit
+        // extracts directly; otherwise anchor the best series-ish post.
+        val direct = candidates
+            .filter {
+                mycimaArabicHit(it, arTitle, year) &&
+                    EPISODE_REGEX.find(decodeSlug(it.url))?.groupValues?.get(1)?.toIntOrNull() == episode
+            }
+            .minByOrNull { it.url.length }
+        if (direct != null) {
+            Log.d(MYCIMA_TAG, "[match  ] E$episode direct ${direct.url}")
+            StreamlyCache.markEpisodeMatched("wecima")
+            return mycimaExtractPost(direct.url, subtitleCallback, callback)
+        }
+        val anchor = candidates
+            .filter { mycimaArabicHit(it, arTitle, year) && EPISODE_REGEX.find(decodeSlug(it.url)) == null }
+            .minByOrNull { it.url.length }
+            ?: candidates.filter { mycimaArabicHit(it, arTitle, year) }.minByOrNull { it.url.length }
+        if (anchor == null) {
+            Log.d(MYCIMA_TAG, "[match  ] no arabic anchor for '$arTitle'")
+            return false
+        }
+        Log.d(MYCIMA_TAG, "[match  ] anchor ${anchor.url}")
+        StreamlyCache.markEpisodeMatched("wecima")
+        return mycimaAnchoredEpisode(anchor, season, episode, subtitleCallback, callback)
+    }
     // Prefer series posts; fall back to the full pool when unknown.
     val pool = candidates.filter { it.isSeries != false }.ifEmpty { candidates }
     val scored = pool.map { it to scoreCandidate(it, title, year) }
@@ -1695,6 +1774,17 @@ private suspend fun mycimaResolveEpisode(
     }
     Log.d(MYCIMA_TAG, "[match  ] anchor ${anchor.url}")
     StreamlyCache.markEpisodeMatched("wecima")
+    return mycimaAnchoredEpisode(anchor, season, episode, subtitleCallback, callback)
+}
+
+/** Shared series-anchor tail: season tabs / inline list / Episodes.php. */
+private suspend fun mycimaAnchoredEpisode(
+    anchor: Candidate,
+    season: Int,
+    episode: Int,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
 
     val doc = try {
         cfGetDoc(anchor.url, timeout = 15000)
