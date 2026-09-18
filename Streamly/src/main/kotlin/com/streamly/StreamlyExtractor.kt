@@ -614,14 +614,14 @@ private fun isCfChallenge(text: String): Boolean =
 /** Solve a CloudFlare challenge via the WebView solver, sharing one lock so
  *  only a single solve runs at a time. Cookies land in the shared
  *  CookieManager; callers retry with them (re-3arabi httpGet pattern). */
-private suspend fun cfSolve(url: String): SolverResult? {
+private suspend fun cfSolve(url: String, awaitContent: Boolean = true): SolverResult? {
     val activity = StreamlyRuntime.context as? Activity
     if (activity == null) {
         Log.w(TAG, "[cf     ] no Activity context available, skipping WebView solver for $url")
         return null
     }
     refreshRealUa()
-    return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, effectiveUa()) }
+    return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, effectiveUa(), awaitContent) }
 }
 
 private fun cfHeaders(
@@ -718,6 +718,7 @@ private suspend fun cfGetDoc(
     referer: String? = null,
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
+    awaitContent: Boolean = true,
 ): Document {
     val target = applyHostOverride(url)
     val first = runCatching {
@@ -739,7 +740,7 @@ private suspend fun cfGetDoc(
         }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
-    val solved = cfSolve(target)
+    val solved = cfSolve(target, awaitContent)
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
         takeSolverHtml(solved, retryUrl)?.let { html ->
@@ -1906,8 +1907,8 @@ internal suspend fun faselHdBase(): String {
 }
 
 /** CF-aware GET backed by the shared WebView solver (see cfGetDoc). */
-private suspend fun faselHdGet(url: String, referer: String? = null): Document =
-    cfGetDoc(url, referer = referer, timeout = 20000)
+private suspend fun faselHdGet(url: String, referer: String? = null, fastSolve: Boolean = false): Document =
+    cfGetDoc(url, referer = referer, timeout = 20000, awaitContent = !fastSolve)
 
 /** Shared card parser for FaselHD list fragments (`?s=` pages and AJAX html). */
 private fun faselHdParseCards(doc: Document): List<Candidate> =
@@ -2199,7 +2200,11 @@ private suspend fun faselHdExtractServers(
     val base = faselHdBase()
     val tPost = SystemClock.elapsedRealtime()
     var doc = try {
-        faselHdGet(postUrl)
+        // fastSolve: the episode post only needs clearance cookies for the
+        // OkHttp retry — skip the solver's 30s rendered-DOM wait (the
+        // challenge platform is DNS-blocked on this network, so settled DOM
+        // never arrives and the wait always burns the full timeout).
+        faselHdGet(postUrl, fastSolve = true)
     } catch (e: Exception) {
         Log.e(FASELHD_TAG, "[watch  ] post page failed in ${SystemClock.elapsedRealtime() - tPost}ms: ${e.message}")
         return false
@@ -2212,7 +2217,7 @@ private suspend fun faselHdExtractServers(
         // timeouts, and the solve itself is milliseconds when re-walled.
         Log.d(FASELHD_TAG, "[watch  ] walled/empty page (${doc.body().text().length} chars), refetching once")
         doc = try {
-            faselHdGet(postUrl)
+            faselHdGet(postUrl, fastSolve = true)
         } catch (e: Exception) {
             Log.e(FASELHD_TAG, "[watch  ] refetch failed: ${e.message}")
             return false
