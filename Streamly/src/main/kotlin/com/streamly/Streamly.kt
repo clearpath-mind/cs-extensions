@@ -546,12 +546,21 @@ open class Streamly : MainAPI() {
                 val budget = StreamlyCache.getAdaptiveTimeout(provider.id)
                 StreamlyCache.clearRunState(provider.id)
                 var success = false
+                // Emissions are side effects that survive cancellation: a
+                // provider killed mid-tail still contributed rows (FaselHD
+                // Server 2 out at ~47s, deferred cancelled at 75s). Count
+                // them so the breaker learns from rows, not just returns.
+                val emitted = java.util.concurrent.atomic.AtomicInteger(0)
+                val countingCallback: (ExtractorLink) -> Unit = {
+                    emitted.incrementAndGet()
+                    dedupCallback(it)
+                }
                 runCatching {
                     // Run detached from the timeout so a provider that matched
                     // something can be granted extraction room below instead of
                     // being cancelled at the first deadline.
                     val deferred = async {
-                        provider.invoke(res, dedupSub, dedupCallback)
+                        provider.invoke(res, dedupSub, countingCallback)
                     }
                     success = withTimeoutOrNull(budget) {
                         deferred.await()
@@ -568,9 +577,15 @@ open class Streamly : MainAPI() {
                             } == true
                         }
                     }
+                    if (emitted.get() > 0) success = true
                     if (!success) {
                         if (!deferred.isCompleted) deferred.cancel()
                         Log.w(TAG, "${provider.name} budget exceeded (${allowedMs}ms)")
+                    } else if (!deferred.isCompleted) {
+                        // invoke still grinding (direct tail, slow probes) but
+                        // rows are already out: stop it, keep the success.
+                        deferred.cancel()
+                        Log.d(TAG, "${provider.name} emitted ${emitted.get()} links, stopping tail")
                     }
                 }.onFailure { e ->
                     Log.e(TAG, "${provider.name} failed: ${e.message}")
