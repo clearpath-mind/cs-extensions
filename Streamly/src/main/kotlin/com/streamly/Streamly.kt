@@ -38,7 +38,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 
@@ -540,18 +539,19 @@ open class Streamly : MainAPI() {
         val tasks: List<suspend () -> Unit> = prioritized.map { provider ->
             suspend {
                 val startTime = System.currentTimeMillis()
+                // Adaptive budget from history (StreamPlay pattern): a provider
+                // gets its average + headroom, never an unbounded grind. No
+                // blind full retry — a failing provider would otherwise run
+                // twice and double the worst case.
+                val budget = StreamlyCache.getAdaptiveTimeout(provider.id)
                 var success = false
                 runCatching {
-                    success = provider.invoke(res, dedupSub, dedupCallback)
+                    success = withTimeoutOrNull(budget) {
+                        provider.invoke(res, dedupSub, dedupCallback)
+                    } == true
+                    if (!success) Log.w(TAG, "${provider.name} budget exceeded (${budget}ms)")
                 }.onFailure { e ->
-                    Log.w(TAG, "${provider.name} failed, retrying: ${e.message}")
-                    delay(1500)
-                    runCatching {
-                        success = provider.invoke(res, dedupSub, dedupCallback)
-                        Log.d(TAG, "Retry succeeded: ${provider.name}")
-                    }.onFailure { retryError ->
-                        Log.e(TAG, "${provider.name} failed after retry: ${retryError.message}")
-                    }
+                    Log.e(TAG, "${provider.name} failed: ${e.message}")
                 }
                 StreamlyCache.recordProviderExecution(
                     provider.id,

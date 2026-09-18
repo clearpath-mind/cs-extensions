@@ -71,6 +71,26 @@ object StreamlyCache {
         return base + (stats.successRate * 100f - timePenalty)
     }
 
+    /**
+     * Per-provider time budget from history (StreamPlay adaptive-timeout
+     * pattern): fast providers keep headroom, slow ones get avg+5s, broken
+     * ones are capped at 5s so they can't stall the tail.
+     */
+    fun getAdaptiveTimeout(providerId: String, baseTimeoutMs: Long = 60000): Long {
+        val stats = getProviderStats(providerId)
+        if (stats.successCount == 0) {
+            return if (stats.isCircuitBroken) 5000L else baseTimeoutMs
+        }
+        if (stats.isCircuitBroken) return 5000L
+        val avg = stats.avgTimeMs
+        return when {
+            avg == 0L -> baseTimeoutMs
+            avg < 3000 -> maxOf(avg + 2000, 5000)
+            avg < 10000 -> avg + 5000
+            else -> minOf(avg + 5000, baseTimeoutMs * 2)
+        }
+    }
+
     // ==================== Persistence ====================
 
     private const val STATS_PREFIX = "streamly_stats_"
