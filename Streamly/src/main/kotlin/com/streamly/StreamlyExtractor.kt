@@ -3141,6 +3141,13 @@ private suspend fun egDeadWatchServers(
                 if (link.contains("hgcloud", ignoreCase = true)) {
                     // The JS loader redirects to rotating player hosts. Use one
                     // bounded WebView attempt, not the shared challenge queue.
+                    // Label with the server name so the player list reads
+                    // "EgyDead - StreamHG" instead of a bare "EgyDead".
+                    val serverLabel = if (!name.isNullOrBlank() && name != "?") {
+                        "$providerLabel - $name"
+                    } else {
+                        "$providerLabel - ${faselHdHostOf(link)}"
+                    }
                     var playerUrl = link
                     val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true) {
                         playerUrl = it
@@ -3148,14 +3155,14 @@ private suspend fun egDeadWatchServers(
                     if (!hit.isNullOrBlank()) {
                         if (hit.substringBefore("?").endsWith(".mp4", ignoreCase = true)) {
                             counting(
-                                newExtractorLink(providerLabel, providerLabel, url = hit) {
+                                newExtractorLink(providerLabel, serverLabel, url = hit) {
                                     this.referer = link
                                     this.quality = getQualityFromName(hit)
                                     this.type = ExtractorLinkType.VIDEO
                                 },
                             )
                         } else {
-                            faselHdEmitResolved(hit, link, getBaseUrl(link), counting, providerLabel)
+                            faselHdEmitResolved(hit, link, getBaseUrl(link), counting, serverLabel)
                         }
                     }
                     Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n webview=${!hit.isNullOrBlank()}")
