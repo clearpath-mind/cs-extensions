@@ -1939,15 +1939,22 @@ private suspend fun mycimaResolveOwnHost(
         return n
     }
     var html = runCatching { cfGetText(rawLink, referer = postUrl, timeout = 15000) }.getOrNull()
-    var videoUrl = html?.let { Regex("""videoUrl\s*=\s*["']([^"']+)""").find(it)?.groupValues?.get(1) }
+    fun extractVideoUrl(h: String): String? {
+        // Artplayer config: const videoUrl = "<file>".
+        Regex("""videoUrl\s*=\s*["']([^"']+)""").find(h)?.groupValues?.get(1)?.let { return it }
+        // Fallback: the file host is distinctive — any link.mycima.cv URL.
+        Regex("""https?://link\.mycima\.cv/[A-Za-z0-9]+""").find(h)?.value?.let { return it }
+        return null
+    }
+    var videoUrl = html?.let { extractVideoUrl(it) }
     if (videoUrl.isNullOrBlank() && html != null && isCfChallenge(html)) {
         // 200-with-challenge: the solve ran but the DOM never settled.
         // Clearance cookies are fresh now — one plain refetch often passes.
         Log.d(MYCIMA_TAG, "[watch  ] my_player challenged (${html.length} chars), refetching once")
         html = runCatching { cfGetText(rawLink, referer = postUrl, timeout = 15000) }.getOrNull()
-        videoUrl = html?.let { Regex("""videoUrl\s*=\s*["']([^"']+)""").find(it)?.groupValues?.get(1) }
+        videoUrl = html?.let { extractVideoUrl(it) }
     }
-    Log.d(MYCIMA_TAG, "[watch  ] my_player videoUrl=${videoUrl?.take(80)} page=${html?.length ?: -1} challenged=${html?.let { isCfChallenge(it) }}")
+    Log.d(MYCIMA_TAG, "[watch  ] my_player videoUrl=${videoUrl?.take(80)} page=${html?.length ?: -1} challenged=${html?.let { isCfChallenge(it) }} videoUrlHits=${html?.let { Regex("videoUrl").findAll(it).count() } ?: -1} fileHits=${html?.let { Regex("link\\.mycima\\.cv").findAll(it).count() } ?: -1}")
     if (videoUrl.isNullOrBlank()) return n
     emit(baseLabel, videoUrl, rawLink)
     // Site convention: v.mp4 siblings per quality.
