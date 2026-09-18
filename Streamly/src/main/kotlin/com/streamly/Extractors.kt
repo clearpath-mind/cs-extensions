@@ -162,10 +162,43 @@ class UpDown : PackedJwPlayer() {
     override val mainUrl = "https://updown.icu"
 }
 
-/** Dood family (d0o0d.com and rotations) */
+/** Dood family (d0o0d.com and rotations). Per-mirror subclasses pin mainUrl
+ *  so the playback Referer stays same-host (upstream DoodExtractor design);
+ *  d0o0d.com itself 301s to playmogo.com. */
 class Dooood : DoodLaExtractor() {
     override var name = "Dood"
-    override var mainUrl = "https://d0o0d.com"
+    override var mainUrl = "https://playmogo.com"
+}
+
+class DoodPlaymogo : DoodLaExtractor() {
+    override var name = "Dood"
+    override var mainUrl = "https://playmogo.com"
+}
+
+class DoodDsvplay : DoodLaExtractor() {
+    override var name = "Dood"
+    override var mainUrl = "https://dsvplay.com"
+}
+
+class DoodDs2play : DoodLaExtractor() {
+    override var name = "Dood"
+    override var mainUrl = "https://ds2play.com"
+}
+
+class DoodStreamCom : DoodLaExtractor() {
+    override var name = "Dood"
+    override var mainUrl = "https://doodstream.com"
+}
+
+/** True when [host] belongs to the DoodStream mirror family (upstream
+ *  DoodExtractor mirror list + observed rotations). */
+private fun isDoodHost(host: String): Boolean {
+    if ("dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host ||
+        "playmogo" in host || "dsvplay" in host || "ds2play" in host || "ds2video" in host ||
+        "doods.pro" in host || "vide0.net" in host || "myvidplay" in host
+    ) return true
+    // dood.wf/cx/sh/watch/pm/to/so/ws/yt/li
+    return Regex("""dood\.(wf|cx|sh|watch|pm|to|so|ws|yt|li)""").containsMatchIn(host)
 }
 
 /** MixDrop (mixdrop.ps and rotations) */
@@ -334,6 +367,7 @@ object EmbedRouter {
                 "mixdrop" in host || "mxdrop" in host -> "MixDrop"
                 "uqload" in host -> "Uqload"
                 "streamtape" in host -> "Streamtape"
+                isDoodHost(host) -> "Dood"
                 else -> "loadExtractor"
             }
             Log.d(TAG, "[route  ] $host -> $extractorName")
@@ -350,8 +384,13 @@ object EmbedRouter {
                 "mp4plus" in host -> Mp4Plus().getUrl(routedLink, referer, subtitleCallback, out)
                 "filelion" in host -> Filelion().getUrl(routedLink, referer, subtitleCallback, out)
                 "lulu" in host || "fastvip" in host -> Luluvdo().getUrl(routedLink, referer, subtitleCallback, out)
-                "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host || "dsvplay" in host || "ds2play" in host ->
-                    Dooood().getUrl(routedLink, referer, subtitleCallback, out)
+                // Dood mirrors pin same-host mainUrl for playback Referer
+                // (upstream DoodExtractor design).
+                "playmogo" in host -> DoodPlaymogo().getUrl(routedLink, referer, subtitleCallback, out)
+                "dsvplay" in host -> DoodDsvplay().getUrl(routedLink, referer, subtitleCallback, out)
+                "ds2play" in host -> DoodDs2play().getUrl(routedLink, referer, subtitleCallback, out)
+                "doodstream" in host -> DoodStreamCom().getUrl(routedLink, referer, subtitleCallback, out)
+                isDoodHost(host) -> Dooood().getUrl(routedLink, referer, subtitleCallback, out)
                 "mixdrop" in host || "mxdrop" in host -> MixDropPs().getUrl(routedLink, referer, subtitleCallback, out)
                 "uqload" in host -> Uqload().getUrl(routedLink, referer, subtitleCallback, out)
                 "streamtape" in host -> StreamTape().getUrl(routedLink, referer, subtitleCallback, out)
