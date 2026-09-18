@@ -1302,6 +1302,7 @@ private suspend fun topcinemaWithDownload(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
+    StreamlyCache.markEpisodeMatched("topcinema")
     val base = epUrl.trimEnd('/')
     val ok = extractServers("$base/watch/", subtitleCallback, callback)
     val dl = topcinemaDownloadLinks("$base/download/", subtitleCallback, callback)
@@ -1790,6 +1791,7 @@ private suspend fun mycimaExtractPost(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean = coroutineScope {
+    StreamlyCache.markEpisodeMatched("wecima")
     try {
         val doc = cfGetDoc(postUrl, timeout = 15000)
         val servers = LinkedHashSet<Pair<String, String?>>()
@@ -2178,6 +2180,7 @@ private suspend fun faselHdExtractServers(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
+    StreamlyCache.markEpisodeMatched("faselhd")
     val base = faselHdBase()
     val tPost = SystemClock.elapsedRealtime()
     val doc = try {
@@ -2741,6 +2744,7 @@ private suspend fun shoofPostServers(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
+    StreamlyCache.markEpisodeMatched("shoof")
     return try {
         val text = cfGetText(postUrl, timeout = 15000)
         val doc = Jsoup.parse(text, postUrl)
@@ -3095,6 +3099,7 @@ private suspend fun egDeadWatchServers(
     callback: (ExtractorLink) -> Unit,
     providerLabel: String = "EgyDead",
 ): Boolean = coroutineScope {
+    StreamlyCache.markEpisodeMatched("egydead")
     try {
         val watchUrl = postUrl.trimEnd('/') + "?view=watch"
         val doc = try {

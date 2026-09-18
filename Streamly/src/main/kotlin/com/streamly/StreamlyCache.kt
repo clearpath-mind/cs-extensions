@@ -80,6 +80,12 @@ object StreamlyCache {
      * get 20s recovery probes — 5s made recovery impossible since a healthy
      * FaselHD/MyCima run needs 15-70s and always timed out, locking them
      * broken forever.
+     *
+     * Phase-gated extension (v76): a broken never-successful provider that
+     * actually matched something (episode/post URL found, extraction started
+     * via [markEpisodeMatched]) may keep running up to [EXTRACTION_BUDGET_MS]
+     * total — see loadLinks. Providers that never matched stay at 20s so
+     * dead ends (MyCima junk results, Shoof no-anchor) fail fast.
      */
     fun getAdaptiveTimeout(providerId: String, baseTimeoutMs: Long = 90000): Long {
         val stats = getProviderStats(providerId)
@@ -97,6 +103,31 @@ object StreamlyCache {
         val avg = stats.avgTimeMs
         if (avg == 0L && stats.maxTimeMs == 0L) return baseTimeoutMs
         return minOf(maxOf(avg + 5000, stats.maxTimeMs, 20000L), 120000L)
+    }
+
+    // ==================== Per-run match signal ====================
+
+    /**
+     * Total wall-clock room for a provider run that matched something and
+     * entered extraction: walled search (~18s) plus episode extraction
+     * (~25s) must fit, cf. FaselHD Blacklist S1E13 needing ~46s end to end.
+     */
+    const val EXTRACTION_BUDGET_MS = 45000L
+
+    /** Providers that reached extraction in the current loadLinks run. */
+    private val matchedProviders = ConcurrentHashMap.newKeySet<String>()
+
+    /** Called on entry to a provider's post/episode extraction. */
+    fun markEpisodeMatched(providerId: String) {
+        matchedProviders.add(providerId)
+    }
+
+    fun hasEpisodeMatched(providerId: String): Boolean =
+        matchedProviders.contains(providerId)
+
+    /** Called before each provider run so a stale match never extends. */
+    fun clearRunState(providerId: String) {
+        matchedProviders.remove(providerId)
     }
 
     // ==================== Persistence ====================
