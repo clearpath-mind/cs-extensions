@@ -1891,6 +1891,8 @@ private suspend fun faselHdAjaxSearch(query: String, base: String): List<Candida
         .build()
     val bodyStr = try {
         faselHdAjaxPost("$base/wp-admin/admin-ajax.php", base, formBody)
+    } catch (e: CfWalledException) {
+        throw e
     } catch (e: Exception) {
         Log.e(FASELHD_TAG, "[search ] ajax failed: ${e.message}")
         null
@@ -1901,10 +1903,12 @@ private suspend fun faselHdAjaxSearch(query: String, base: String): List<Candida
 
 /**
  * Raw OkHttp AJAX POST with manual redirect handling (re-3arabi
- * `makeAjaxRequest`). Throws IllegalStateException("403_FORBIDDEN") on a
- * Cloudflare block so the caller can refresh clearance and retry once
- * (re-3arabi `executeRequestWithCloudflareRetry`).
+ * `makeAjaxRequest`). Throws CfWalledException when the endpoint stays
+ * Cloudflare-blocked even after a clearance refresh, so the caller can skip
+ * straight to the `?s=` fallback instead of burning another ~30s round.
  */
+private class CfWalledException : IllegalStateException("CF_WALLED")
+
 private suspend fun faselHdAjaxPost(
     ajaxUrl: String,
     base: String,
@@ -1916,9 +1920,16 @@ private suspend fun faselHdAjaxPost(
         if (e.message != "403_FORBIDDEN") return null
     }
     Log.d(FASELHD_TAG, "[search ] 403 on AJAX, refreshing CF clearance…")
-    cfSolve(ajaxUrl)
+    // Solve the renderable base page, not the AJAX endpoint itself: the
+    // endpoint returns "0"/empty so the WebView solver can never observe a
+    // solved DOM there (re-3arabi smartPost solves mainUrl for the same
+    // reason). Clearance cookies are site-wide.
+    cfSolve(base)
     return try {
         faselHdAjaxAttempt(ajaxUrl, base, formBody, cfCookies(base))
+    } catch (e: IllegalStateException) {
+        if (e.message == "403_FORBIDDEN") throw CfWalledException()
+        null
     } catch (_: Exception) {
         null
     }
@@ -1991,9 +2002,16 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
     Log.d(FASELHD_TAG, "[search ] base=$base in ${SystemClock.elapsedRealtime() - tBase}ms")
 
     // Primary: theme live-search AJAX (matches Arabic titles server-side).
+    // A CF wall (not a genuine empty) skips the stripped round: another
+    // ~30s AJAX cycle is pointless, the `?s=` fallback answers in ~15s.
     val tAjax = SystemClock.elapsedRealtime()
+    var walled = false
     val primary = try {
         faselHdAjaxSearch(query, base)
+    } catch (e: CfWalledException) {
+        walled = true
+        Log.d(FASELHD_TAG, "[search ] ajax walled for '$query', skipping to ?s=")
+        emptyList()
     } catch (e: Exception) {
         Log.e(FASELHD_TAG, "[search ] ajax failed: ${e.message}")
         emptyList()
@@ -2005,12 +2023,15 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
     Log.d(FASELHD_TAG, "[search ] ajax '$query' empty in ${SystemClock.elapsedRealtime() - tAjax}ms")
 
     // Same AJAX with leading article stripped ("The X" -> "X"), which the
-    // Arabic index often drops.
+    // Arabic index often drops. Skipped when walled (see above).
     val stripped = query.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
-    if (stripped.isNotBlank() && stripped != query) {
+    if (!walled && stripped.isNotBlank() && stripped != query) {
         val tStripped = SystemClock.elapsedRealtime()
         val retry = try {
             faselHdAjaxSearch(stripped, base)
+        } catch (_: CfWalledException) {
+            walled = true
+            emptyList()
         } catch (_: Exception) {
             emptyList()
         }
