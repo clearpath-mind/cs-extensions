@@ -18,6 +18,7 @@ object StreamlyCache {
         val failureCount: Int = 0,
         val totalTimeMs: Long = 0,
         val consecutiveFailures: Int = 0,
+        val maxTimeMs: Long = 0,
     ) {
         val successRate: Float
             get() = if (successCount + failureCount == 0) 0f
@@ -42,6 +43,7 @@ object StreamlyCache {
                 successCount = current.successCount + 1,
                 totalTimeMs = current.totalTimeMs + durationMs,
                 consecutiveFailures = 0,
+                maxTimeMs = maxOf(current.maxTimeMs, durationMs),
             )
         } else {
             current.copy(
@@ -73,22 +75,21 @@ object StreamlyCache {
 
     /**
      * Per-provider time budget from history (StreamPlay adaptive-timeout
-     * pattern): fast providers keep headroom, slow ones get avg+5s, broken
-     * ones are capped at 5s so they can't stall the tail.
+     * pattern, widened for WebView sources): a provider gets its slowest
+     * success or avg+5s (never below 20s, never above 120s). Broken providers
+     * get 20s recovery probes — 5s made recovery impossible since a healthy
+     * FaselHD/MyCima run needs 15-70s and always timed out, locking them
+     * broken forever.
      */
-    fun getAdaptiveTimeout(providerId: String, baseTimeoutMs: Long = 60000): Long {
+    fun getAdaptiveTimeout(providerId: String, baseTimeoutMs: Long = 90000): Long {
         val stats = getProviderStats(providerId)
         if (stats.successCount == 0) {
-            return if (stats.isCircuitBroken) 5000L else baseTimeoutMs
+            return if (stats.isCircuitBroken) 20000L else baseTimeoutMs
         }
-        if (stats.isCircuitBroken) return 5000L
+        if (stats.isCircuitBroken) return 20000L
         val avg = stats.avgTimeMs
-        return when {
-            avg == 0L -> baseTimeoutMs
-            avg < 3000 -> maxOf(avg + 2000, 5000)
-            avg < 10000 -> avg + 5000
-            else -> minOf(avg + 5000, baseTimeoutMs * 2)
-        }
+        if (avg == 0L && stats.maxTimeMs == 0L) return baseTimeoutMs
+        return minOf(maxOf(avg + 5000, stats.maxTimeMs, 20000L), 120000L)
     }
 
     // ==================== Persistence ====================
@@ -101,7 +102,7 @@ object StreamlyCache {
             providerStatsMap.forEach { (id, stats) ->
                 putString(
                     STATS_PREFIX + id,
-                    "${stats.successCount},${stats.failureCount},${stats.totalTimeMs},${stats.consecutiveFailures}"
+                    "${stats.successCount},${stats.failureCount},${stats.totalTimeMs},${stats.consecutiveFailures},${stats.maxTimeMs}"
                 )
             }
         }.apply()
@@ -120,6 +121,7 @@ object StreamlyCache {
                     failureCount = parts[1].toInt(),
                     totalTimeMs = parts[2].toLong(),
                     consecutiveFailures = parts[3].toInt(),
+                    maxTimeMs = parts.getOrNull(4)?.toLongOrNull() ?: 0L,
                 )
             }.onFailure { Log.e(TAG, "Error loading stats for $id: ${it.message}") }
         }
