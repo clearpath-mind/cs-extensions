@@ -1356,7 +1356,7 @@ private fun unwrapPlayUrl(url: String): String {
 
 // ---------------------------------------------------------------------------
 // MyCima (mycima.gdn) link source. Port of re-3arabi MyCimaProvider, adapted
-// to Streamly's TMDB-title matching. WordPress site (wp-content/themes/mycima):
+// to Streamly's TMDB-title matching. WordPress site (wp-content/themes/my-cimacc):
 // search via /filtering/?keywords= GridItem cards, with plain WP ?s= and WP
 // REST discovery merged in. Series resolve through div.SeasonsList season tabs
 // plus POST .../Ajaxt/Single/Episodes.php; watch servers come from
@@ -1693,8 +1693,10 @@ private suspend fun mycimaResolveMovie(
 /** Season tab number: data-season attrs first, then digits, then Arabic
  *  ordinals (الموسم الاول has no digit). */
 private fun mycimaSeasonNum(el: Element): Int? {
+    // data-season is a WP post ID (e.g. 49691), not a season number — only
+    // accept short numeric attrs, else fall through to text/ordinal.
     val attr = el.attr("data-season").ifBlank { el.attr("data-season-id") }
-    Regex("""\d+""").find(attr)?.value?.toIntOrNull()?.let { return it }
+    Regex("""\d+""").find(attr)?.value?.takeIf { it.length <= 3 }?.toIntOrNull()?.let { return it }
     val text = el.text()
     Regex("""\d+""").find(text)?.value?.toIntOrNull()?.let { return it }
     return arabicOrdinalNum(text)
@@ -1816,16 +1818,21 @@ private suspend fun mycimaAnchoredEpisode(
     val base = mycimaBase()
 
     // Preferred: full episode list via the theme's Episodes.php endpoint.
+    // Theme renamed mycima -> my-cimacc (old path 404s): try current first.
     if (seasonId.isNotBlank() && !postId.isNullOrBlank()) {
-        val listHtml = runCatching {
-            cfPostText(
-                "$base/wp-content/themes/mycima/Ajaxt/Single/Episodes.php",
-                data = mapOf("season" to seasonId, "post_id" to postId),
-                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-                referer = anchor.url,
-                timeout = 15000,
-            )
-        }.getOrNull()
+        var listHtml: String? = null
+        for (theme in listOf("my-cimacc", "mycima")) {
+            listHtml = runCatching {
+                cfPostText(
+                    "$base/wp-content/themes/$theme/Ajaxt/Single/Episodes.php",
+                    data = mapOf("season" to seasonId, "post_id" to postId),
+                    headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                    referer = anchor.url,
+                    timeout = 15000,
+                )
+            }.getOrNull()?.takeIf { it.isNotBlank() && !it.contains("404 Not Found") }
+            if (listHtml != null) break
+        }
         if (!listHtml.isNullOrBlank()) {
             val epUrl = mycimaExactEpisode(Jsoup.parse(listHtml, anchor.url), episode)
             if (epUrl != null) {
