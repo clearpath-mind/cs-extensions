@@ -634,9 +634,19 @@ private fun cfHeaders(
     // score penalizes missing Accept/Accept-Language, so a bare OkHttp
     // retry keeps failing the challenge even with a valid cf_clearance
     // while the WebView (which sends these) passes.
-    putIfAbsent("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    putIfAbsent("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
     putIfAbsent("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
     putIfAbsent("Upgrade-Insecure-Requests", "1")
+    // Client-hint + fetch-metadata headers (re-3arabi Faselhd
+    // getModernHeaders): CF bot score weighs their presence heavily.
+    // Values mirror a modern Android Chrome.
+    putIfAbsent("sec-ch-ua", "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")
+    putIfAbsent("sec-ch-ua-mobile", "?1")
+    putIfAbsent("sec-ch-ua-platform", "\"Android\"")
+    putIfAbsent("sec-fetch-site", "none")
+    putIfAbsent("sec-fetch-mode", "navigate")
+    putIfAbsent("sec-fetch-dest", "document")
+    putIfAbsent("priority", "u=0, i")
     putIfAbsent("Cache-Control", "no-cache")
     putIfAbsent("Pragma", "no-cache")
     val c = cfCookies(url)
