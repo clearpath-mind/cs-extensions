@@ -252,6 +252,15 @@ suspend fun faselHdResolveWebView(
                     if (lowerUrl.contains("policies.google.com") || lowerUrl.contains("recaptcha") || lowerUrl.contains("mcaptcha") || lowerUrl.contains("melbet")) { Handler(Looper.getMainLooper()).post { view?.loadUrl(finalUrl, mapOf("Referer" to referer)) }; return true }
                     val currentHost = runCatching { Uri.parse(url).host?.replace("www.", "") ?: "" }.getOrDefault("")
                     if (originalHost.isNotBlank() && currentHost.isNotBlank() && !currentHost.contains(originalHost)) {
+                        // hgcloud loader mode: the JS loader hops to rotating
+                        // player hosts before any stream exists — follow
+                        // main-frame hops so the sniffer sees the player page.
+                        // The view is hidden/untouchable and the attempt is
+                        // time-bounded, so ad hops are harmless.
+                        if (sniffMp4 && request?.isForMainFrame == true && !request.hasGesture()) {
+                            Log.d("StreamHG", "following loader redirect: $url")
+                            return false
+                        }
                         val samePlayerRedirect = sniffMp4 && request?.isForMainFrame == true &&
                             !request.hasGesture() && Uri.parse(url).path == Uri.parse(finalUrl).path
                         if (!samePlayerRedirect) return true
