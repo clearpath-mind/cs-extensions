@@ -3095,7 +3095,17 @@ private suspend fun egDeadWatchServers(
             val fixed = fixUrl(t, watchUrl).takeIf { it.startsWith("http") } ?: return null
             // Same file behind both pages; collapse to the iframe variant so
             // the pair doesn't extract (and emit) twice.
-            return if (fixed.contains("megamax.me")) fixed.replace("/download/", "/iframe/") else fixed
+            if (fixed.contains("megamax.me")) return fixed.replace("/download/", "/iframe/")
+            // Same hgcloud file behind /<id> and /e/<id> (both resolve to the
+            // same variant set) — collapse so it extracts (and emits) once.
+            if (fixed.contains("hgcloud")) {
+                return runCatching {
+                    val u = java.net.URI(fixed)
+                    val p = u.path.replace("/e/", "/")
+                    java.net.URI(u.scheme, u.userInfo, u.host, u.port, p, u.query, u.fragment).toString()
+                }.getOrDefault(fixed)
+            }
+            return fixed
         }
         val candidates = ArrayList<Pair<String, String?>>()
         fun add(link: String?, name: String?) {
