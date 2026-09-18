@@ -234,7 +234,9 @@ open class Streamly : MainAPI() {
         /**
          * Picks a title logo from TMDB so the result page can render it in
          * place of the text title. Preference: Arabic raster logo → any
-         * Arabic logo → highest-voted raster → highest-voted SVG.
+         * Arabic logo → English raster → any English logo → highest-voted
+         * raster → highest-voted SVG. The voted fallbacks are language-blind
+         * (a Portuguese logo once won on votes), so English is pinned first.
          */
         suspend fun fetchLogoUrl(tmdbId: Int?, isMovie: Boolean): String? {
             if (tmdbId == null) return null
@@ -255,6 +257,8 @@ open class Streamly : MainAPI() {
 
             logos.firstOrNull { it.lang == LANG && !isSvg(it) }?.let { return urlOf(it) }
             logos.firstOrNull { it.lang == LANG }?.let { return urlOf(it) }
+            logos.firstOrNull { it.lang == "en" && !isSvg(it) }?.let { return urlOf(it) }
+            logos.firstOrNull { it.lang == "en" }?.let { return urlOf(it) }
             logos.filter { voted(it) && !isSvg(it) }.maxWithOrNull(byVote)?.let { return urlOf(it) }
             logos.filter { voted(it) }.maxWithOrNull(byVote)?.let { return urlOf(it) }
             return null
@@ -520,12 +524,12 @@ open class Streamly : MainAPI() {
         }
 
         // Global dedup across all providers: same URL from
-        // multiple sites (e.g. vidtube on TopCinema + Wecima) must not duplicate.
+        // multiple sites (e.g. vidtube on TopCinema + FaselHD) must not duplicate.
         val seenLinks = ConcurrentHashMap.newKeySet<String>()
         val seenSubs = ConcurrentHashMap.newKeySet<String>()
         // Dedup by normalized final URL only (allSeenLinks style).
         // Same host different quality with distinct variant URLs stays distinct (quality-specific),
-        // same URL appearing via multiple providers (WeCima cinemm x2) collapses.
+        // same URL appearing via multiple providers (vidtube mirrors) collapses.
         val dedupCallback: (ExtractorLink) -> Unit = { link ->
             val key = normalizeUrl(link.url)
             if (seenLinks.add(key)) callback(link)
