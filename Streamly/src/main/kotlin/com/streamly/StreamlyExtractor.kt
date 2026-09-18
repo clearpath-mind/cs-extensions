@@ -154,7 +154,7 @@ suspend fun faselHdResolveWebView(
                 setSupportMultipleWindows(true); mediaPlaybackRequiresUserGesture = false
                 loadWithOverviewMode = true; useWideViewPort = true; builtInZoomControls = true
                 displayZoomControls = false; mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                cacheMode = WebSettings.LOAD_DEFAULT; userAgentString = FASELHD_RES_UA; blockNetworkImage = true
+                cacheMode = WebSettings.LOAD_DEFAULT; userAgentString = effectiveUa(); blockNetworkImage = true
             }
             webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
             val cookieManager = CookieManager.getInstance()
@@ -286,7 +286,7 @@ suspend fun faselHdResolveWebView(
                         handleFoundLink(url)
                         try {
                             val reqBuilder = OkRequest.Builder().url(url)
-                                .header("User-Agent", FASELHD_RES_UA)
+                                .header("User-Agent", effectiveUa())
                                 .header("Referer", referer)
                                 .header("Origin", mainUrlForHeader)
                             try { cookieManager.getCookie(url)?.let { ck -> reqBuilder.header("Cookie", ck) } } catch (_: Exception) {}
@@ -303,7 +303,7 @@ suspend fun faselHdResolveWebView(
                     if (method.equals("GET", ignoreCase = true) && (lower.contains("fasel") || lower.contains("jwplayer") || lower.contains("config") || lower.contains("player"))) {
                         try {
                             val reqBuilder = OkRequest.Builder().url(url)
-                                .header("User-Agent", FASELHD_RES_UA)
+                                .header("User-Agent", effectiveUa())
                                 .header("Referer", referer)
                             try { cookieManager.getCookie(url)?.let { ck -> reqBuilder.header("Cookie", ck) } } catch (_: Exception) {}
                             val response = client.newCall(reqBuilder.build()).execute()
@@ -320,7 +320,7 @@ suspend fun faselHdResolveWebView(
             webView.webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(cm: ConsoleMessage?): Boolean { val msg = cm?.message() ?: ""; if (msg.startsWith("NET_M3U8::")) handleFoundLink(msg.substringAfter("::").trim()); return true }
                 override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
-                    try { val transport = resultMsg?.obj as? WebView.WebViewTransport; val adWebView = WebView(activity).apply { layoutParams = FrameLayout.LayoutParams(1, 1, Gravity.START or Gravity.TOP); visibility = View.INVISIBLE }; adWebView.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = FASELHD_RES_UA }; try { (activity.window?.decorView as? ViewGroup)?.addView(adWebView) } catch (_: Exception) {}; adWebView.webViewClient = webViewClient; transport?.webView = adWebView; resultMsg?.sendToTarget(); handler.postDelayed({ try { (adWebView.parent as? ViewGroup)?.removeView(adWebView); adWebView.destroy() } catch (e: Exception) {} }, 1000); return true } catch (e: Exception) { return false }
+                    try { val transport = resultMsg?.obj as? WebView.WebViewTransport; val adWebView = WebView(activity).apply { layoutParams = FrameLayout.LayoutParams(1, 1, Gravity.START or Gravity.TOP); visibility = View.INVISIBLE }; adWebView.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = effectiveUa() }; try { (activity.window?.decorView as? ViewGroup)?.addView(adWebView) } catch (_: Exception) {}; adWebView.webViewClient = webViewClient; transport?.webView = adWebView; resultMsg?.sendToTarget(); handler.postDelayed({ try { (adWebView.parent as? ViewGroup)?.removeView(adWebView); adWebView.destroy() } catch (e: Exception) {} }, 1000); return true } catch (e: Exception) { return false }
                 }
             }
             startNextAttempt()
@@ -435,7 +435,7 @@ object MegaMaxExtractor {
         try {
             val iframeUrl = pageUrl.replace("/download/", "/iframe/")
             val headers = mapOf(
-                "User-Agent" to CF_UA,
+                "User-Agent" to effectiveUa(),
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language" to "en-US,en;q=0.5",
             )
@@ -572,6 +572,29 @@ private fun cfLockFor(url: String): Mutex {
 internal const val CF_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
+/** Real device WebView UA (upstream WebViewResolver: "setting user agent will
+ *  make cloudflare break" — a stale hardcoded Chrome scores as a bot). Fetched
+ *  once on the UI thread; CF_UA stays as fallback until it lands. */
+@Volatile
+private var realUa: String? = null
+
+internal fun effectiveUa(): String = realUa ?: CF_UA
+
+internal fun refreshRealUa() {
+    if (realUa != null) return
+    val ctx = StreamlyRuntime.context ?: return
+    runCatching {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            runCatching {
+                val wv = android.webkit.WebView(ctx)
+                realUa = wv.settings.userAgentString?.takeIf { it.isNotBlank() }
+                runCatching { wv.destroy() }
+                Log.d(TAG, "[cf     ] real WebView UA: $realUa")
+            }
+        }
+    }
+}
+
 /** HTTP codes that mean Cloudflare / rate-limit wall (re-3arabi httpGet pattern). */
 private val CF_BLOCK_CODES = listOf(403, 503, 429)
 
@@ -597,7 +620,8 @@ private suspend fun cfSolve(url: String): SolverResult? {
         Log.w(TAG, "[cf     ] no Activity context available, skipping WebView solver for $url")
         return null
     }
-    return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, CF_UA) }
+    refreshRealUa()
+    return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, effectiveUa()) }
 }
 
 private fun cfHeaders(
@@ -605,7 +629,7 @@ private fun cfHeaders(
     referer: String?,
     extra: Map<String, String>,
 ): MutableMap<String, String> = extra.toMutableMap().apply {
-    putIfAbsent("User-Agent", CF_UA)
+    putIfAbsent("User-Agent", effectiveUa())
     // Full browser header set (re-3arabi MyCima pattern): Cloudflare bot
     // score penalizes missing Accept/Accept-Language, so a bare OkHttp
     // retry keeps failing the challenge even with a valid cf_clearance
@@ -2091,7 +2115,7 @@ private suspend fun faselHdEmitResolved(
             label,
             m3u8,
             referer = iframe,
-            headers = mapOf("Referer" to iframe, "User-Agent" to CF_UA),
+            headers = mapOf("Referer" to iframe, "User-Agent" to effectiveUa()),
         )
     }.getOrNull().orEmpty()
     if (variants.isNotEmpty()) {
@@ -3147,6 +3171,17 @@ private suspend fun egDeadWatchServers(
                         "$providerLabel - $name"
                     } else {
                         "$providerLabel - ${faselHdHostOf(link)}"
+                    }
+                    // Cheap path first: hgcloud.to is StreamWish-family
+                    // (upstream Hgcloudto), so the packed-JWPlayer parse often
+                    // resolves without any WebView.
+                    runCatching {
+                        EmbedRouter.route(link, watchUrl, subtitleCallback, counting, providerLabel)
+                    }
+                    Log.d(EGDEAD_TAG, "[watch  ] hgcloud streamwish attempt emitted=$n")
+                    if (n > 0) {
+                        Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n (streamwish, no webview)")
+                        return@async
                     }
                     var playerUrl = link
                     val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true) {

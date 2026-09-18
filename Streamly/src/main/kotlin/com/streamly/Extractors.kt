@@ -229,6 +229,14 @@ class Luluvdo : StreamWishExtractor() {
     override val mainUrl = "https://luluvdo.com"
 }
 
+/** hgcloud.to is StreamWish-family (upstream Hgcloudto subclass): the packed
+ *  JWPlayer parse (plus upstream's own WebView fallback) replaces the custom
+ *  hidden-WebView sniff when it works. Same-host mainUrl for headers. */
+class Hgcloud : StreamWishExtractor() {
+    override val name = "Hgcloud"
+    override val mainUrl = "https://hgcloud.to"
+}
+
 /** VidSpeed (vidspeed.cyou and rotations) — packed JWPlayer, master m3u8 in `file:` after unpack */
 class VidSpeed : PackedJwPlayer() {
     override val name = "VidSpeed"
@@ -373,7 +381,8 @@ object EmbedRouter {
                 "cdnplus" in host -> "CdnPlus"
                 "mp4plus" in host -> "Mp4Plus"
                 "filelion" in host -> "Filelion"
-                "lulu" in host || "fastvip" in host -> "Luluvdo"
+                "lulu" in host || "fastvip" in host || "streamwish" in host || "strwish" in host || "wish" in host -> "Luluvdo"
+                "hgcloud" in host -> "Hgcloud"
                 "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host || "dsvplay" in host || "ds2play" in host -> "Dood"
                 "mixdrop" in host || "mxdrop" in host -> "MixDrop"
                 "uqload" in host -> "Uqload"
@@ -393,7 +402,8 @@ object EmbedRouter {
                 "cdnplus" in host -> CdnPlus().getUrl(routedLink, referer, subtitleCallback, out)
                 "mp4plus" in host -> Mp4Plus().getUrl(routedLink, referer, subtitleCallback, out)
                 "filelion" in host -> Filelion().getUrl(routedLink, referer, subtitleCallback, out)
-                "lulu" in host || "fastvip" in host -> Luluvdo().getUrl(routedLink, referer, subtitleCallback, out)
+                "lulu" in host || "fastvip" in host || "streamwish" in host || "strwish" in host || "wish" in host -> Luluvdo().getUrl(routedLink, referer, subtitleCallback, out)
+                "hgcloud" in host -> Hgcloud().getUrl(routedLink, referer, subtitleCallback, out)
                 // Dood mirrors pin same-host mainUrl for playback Referer
                 // (upstream DoodExtractor design).
                 "playmogo" in host -> DoodPlaymogo().getUrl(routedLink, referer, subtitleCallback, out)
