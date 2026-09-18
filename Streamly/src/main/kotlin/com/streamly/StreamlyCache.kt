@@ -88,8 +88,12 @@ object StreamlyCache {
         }
         // Broken but previously successful: probe with room to repeat the
         // slowest success (capped) — a flat 20s kills FaselHD mid-resolve
-        // when walled, locking it broken forever.
-        if (stats.isCircuitBroken) return minOf(maxOf(20000L, stats.maxTimeMs), 120000L)
+        // when walled, locking it broken forever. Floor 45s: a walled
+        // search (~18s) plus episode extraction (~25s) must fit.
+        if (stats.isCircuitBroken) {
+            if (stats.maxTimeMs > 0) return minOf(maxOf(45000L, stats.maxTimeMs), 120000L)
+            return 20000L
+        }
         val avg = stats.avgTimeMs
         if (avg == 0L && stats.maxTimeMs == 0L) return baseTimeoutMs
         return minOf(maxOf(avg + 5000, stats.maxTimeMs, 20000L), 120000L)
