@@ -315,7 +315,9 @@ object EmbedRouter {
         // Always-expand: forward every variant built-in extractors emit
         // (Strwish 1080p/720p/…) so slow networks can pick a lower rendition.
         // Subtitles still flow via subtitleCallback untouched.
+        var emittedN = 0
         val out: (ExtractorLink) -> Unit = { l ->
+            emittedN++
             callback(relabelLink(l, providerName))
         }
         try {
@@ -328,31 +330,36 @@ object EmbedRouter {
                 "mp4plus" in host -> "Mp4Plus"
                 "filelion" in host -> "Filelion"
                 "lulu" in host || "fastvip" in host -> "Luluvdo"
-                "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host -> "Dood"
+                "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host || "dsvplay" in host || "ds2play" in host -> "Dood"
                 "mixdrop" in host || "mxdrop" in host -> "MixDrop"
                 "uqload" in host -> "Uqload"
                 "streamtape" in host -> "Streamtape"
                 else -> "loadExtractor"
             }
             Log.d(TAG, "[route  ] $host -> $extractorName")
+            // MixDrop file pages (/f/<id>) carry no embed: use the /e/ player.
+            val routedLink = if (("mixdrop" in host || "mxdrop" in host) && "/f/" in host) {
+                link.replace("/f/", "/e/")
+            } else link
             when {
-                "vidtube" in host -> Vidtube().getUrl(link, referer, subtitleCallback, out)
-                "updown" in host -> UpDown().getUrl(link, referer, subtitleCallback, out)
-                "anafast" in host -> AnaFast().getUrl(link, referer, subtitleCallback, out)
-                "vidspeed" in host -> VidSpeed().getUrl(link, referer, subtitleCallback, out)
-                "cdnplus" in host -> CdnPlus().getUrl(link, referer, subtitleCallback, out)
-                "mp4plus" in host -> Mp4Plus().getUrl(link, referer, subtitleCallback, out)
-                "filelion" in host -> Filelion().getUrl(link, referer, subtitleCallback, out)
-                "lulu" in host || "fastvip" in host -> Luluvdo().getUrl(link, referer, subtitleCallback, out)
-                "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host ->
-                    Dooood().getUrl(link, referer, subtitleCallback, out)
-                "mixdrop" in host || "mxdrop" in host -> MixDropPs().getUrl(link, referer, subtitleCallback, out)
-                "uqload" in host -> Uqload().getUrl(link, referer, subtitleCallback, out)
-                "streamtape" in host -> StreamTape().getUrl(link, referer, subtitleCallback, out)
+                "vidtube" in host -> Vidtube().getUrl(routedLink, referer, subtitleCallback, out)
+                "updown" in host -> UpDown().getUrl(routedLink, referer, subtitleCallback, out)
+                "anafast" in host -> AnaFast().getUrl(routedLink, referer, subtitleCallback, out)
+                "vidspeed" in host -> VidSpeed().getUrl(routedLink, referer, subtitleCallback, out)
+                "cdnplus" in host -> CdnPlus().getUrl(routedLink, referer, subtitleCallback, out)
+                "mp4plus" in host -> Mp4Plus().getUrl(routedLink, referer, subtitleCallback, out)
+                "filelion" in host -> Filelion().getUrl(routedLink, referer, subtitleCallback, out)
+                "lulu" in host || "fastvip" in host -> Luluvdo().getUrl(routedLink, referer, subtitleCallback, out)
+                "dood" in host || "d0o0d" in host || "do0od" in host || "d000d" in host || "playmogo" in host || "dsvplay" in host || "ds2play" in host ->
+                    Dooood().getUrl(routedLink, referer, subtitleCallback, out)
+                "mixdrop" in host || "mxdrop" in host -> MixDropPs().getUrl(routedLink, referer, subtitleCallback, out)
+                "uqload" in host -> Uqload().getUrl(routedLink, referer, subtitleCallback, out)
+                "streamtape" in host -> StreamTape().getUrl(routedLink, referer, subtitleCallback, out)
                 else -> {
-                    loadExtractor(link, referer, subtitleCallback, out)
+                    loadExtractor(routedLink, referer, subtitleCallback, out)
                 }
             }
+            Log.d(TAG, "[route  ] $host -> $extractorName emitted=$emittedN")
         } catch (e: Exception) {
             Log.e(TAG, "[route  ] Failed to extract $link: ${e.message}")
         }
