@@ -1,0 +1,437 @@
+package com.clearpathmind
+
+import android.R
+import android.app.Activity
+import android.content.Context
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import android.view.MotionEvent
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+
+/** Clearance result: final URL (follows mirror rotations) + cookies for that URL
+ *  + the solved page's rendered HTML (avoids a redundant refetch). */
+data class SolverResult(val finalUrl: String, val cookies: String?, val html: String? = null)
+
+private const val READINESS_JS =
+    """(function(){try{
+        var html = document.documentElement.innerHTML || "";
+        var t = document.body ? document.body.innerText : "";
+        var ch = /just a moment|checking your browser|verify you are human|verifying you are human|i'm not a robot|performing security verification|challenge-platform|cf-chl|turnstile/i.test(html);
+        return document.readyState + "|" + t.length + "|" + ch + "|" + location.href;
+    }catch(e){ return "loading|0|true|"; }})();"""
+
+
+object CloudflareSolver {
+    private const val TAG = "CF_Solver_PornHoarder"
+    private const val PREFS = "Pornhoarder"
+    private const val KEY_COOKIES = "cf_cookies"
+    private const val KEY_UA = "cf_user_agent"
+
+    private var appContext: Context? = null
+
+    fun init(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    private fun prefs(): SharedPreferences? =
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun storedCookies(): String = prefs()?.getString(KEY_COOKIES, "").orEmpty()
+
+    fun storedUserAgent(): String? = prefs()?.getString(KEY_UA, null)
+
+    fun saveCookies(url: String, userAgent: String? = null) {
+        val cookies = CookieManager.getInstance().getCookie(url) ?: return
+        prefs()?.edit()
+            ?.putString(KEY_COOKIES, cookies)
+            ?.apply {
+                if (userAgent != null) putString(KEY_UA, userAgent)
+            }?.apply()
+    }
+
+    /**
+     * Merges Set-Cookie response headers into the persisted cookie string so
+     * server-set preferences (e.g. orientation) survive: NiceHttp's jar is
+     * bypassed because requests carry an explicit Cookie header.
+     */
+    fun mergeCookies(setCookieHeaders: List<String>) {
+        if (setCookieHeaders.isEmpty()) return
+        val store = storedCookies().split(";")
+            .map { it.trim() }
+            .filter { it.contains("=") }
+            .associate { it.substringBefore("=").trim() to it.substringAfter("=").trim() }
+            .toMutableMap()
+        for (h in setCookieHeaders) {
+            val pair = h.substringBefore(";").trim()
+            if (!pair.contains("=")) continue
+            val name = pair.substringBefore("=").trim()
+            val value = pair.substringAfter("=").trim()
+            if (name.isBlank()) continue
+            if (value.isBlank() || h.contains("expires=Thu, 01 Jan 1970", true)) {
+                store.remove(name)
+            } else {
+                store[name] = value
+            }
+        }
+        prefs()?.edit()
+            ?.putString(KEY_COOKIES, store.map { (k, v) -> "$k=$v" }.joinToString("; "))
+            ?.apply()
+    }
+
+    fun clearCookies() {
+        prefs()?.edit()?.remove(KEY_COOKIES)?.remove(KEY_UA)?.apply()
+    }
+
+    /**
+     * Shared content waiter: polls page readiness until real content renders,
+     * then invokes [onDone] with outerHTML (null on timeout/failure). Logs the
+     * readiness tuple on change + every 5s so logcat shows what the page is
+     * stuck on (loading / challenged / thin).
+     */
+    private fun waitForPageContent(
+        webView: WebView,
+        pollingHandler: Handler,
+        timeoutMs: Long,
+        minText: Int,
+        stableMs: Long,
+        logTag: String,
+        onDone: (String?) -> Unit,
+    ) {
+        var finished = false
+        var lastState = ""
+        var lastLogAt = 0L
+        var lastUrl: String? = null
+        var stableSince = SystemClock.uptimeMillis()
+        fun finish(html: String?) {
+            if (finished) return
+            finished = true
+            Log.d(TAG, "$logTag done html=${html?.length ?: -1}")
+            onDone(html)
+        }
+        pollingHandler.postDelayed({
+            Log.d(TAG, "$logTag content wait timeout state=$lastState")
+            finish(null)
+        }, timeoutMs)
+        fun poll() {
+            if (finished) return
+            try {
+                webView.evaluateJavascript(READINESS_JS) { res ->
+                    if (finished) return@evaluateJavascript
+                    val parts = res?.removeSurrounding("\"")?.split("|") ?: emptyList()
+                    if (parts.size < 4) {
+                        pollingHandler.postDelayed({ poll() }, 500)
+                        return@evaluateJavascript
+                    }
+                    val ready = parts[0]
+                    val textLen = parts[1].toIntOrNull() ?: 0
+                    val challenged = parts[2].toBoolean()
+                    val cur = parts.subList(3, parts.size).joinToString("|")
+                    val now = SystemClock.uptimeMillis()
+                    if (cur != lastUrl) {
+                        lastUrl = cur
+                        stableSince = now
+                    }
+                    val state = "$ready|$textLen|$challenged"
+                    if (state != lastState || now - lastLogAt > 5000) {
+                        lastState = state
+                        lastLogAt = now
+                        Log.d(TAG, "$logTag readiness $state url=$cur")
+                    }
+                    if (ready == "complete" && !challenged && textLen >= minText && now - stableSince > stableMs) {
+                        webView.evaluateJavascript("document.documentElement.outerHTML") { html ->
+                            finish(html)
+                        }
+                    } else {
+                        pollingHandler.postDelayed({ poll() }, 500)
+                    }
+                }
+            } catch (_: Exception) {
+                finish(null)
+            }
+        }
+        poll()
+    }
+
+    suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String): SolverResult? {
+        return suspendCoroutine { continuation ->
+            if (activity == null || activity.isFinishing) {
+                continuation.resume(null)
+                return@suspendCoroutine
+            }
+
+            Handler(Looper.getMainLooper()).post {
+                val rootView = activity.findViewById<ViewGroup>(R.id.content) ?: run {
+                    continuation.resume(null)
+                    return@post
+                }
+
+                val webView = try {
+                    WebView(activity)
+                } catch (e: Exception) {
+                    Log.w(TAG, "no WebView on device: ${e.message}")
+                    continuation.resume(null)
+                    return@post
+                }
+                webView.layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+
+                webView.alpha = 0.01f
+                webView.translationX = 10000f
+                webView.translationY = 10000f
+                webView.isFocusable = false
+                webView.isFocusableInTouchMode = false
+                webView.isClickable = false
+
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    this.userAgentString = userAgent
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                }
+
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
+
+                var isSolved = false
+                var isProcessingClick = false
+                var bypassWatching = false
+                val pollingHandler = Handler(Looper.getMainLooper())
+
+                fun finishSuccess(finalUrl: String, reason: String = "unknown", awaitContent: Boolean = true) {
+                    if (isSolved) return
+                    isSolved = true
+                    Log.i(TAG, "clearance | reason: $reason | finalUrl: $finalUrl")
+
+                    cookieManager.flush()
+                    pollingHandler.removeCallbacksAndMessages(null)
+
+                    var delivered = false
+                    fun deliver(html: String?) {
+                        if (delivered) return
+                        delivered = true
+                        var cleanHtml = html?.removeSurrounding("\"")
+                            ?.replace("\\u003C", "<")
+                            ?.replace("\\u003E", ">")
+                            ?.replace("\\\"", "\"")
+                            ?.replace("\\\\", "\\")
+                        val finalCookies = runCatching { cookieManager.getCookie(finalUrl) }.getOrNull()
+                        if (finalCookies.isNullOrBlank()) {
+                            Log.w(TAG, "finished without cookies for $finalUrl")
+                        }
+                        try {
+                            rootView.removeView(webView)
+                            webView.destroy()
+                        } catch (e: Exception) {}
+
+                        continuation.resume(SolverResult(finalUrl, finalCookies, cleanHtml))
+                    }
+
+                    if (!awaitContent) {
+                        deliver(null)
+                        return
+                    }
+
+                    // Phase 2: Cloudflare sets cf_clearance BEFORE navigating to the
+                    // real page — capturing outerHTML immediately yields an empty
+                    // shell. Wait for rendered content instead.
+                    waitForPageContent(
+                        webView = webView,
+                        pollingHandler = pollingHandler,
+                        timeoutMs = 30000,
+                        minText = 500,
+                        stableMs = 1500,
+                        logTag = "solve",
+                        onDone = { html -> deliver(html) },
+                    )
+                }
+
+                pollingHandler.postDelayed({
+                    finishSuccess(webView.url ?: initialUrl, "Timeout - 60s")
+                }, 60000)
+
+                fun simulateRealTouch(view: WebView, cssX: Float, cssY: Float) {
+                    val density = activity.resources.displayMetrics.density
+                    val realX = cssX * density
+                    val realY = cssY * density
+                    val downTime = SystemClock.uptimeMillis()
+                    val eventTime = SystemClock.uptimeMillis() + 50
+                    val downEvent = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, realX, realY, 0)
+                    view.dispatchTouchEvent(downEvent)
+                    view.postDelayed({
+                        val upEvent = MotionEvent.obtain(downTime, eventTime, MotionEvent.ACTION_UP, realX, realY, 0)
+                        view.dispatchTouchEvent(upEvent)
+                        downEvent.recycle()
+                        upEvent.recycle()
+                    }, 50)
+                }
+
+                val targetCssPath = "html > body > div:nth-of-type(1) > div > div:nth-of-type(2) > div"
+
+                fun startPolling() {
+                    // Managed ("I'm not a robot") checkbox lives in a cross-origin
+                    // CF iframe — unreachable from JS inside, but the iframe
+                    // element itself exposes a rect we can tap (box at its left).
+                    val jsChallengeCoords = """
+                        (function(){
+                            try{
+                                var f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                                if(!f) return "NO_BOX";
+                                var r = f.getBoundingClientRect();
+                                if(r.width === 0 && r.height === 0) return "NO_BOX";
+                                var y = r.top + (r.height / 2);
+                                var lx = r.left + 28;
+                                var cx = r.left + (r.width / 2);
+                                return lx + "," + y + "|" + cx + "," + y;
+                            }catch(e){ return "ERROR"; }
+                        })();
+                    """.trimIndent()
+                    var lastTapLogAt = 0L
+                    fun tapPair(clean: String) {
+                        isProcessingClick = true
+                        if (SystemClock.uptimeMillis() - lastTapLogAt > 10000) {
+                            lastTapLogAt = SystemClock.uptimeMillis()
+                            Log.d(TAG, "tap $clean")
+                        }
+                        try {
+                            val sides = clean.split("|")
+                            val (rx, ry) = sides[0].split(",").map { it.toFloatOrNull() }
+                            val (lx, ly) = sides[1].split(",").map { it.toFloatOrNull() }
+                            if (rx != null && ry != null && lx != null && ly != null) {
+                                simulateRealTouch(webView, rx, ry)
+                                pollingHandler.postDelayed({
+                                    simulateRealTouch(webView, lx, ly)
+                                    pollingHandler.postDelayed({ isProcessingClick = false }, 3000)
+                                }, 250)
+                            } else { isProcessingClick = false }
+                        } catch (e: Exception) { isProcessingClick = false }
+                    }
+                    val runnable = object : Runnable {
+                        override fun run() {
+                            if (isSolved || isProcessingClick) {
+                                pollingHandler.postDelayed(this, 2000)
+                                return
+                            }
+
+                            val jsGetCoords = """
+                                (function(){
+                                    try{
+                                        var box = document.querySelector("$targetCssPath");
+                                        if(!box) return "NO_BOX";
+                                        var r = box.getBoundingClientRect();
+                                        if(r.width === 0 && r.height === 0) return "NO_BOX";
+                                        var size = Math.min(36, Math.max(18, Math.round(r.height * 0.55)));
+                                        var margin = Math.round(Math.max(8, r.width * 0.03));
+                                        var centerY = r.top + (r.height / 2);
+                                        var rightSideX = r.right - (size / 2) - margin;
+                                        var leftSideX = r.left + (size / 2) + margin;
+                                        return rightSideX + "," + centerY + "|" + leftSideX + "," + centerY;
+                                    }catch(e){ return "ERROR"; }
+                                })();
+                            """.trimIndent()
+
+                            webView.evaluateJavascript(jsChallengeCoords) { res ->
+                                try {
+                                    val clean = res?.removeSurrounding("\"")
+                                    if (clean != null && clean.contains("|")) {
+                                        tapPair(clean)
+                                    } else {
+                                        webView.evaluateJavascript(jsGetCoords) { res2 ->
+                                            try {
+                                                val clean2 = res2?.removeSurrounding("\"")
+                                                if (clean2 != null && clean2.contains("|")) tapPair(clean2)
+                                            } catch (e: Exception) { }
+                                        }
+                                    }
+                                } catch (e: Exception) { }
+                            }
+                            pollingHandler.postDelayed(this, 2000)
+                        }
+                    }
+                    pollingHandler.post(runnable)
+                }
+
+                fun checkBypassSuccess() {
+                    if (isSolved) return
+                    if (bypassWatching) return
+                    bypassWatching = true
+
+                    fun poll() {
+                        if (isSolved) {
+                            bypassWatching = false
+                            return
+                        }
+                        val currentLiveUrl = try {
+                            webView.url ?: initialUrl
+                        } catch (_: Exception) {
+                            initialUrl
+                        }
+                        val currentCookies = runCatching { cookieManager.getCookie(currentLiveUrl) }.getOrNull()
+
+                        if (currentCookies != null && currentCookies.contains("cf_clearance")) {
+                            bypassWatching = false
+                            finishSuccess(currentLiveUrl, "cf_clearance captured")
+                            return
+                        }
+
+                        pollingHandler.postDelayed({ poll() }, 500)
+                    }
+                    poll()
+                }
+
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        super.onPageStarted(view, url, favicon)
+                        if (url != null && url != initialUrl) {
+                            Log.d(TAG, "redirect to: $url")
+                        }
+                    }
+
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?,
+                    ) {
+                        super.onReceivedError(view, request, error)
+                        val failing = request?.url?.toString()
+                        Log.w(TAG, "load error on $failing: ${error?.description}")
+                        // Dead seed domain (DNS/ISP block): don't burn the full
+                        // 60s — bail out so the caller can try the next mirror.
+                        if (request?.isForMainFrame == true && failing == initialUrl) {
+                            pollingHandler.postDelayed({
+                                if (!isSolved) finishSuccess(initialUrl, "load-error", awaitContent = false)
+                            }, 5000)
+                        }
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        isProcessingClick = false
+                        startPolling()
+                        checkBypassSuccess()
+                    }
+                }
+
+                rootView.addView(webView)
+                webView.loadUrl(initialUrl)
+                // Challenges that never fire onPageFinished still get watched.
+                checkBypassSuccess()
+            }
+        }
+    }
+}
