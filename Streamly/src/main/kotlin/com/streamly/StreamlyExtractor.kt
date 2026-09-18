@@ -1885,23 +1885,35 @@ internal suspend fun faselHdBase(): String {
     // content. The site lives on fasel-hd.co (old .bid seeds just redirect
     // there, so they are not probed), with .cam kept as fallback. The domain
     // root is a marker-less landing page — so probe /main, which carries the
-    // theme (postDiv/dtc_live).
-    for (seed in listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL)) {
-        val origin = resolveOrigin(seed)
-        // Explicit String? type: app response accessors carry a jspecify
-        // @Nullable annotation that isn't on the compile classpath.
-        val tProbe = SystemClock.elapsedRealtime()
-        val probe: String? = try {
-            app.get("$origin/main", timeout = 15000).text
-        } catch (_: Exception) {
-            null
-        }
-        if (isFaselHdPage(probe)) {
-            Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin in ${SystemClock.elapsedRealtime() - tProbe}ms")
-            faselHdLiveBase = origin
-            return origin
-        }
-        Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin not serving FaselHD in ${SystemClock.elapsedRealtime() - tProbe}ms, trying next")
+    // theme (postDiv/dtc_live). Probes run concurrently; list order decides
+    // on ties so .co stays preferred.
+    val seeds = listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL)
+    val live: Map<String, String> = coroutineScope {
+        seeds.map { seed ->
+            async {
+                val origin = resolveOrigin(seed)
+                // Explicit String? type: app response accessors carry a jspecify
+                // @Nullable annotation that isn't on the compile classpath.
+                val tProbe = SystemClock.elapsedRealtime()
+                val probe: String? = try {
+                    app.get("$origin/main", timeout = 15000).text
+                } catch (_: Exception) {
+                    null
+                }
+                if (isFaselHdPage(probe)) {
+                    Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin in ${SystemClock.elapsedRealtime() - tProbe}ms")
+                    seed to origin
+                } else {
+                    Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin not serving FaselHD in ${SystemClock.elapsedRealtime() - tProbe}ms (page=${probe?.length ?: -1} chars), trying next")
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull().toMap()
+    }
+    val winner = seeds.firstNotNullOfOrNull { live[it] }
+    if (winner != null) {
+        faselHdLiveBase = winner
+        return winner
     }
     val fallback = resolveOrigin(FASELHD_MAIN_URL)
     StreamlyDiag.lastStage = "FaselHD: no live mirror"
@@ -2145,8 +2157,17 @@ private suspend fun faselHdEmitResolved(
             label,
             m3u8,
             referer = iframe,
-            headers = mapOf("Referer" to iframe, "User-Agent" to effectiveUa()),
+            // The CDN gatekeeps playlists per player session: send the
+            // player's cookies (and Origin) with the expansion fetch.
+            headers = mapOf(
+                "Referer" to iframe,
+                "Origin" to base,
+                "User-Agent" to effectiveUa(),
+                "Cookie" to cfCookies(m3u8),
+            ),
         )
+    }.onFailure {
+        Log.d(FASELHD_TAG, "[watch  ] expansion fetch failed for $label: ${it::class.java.simpleName}: ${it.message}")
     }.getOrNull().orEmpty()
     if (variants.isNotEmpty()) {
         Log.d(FASELHD_TAG, "[watch  ] expanded ${variants.size} qualities for $label")
@@ -2244,22 +2265,32 @@ private suspend fun faselHdExtractServers(
     val resolvedIdx = HashSet<Int>()
     // Pass 1: WebView resolve (handles enc: payloads). Every watch server
     // (سيرفر المشاهدة #01/#02 → distinct player_tokens) is resolved on its
-    // own and emitted with its server label — no early break.
-    for ((idx, iframe) in iframes.withIndex()) {
-        val t0 = SystemClock.elapsedRealtime()
-        val m3u8 = faselHdResolveWebView(iframe, postUrl)
-        if (!m3u8.isNullOrBlank()) {
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
-            found = true
-            resolved = true
-            resolvedIdx.add(idx)
-            faselHdEmitResolved(m3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
-        } else {
-            // Probe the token page size: a dead/rotated token serves a tiny
-            // or challenge page, a live-but-undecrypted player serves ~10k+.
-            val probe = runCatching { cfGetText(iframe, referer = postUrl, timeout = 15000) }.getOrNull()
-            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms playerPage=${probe?.length ?: -1}")
-        }
+    // own and emitted with its server label — no early break. Servers resolve
+    // concurrently (independent hidden WebViews): wall time is the slowest
+    // server, not the sum.
+    val pass1Hits: Set<Int> = coroutineScope {
+        iframes.withIndex().map { (idx, iframe) ->
+            async {
+                val t0 = SystemClock.elapsedRealtime()
+                val m3u8 = faselHdResolveWebView(iframe, postUrl)
+                if (!m3u8.isNullOrBlank()) {
+                    Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
+                    faselHdEmitResolved(m3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
+                    idx
+                } else {
+                    // Probe the token page size: a dead/rotated token serves a tiny
+                    // or challenge page, a live-but-undecrypted player serves ~10k+.
+                    val probe = runCatching { cfGetText(iframe, referer = postUrl, timeout = 15000) }.getOrNull()
+                    Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms playerPage=${probe?.length ?: -1}")
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull().toSet()
+    }
+    if (pass1Hits.isNotEmpty()) {
+        found = true
+        resolved = true
+        resolvedIdx.addAll(pass1Hits)
     }
     // Pass 2 (fallback): cheap inline scan for the servers the WebView
     // missed (non-encrypted embeds). Also reports enc: presence: the decryptor keys
@@ -2360,6 +2391,9 @@ private suspend fun faselHdExtractServers(
     // withTimeout(6s) measured 50.3s on a dead locker (Blacklist S1E13 v76
     // run), starving the passes that carry the links. The inner timeout is
     // 6s so even a stuck POST bounds itself without relying on cancellation.
+    // Skipped outright when the passes above already emitted: the ~34s locker
+    // grind buys nothing then and only delays invoke's return (and stats).
+    if (!found) {
     val downloadAnchor = doc.selectFirst(".downloadLinks a")
     var downloadHref = ""
     if (downloadAnchor != null) {
@@ -2387,6 +2421,9 @@ private suspend fun faselHdExtractServers(
         } catch (e: Exception) {
             Log.w(FASELHD_TAG, "[direct ] capped/failed in ${SystemClock.elapsedRealtime() - tDl}ms: ${e.message}")
         }
+    }
+    } else {
+        Log.d(FASELHD_TAG, "[direct ] skipped, rows already emitted")
     }
 
     return found
