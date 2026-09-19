@@ -541,6 +541,10 @@ class YacineTvProvider : MainAPI() {
                 )
             )
             if (events.isNotEmpty()) {
+                // FotMob date pools (one request per UTC day): live-score +
+                // league fallback when TheSportsDB has no day match.
+                val fotmobPools = events.mapNotNull { fotmobDayCompact(it.startTime) }.toSet()
+                    .associateWith { withTimeoutOrNull(12_000) { getFotmobDay(it) } }
                 // Thumbs/badges/leagues resolve in parallel; each is guarded
                 // so one slow lookup never blocks the homepage.
                 // TheSportsDB art (thumb + English strLeague) reuses one request.
@@ -549,7 +553,9 @@ class YacineTvProvider : MainAPI() {
                     async {
                         // No team-logo fallback: cards show the TheSportsDB
                         // banner, else the neutral placeholder (never empty).
-                        val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
+                        val art = withTimeoutOrNull(8_000) {
+                            matchArt(e, fotmobDayCompact(e.startTime)?.let { fotmobPools[it] })
+                        } ?: MatchArt()
                         art to (art.thumb ?: noArtBanner)
                     }
                 }.awaitAll()
@@ -799,8 +805,11 @@ class YacineTvProvider : MainAPI() {
 
     /** Cricify-style: no art/state cache — every build fetches fresh
      * (Cache-Control: no-cache), same request returning thumb + league +
-     * home-first title + live state. Bounded by caller timeouts. */
-    private suspend fun matchArt(e: YacineEvent): MatchArt {
+     * home-first title + live state. Bounded by caller timeouts.
+     * FotMob pool (optional, pre-fetched per day) fills league + live
+     * state only when TheSportsDB has no day match; TheSportsDB stays
+     * primary so FotMob flaps degrade to today's behavior. */
+    private suspend fun matchArt(e: YacineEvent, fotmobPool: List<FotmobDayMatch>? = null): MatchArt {
         e.id ?: return MatchArt()
         val day = e.startTime?.let { dayString(it) }
         val t1 = teamAlias(e.team1?.id) ?: return MatchArt()
@@ -823,6 +832,17 @@ class YacineTvProvider : MainAPI() {
         }
         // No backoff cache: empty/failed lookups simply return nothing and
         // are retried on the next build (Cricify-style always-fresh).
+        // FotMob fallback for league + live state when TheSportsDB has no
+        // day match (flaps, rate limits, unmapped fixtures). Thumb stays
+        // TheSportsDB-only (FotMob serves no match banners).
+        if ((bestLeague == null || bestState == null || bestTitle == null) && fotmobPool != null) {
+            val fb = fotmobPair(fotmobPool, t1, t2)
+            if (fb != null) {
+                if (bestLeague == null) bestLeague = fb.league?.trim()?.takeIf { it.isNotBlank() }
+                if (bestState == null) bestState = fotmobState(fb)
+                if (bestTitle == null) bestTitle = fotmobOrderedTitle(fb, t1, t2)
+            }
+        }
         if (bestThumb == null && bestLeague == null) {
             return MatchArt(null, null, bestTitle, bestState)
         }
@@ -896,6 +916,146 @@ class YacineTvProvider : MainAPI() {
 
     private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
         return searchEventArt(a, b, day).thumb
+    }
+
+    data class FotmobMatches(
+        @JsonProperty("leagues") val leagues: List<FotmobLeague>? = null,
+    )
+
+    data class FotmobLeague(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("matches") val matches: List<FotmobMatch>? = null,
+    )
+
+    data class FotmobTeam(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("shortName") val shortName: String? = null,
+        @JsonProperty("score") val score: Int? = null,
+    )
+
+    data class FotmobLiveTime(
+        @JsonProperty("short") val short: String? = null,
+    )
+
+    data class FotmobStatus(
+        @JsonProperty("started") val started: Boolean? = null,
+        @JsonProperty("finished") val finished: Boolean? = null,
+        @JsonProperty("ongoing") val ongoing: Boolean? = null,
+        @JsonProperty("cancelled") val cancelled: Boolean? = null,
+        @JsonProperty("liveTime") val liveTime: FotmobLiveTime? = null,
+    )
+
+    data class FotmobMatch(
+        @JsonProperty("home") val home: FotmobTeam? = null,
+        @JsonProperty("away") val away: FotmobTeam? = null,
+        @JsonProperty("status") val status: FotmobStatus? = null,
+    )
+
+    private data class FotmobDayMatch(
+        val league: String?,
+        val match: FotmobMatch,
+    )
+
+    /** FotMob date pool (one request per day): every fixture FotMob
+     * lists for YYYYMMDD with live scores and league names. No key or
+     * token, plain browser UA. Null on any failure — callers fall back
+     * to TheSportsDB-only behavior, never worse. */
+    private suspend fun getFotmobDay(dayCompact: String?): List<FotmobDayMatch>? {
+        if (dayCompact.isNullOrBlank()) return null
+        val txt = retryIO(times = 2) {
+            runCatching {
+                app.get(
+                    "https://www.fotmob.com/api/data/matches?date=$dayCompact",
+                    headers = mapOf("User-Agent" to BROWSER_UA, "Accept" to "application/json"),
+                    timeout = 8,
+                ).text.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        } ?: return null
+        return runCatching {
+            parseJson<FotmobMatches>(txt).leagues.orEmpty().flatMap { l ->
+                l.matches.orEmpty().map { m -> FotmobDayMatch(league = l.name, match = m) }
+            }
+        }.getOrNull()
+    }
+
+    private fun fotmobDayCompact(epochSec: Long?): String? {
+        return try {
+            val fmt = SimpleDateFormat("yyyyMMdd", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            epochSec?.let { fmt.format(Date(it * 1000)) }
+        } catch (_: Exception) { null }
+    }
+
+    /** FotMob name compare: normArt plus &/and equivalence, hyphens to
+     * spaces, de/del/de-la particles and trailing FC dropped
+     * ("Al Ahli" vs "Al-Ahli", "Racing Santander" vs
+     * "Racing de Santander", "Mamelodi Sundowns FC" vs
+     * "Mamelodi Sundowns", "Brighton & Hove Albion" vs
+     * "Brighton and Hove Albion"). */
+    private fun normFotmob(s: String): String {
+        var n = normArt(s).replace("&", "and").replace("-", " ")
+        n = n.replace(Regex("""\s+"""), " ").trim()
+        n = n.replace(Regex("""\s+del?\s+|\s+de\s+la\s+"""), " ").trim()
+        return n.replace(Regex("""\s+fc$"""), "")
+    }
+
+    /** Pair our aliases against the FotMob day pool. Exact match on
+     * name/shortName after normalization, either team order (Yacine
+     * order is unreliable). No substring matching: the pool mixes
+     * youth/reserve legs ("Brighton & Hove Albion U18") that would
+     * false-positive on contains. */
+    private fun fotmobPair(pool: List<FotmobDayMatch>?, a: String, b: String): FotmobDayMatch? {
+        if (pool.isNullOrEmpty()) return null
+        val na = normFotmob(a)
+        val nb = normFotmob(b)
+        if (na.isBlank() || nb.isBlank() || na == nb) return null
+        fun names(t: FotmobTeam?): List<String> =
+            listOfNotNull(t?.name, t?.shortName).map { normFotmob(it) }.filter { it.isNotBlank() }
+        return pool.firstOrNull { dm ->
+            val h = names(dm.match.home)
+            val w = names(dm.match.away)
+            (na in h && nb in w) || (nb in h && na in w)
+        }
+    }
+
+    /** Home-first "A vs B" from a FotMob pairing (aliases in display
+     * casing). Both sides verified exact, so scores stay canonical. */
+    private fun fotmobOrderedTitle(dm: FotmobDayMatch, a: String, b: String): String? {
+        val na = normFotmob(a)
+        val nb = normFotmob(b)
+        if (na.isBlank() || nb.isBlank() || na == nb) return null
+        fun names(t: FotmobTeam?): List<String> =
+            listOfNotNull(t?.name, t?.shortName).map { normFotmob(it) }.filter { it.isNotBlank() }
+        val h = names(dm.match.home)
+        val w = names(dm.match.away)
+        if (na in h && nb in w) return "$a vs $b"
+        if (nb in h && na in w) return "$b vs $a"
+        return null
+    }
+
+    /** FotMob pairing -> canonical home-first MatchState. Null when the
+     * pairing carries nothing usable (pre-match NS, cancelled): callers
+     * fall back to Yacine clocks with no score shown. */
+    private fun fotmobState(dm: FotmobDayMatch): MatchState? {
+        val m = dm.match
+        val st = m.status ?: return null
+        if (st.cancelled == true) return null
+        val hs = m.home?.score
+        val aws = m.away?.score
+        // Live minute carries RTL marks ("22'"): keep digits/letters/'/+.
+        val min = st.liveTime?.short
+            ?.filter { it.isLetterOrDigit() || it == '\'' || it == '+' }
+            ?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { if (it.any { c -> c.isDigit() } && !it.endsWith("'")) "$it'" else it }
+        return when {
+            st.finished == true ->
+                MatchState(status = "FT", progress = null, homeScore = hs, awayScore = aws)
+                    .takeIf { hs != null || aws != null }
+            st.ongoing == true || st.started == true ->
+                MatchState(status = "1H", progress = min, homeScore = hs, awayScore = aws)
+                    .takeIf { min != null || hs != null || aws != null }
+            else -> null
+        }
     }
 
     data class SportsDbTeams(
@@ -1071,9 +1231,16 @@ class YacineTvProvider : MainAPI() {
                 hay.contains(q, ignoreCase = true)
             }
             // English league + home-first title + live state per match
-            // (cached; bounded lookup so search stays fast).
+            // (cached; bounded lookup so search stays fast). FotMob pools
+            // are fetched once per day, shared by all matched cards.
+            val fotmobDays = matched.mapNotNull { fotmobDayCompact(it.startTime) }.toSet()
+                .associateWith { withTimeoutOrNull(8_000) { getFotmobDay(it) } }
             val artMap = matched.map { e ->
-                async { e.id to withTimeoutOrNull(4_000) { matchArt(e) } }
+                async {
+                    e.id to withTimeoutOrNull(4_000) {
+                        matchArt(e, fotmobDayCompact(e.startTime)?.let { fotmobDays[it] })
+                    }
+                }
             }.awaitAll().toMap()
             matched.forEach { e ->
                 val art = artMap[e.id]
@@ -1126,7 +1293,8 @@ class YacineTvProvider : MainAPI() {
         val lazyArt = lazyEvent?.let { ev ->
             withTimeoutOrNull(5_000) {
                 runCatching { ensureTeamAliases() }
-                matchArt(ev)
+                val pool = withTimeoutOrNull(4_000) { fotmobDayCompact(ev.startTime)?.let { getFotmobDay(it) } }
+                matchArt(ev, pool)
             }
         }
         // Fresh title only when the canonical home-first matchup resolved;
@@ -1153,7 +1321,7 @@ class YacineTvProvider : MainAPI() {
         // Cricify-style emoji plot, no tags: one line per available
         // field, kickoff first, then competition, channel, commentary
         // last. No status line: the card title already carries the
-        // emoji + minute/score/FT. Joined with <br><br> (not \n): the app
+        // emoji + minute/score/FT. Joined with <br> (not \n): the app
         // renders plot via setTextHtml, which collapses raw newlines.
         // Channels keep their watch plot below.
         val matchPlotLines = if (data.kind == "event") listOfNotNull(
@@ -1162,7 +1330,7 @@ class YacineTvProvider : MainAPI() {
             data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
             data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
         ) else emptyList()
-        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("<br><br>")
+        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("<br>")
             ?: data.plot
             ?: if (data.kind == "event") matchPlot(name)
             else "شاهد البث المباشر لقناة ${data.name}"
