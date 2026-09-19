@@ -1163,7 +1163,7 @@ class YacineTvProvider : MainAPI() {
         val matchPlotLines = if (data.kind == "event") listOfNotNull(
             when (status) {
                 "LIVE" -> "🔴 LIVE"
-                "ENDED" -> "✅ انتهت المباراة"
+                "ENDED" -> "✅ ENDED"
                 else -> null
             },
             competition?.let { "🏆 $it" },
