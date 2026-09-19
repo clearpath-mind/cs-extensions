@@ -545,9 +545,9 @@ class YacineTvProvider : MainAPI() {
                 val arts = events.map { e ->
                     async {
                         // No team-logo fallback: cards show the TheSportsDB
-                        // banner or render empty (null poster).
+                        // banner, else the neutral placeholder (never empty).
                         val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
-                        art to art.thumb
+                        art to (art.thumb ?: noArtBanner)
                     }
                 }.awaitAll()
                 val matchLinks = events.zip(arts).mapNotNull { (e, artAndPoster) ->
@@ -559,8 +559,8 @@ class YacineTvProvider : MainAPI() {
                     // title adds live minute + score inline (option a).
                     val matchup = art.orderedTitle ?: eventBaseTitle(e)
                     val displayName = eventDisplayName(e, nowSec, art)
-                    // TheSportsDB banner or empty (no team-logo fallback);
-                    // poster2 stays null so detail shows banner or empty.
+                    // TheSportsDB banner or placeholder (no team-logo fallback);
+                    // poster2 stays null so detail shows banner or placeholder.
                     LinkData(
                         kind = "event",
                         id = id,
@@ -927,6 +927,11 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
+    /** Neutral placeholder banner for matches with zero upstream art
+     * (verified 200, ~9 KB PNG). Used instead of rendering empty. */
+    private val noArtBanner =
+        "https://thumb.wikimedia.org/wikipedia/commons/thumb/6/60/No-Image-Placeholder-banner.svg/960px-No-Image-Placeholder-banner.svg.png"
+
     /** Official snrtlive.ma vignette arts for the SNRT channels
      * (verified 200; ~5-7 KB each). Other Morocco entries (2M, Medi 1,
      * Télé Maroc) keep API logos. Keys are normalized channel names. */
@@ -1072,8 +1077,8 @@ class YacineTvProvider : MainAPI() {
                 val matchup = art?.orderedTitle ?: eventBaseTitle(e)
                 val displayName = eventDisplayName(e, nowSec, art)
                 val id = e.id ?: return@forEach
-                // TheSportsDB banner or empty (no team-logo fallback).
-                val poster = art?.thumb
+                // TheSportsDB banner or placeholder (no team-logo fallback).
+                val poster = art?.thumb ?: noArtBanner
                 val data = LinkData(
                     kind = "event",
                     id = id,
@@ -1127,7 +1132,7 @@ class YacineTvProvider : MainAPI() {
         val name = if (lazyArt?.orderedTitle != null && lazyEvent != null) {
             eventDisplayName(lazyEvent, nowSec, lazyArt)
         } else data.name
-        val banner = data.poster ?: lazyArt?.thumb
+        val banner = data.poster ?: lazyArt?.thumb ?: noArtBanner
         // Match meta, in order: status, competition, kickoff,
         // commentator, broadcast channel. Accepts new emoji prefix
         // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
@@ -1157,7 +1162,7 @@ class YacineTvProvider : MainAPI() {
         // line covers it); channels keep their watch plot below.
         val matchPlotLines = if (data.kind == "event") listOfNotNull(
             when (status) {
-                "LIVE" -> "🔴 مباشر الآن"
+                "LIVE" -> "🔴 LIVE"
                 "ENDED" -> "✅ انتهت المباراة"
                 else -> null
             },
@@ -1172,8 +1177,8 @@ class YacineTvProvider : MainAPI() {
             else "شاهد البث المباشر لقناة ${data.name}"
         return newMovieLoadResponse(name, url, TvType.Live, url) {
             this.posterUrl = banner
-            // Matches: hero shows the same homepage thumbnail (banner);
-            // empty when no banner was rendered (no team-logo fallback).
+            // Matches: hero shows the same homepage thumbnail (banner),
+            // falling back to the neutral placeholder (never empty).
             if (data.kind == "event") {
                 this.backgroundPosterUrl = banner ?: data.poster2
             }
