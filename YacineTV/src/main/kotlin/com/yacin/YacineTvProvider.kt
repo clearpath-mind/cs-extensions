@@ -311,43 +311,11 @@ class YacineTvProvider : MainAPI() {
             .trim()
     }
 
-    /** Arabic champions -> English fallback when TheSportsDB has no league
-     * (unmapped teams, no day match). Substring matching so minor API
-     * wording variants still hit. Returns null when nothing matches. */
-    private fun translateChampions(arabic: String?): String? {
-        val s = arabic?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        val t = s.replace(Regex("""[ً-ٰٟ]"""), "")
-        fun has(vararg keys: String) = keys.any { t.contains(it) }
-        return when {
-            has("تشامبيونشيب") || (has("البطولة") && has("الإنجليزي", "الانجليزي")) -> "English League Championship"
-            has("الهولندي", "هولندا") -> "Dutch Eredivisie"
-            has("أبطال أوروبا", "ابطال اوروبا") -> "UEFA Champions League"
-            has("المؤتمر الأوروبي", "المؤتمر الاوروبي") -> "UEFA Conference League"
-            has("الأوروبي", "الاوروبي") && has("الدوري") -> "UEFA Europa League"
-            has("الإنجليزي", "الانجليزي", "البريميرليج") -> "Premier League"
-            has("الإسباني", "الاسباني", "الليجا") -> "La Liga"
-            has("الإيطالي", "الايطالي", "الكالتشيو") -> "Serie A"
-            has("الألماني", "الالماني", "البوندسليجا") -> "Bundesliga"
-            has("الفرنسي") -> "Ligue 1"
-            has("السعودي", "روشن") -> "Saudi Pro League"
-            has("المغربي", "البطولة الاحترافية", "البطولة") -> "Botola Pro"
-            has("المصري") -> "Egyptian Premier League"
-            has("أبطال أفريقيا", "ابطال افريقيا") -> "CAF Champions League"
-            has("أبطال آسيا", "ابطال اسيا") -> "AFC Champions League"
-            has("أمم أفريقيا", "امم افريقيا") -> "Africa Cup of Nations"
-            has("أمم أوروبا", "امم اوروبا") -> "UEFA Euro"
-            has("القارات") -> "FIFA Intercontinental Cup"
-            has("كأس العالم", "كاس العالم") -> "FIFA World Cup"
-            else -> null
-        }
-    }
-
-    /** Preferred competition label: TheSportsDB English league, then the
-     * Arabic->English map, then raw Arabic (never blank). */
+    /** Preferred competition label: upstream English league
+     * (TheSportsDB, then FotMob), else raw Arabic (never blank). */
     private fun competitionEnglish(league: String?, champions: String?): String? {
         league?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
-        val raw = champions?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        return translateChampions(raw) ?: raw
+        return champions?.trim()?.takeIf { it.isNotBlank() }
     }
 
     private fun cleanCategoryName(name: String?): String {
@@ -446,50 +414,13 @@ class YacineTvProvider : MainAPI() {
         return matchStatus(e, nowSec)
     }
 
-    /** Minute tag for live cards: 65' | HT | FT | LIVE | null. */
-    private fun minuteLabel(state: MatchState?): String? {
-        val s = state ?: return null
-        val raw = s.status?.trim()?.uppercase() ?: return null
-        if (isFinalScore(raw)) return "FT"
-        if (raw == "HT") return "HT"
-        if (!isInPlayScore(raw)) return null
-        val p = s.progress?.trim()?.takeIf { it.isNotBlank() } ?: return "LIVE"
-        return if (p[0].isDigit() && !p.endsWith("'")) "$p'" else p
-    }
-
-    /** Card title, option (a): score inline when TheSportsDB has it on the
-     * day-matching fixture, e.g. "🔴 65' Everton 1-0 Wolves",
-     * "✅ FT Coventry City 2-1 Aston Villa". Scores only ever pair with
-     * orderedTitle (canonical home-first); without it, plain "A vs B". */
+    /** Card title: status emoji + matchup, e.g. "🔴 Everton vs Wolves".
+     * No minute/score inline (title already tells live vs ended);
+     * matchup is home-first when upstream orderedTitle resolved. */
     private fun eventDisplayName(e: YacineEvent, nowSec: Long, art: MatchArt? = null): String {
         val matchup = art?.orderedTitle ?: eventBaseTitle(e)
-        val teams = art?.orderedTitle?.split(" vs ")?.takeIf { it.size == 2 }
-        val st = art?.state
-        val hs = st?.homeScore
-        val aws = st?.awayScore
-        val status = displayStatus(e, nowSec, st)
-        val emoji = statusEmoji(status)
-        if (teams != null && hs != null && aws != null) {
-            val score = "${teams[0]} $hs-$aws ${teams[1]}"
-            return when (status) {
-                "LIVE" -> {
-                    val tag = if (st?.status?.trim()?.uppercase() == "HT") "HT" else (minuteLabel(st) ?: "LIVE")
-                    "$emoji $tag $score"
-                }
-                "UPCOMING" -> "$emoji $matchup"
-                else -> {
-                    val tag = if (isFinalScore(st?.status)) "FT " else ""
-                    "$emoji $tag$score"
-                }
-            }
-        }
-        return when (status) {
-            "LIVE" -> {
-                val min = minuteLabel(st)
-                if (min != null) "$emoji $min $matchup" else "$emoji $matchup"
-            }
-            else -> "$emoji $matchup"
-        }
+        val status = displayStatus(e, nowSec, art?.state)
+        return "${statusEmoji(status)} $matchup"
     }
 
     private fun matchRank(status: String): Int = when (status) {
