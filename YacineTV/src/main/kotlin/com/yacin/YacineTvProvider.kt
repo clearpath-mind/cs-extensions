@@ -1136,17 +1136,9 @@ class YacineTvProvider : MainAPI() {
             eventDisplayName(lazyEvent, nowSec, lazyArt)
         } else data.name
         val banner = data.poster ?: lazyArt?.thumb ?: noArtBanner
-        // Match meta, in order: status, competition, kickoff,
-        // commentator, broadcast channel. Accepts new emoji prefix
-        // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
-        // Old saved links carry Arabic champions + old date format;
-        // re-translate so detail shows English without re-adding.
-        val status = if (data.kind == "event") when {
-            name.startsWith("🔴") -> "LIVE"
-            name.startsWith("🔜") -> "UPCOMING"
-            name.startsWith("✅") -> "ENDED"
-            else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(name)?.groupValues?.get(1)
-        } else null
+        // Match meta: competition, kickoff, broadcast channel,
+        // commentator. Old saved links carry Arabic champions + old date
+        // format; re-translate so detail shows English without re-adding.
         val competition = if (data.kind == "event") {
             lazyArt?.league?.takeIf { it.isNotBlank() }
                 ?: competitionEnglish(null, data.competition)
@@ -1159,18 +1151,13 @@ class YacineTvProvider : MainAPI() {
                 ?: data.kickoff?.takeIf { it.isNotBlank() }
         } else null
         // Cricify-style emoji plot, no tags: one line per available
-        // field, kickoff first, then status, competition, channel,
-        // commentary last. Joined with <br><br> (not \n): the app
+        // field, kickoff first, then competition, channel, commentary
+        // last. No status line: the card title already carries the
+        // emoji + minute/score/FT. Joined with <br><br> (not \n): the app
         // renders plot via setTextHtml, which collapses raw newlines.
-        // UPCOMING gets no status line (the kickoff
-        // line covers it); channels keep their watch plot below.
+        // Channels keep their watch plot below.
         val matchPlotLines = if (data.kind == "event") listOfNotNull(
             kickoff?.let { "🕐 $it" },
-            when (status) {
-                "LIVE" -> "🔴 LIVE"
-                "ENDED" -> "✅ ENDED"
-                else -> null
-            },
             competition?.let { "🏆 $it" },
             data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
             data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
