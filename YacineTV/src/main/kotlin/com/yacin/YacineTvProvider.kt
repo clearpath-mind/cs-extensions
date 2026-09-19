@@ -662,25 +662,6 @@ class YacineTvProvider : MainAPI() {
             }.awaitAll().flatten()
 
             lists.addAll(otherRows)
-            if (lists.isEmpty()) {
-                // Both bases down and no stale cache: say so instead of a
-                // silently empty homepage. The card carries no ids, so
-                // tapping it loads nothing — refresh to retry.
-                val data = LinkData(
-                    kind = "channel",
-                    ids = emptyList(),
-                    name = "⚠️ Couldn't reach server",
-                    plot = "تعذر الاتصال بالخادم — اسحب للتحديث",
-                ).toJson()
-                lists.add(
-                    HomePageList(
-                        "YacineTV",
-                        listOf(
-                            newLiveSearchResponse("⚠️ Couldn't reach server — pull to refresh", data, TvType.Live)
-                        ),
-                    )
-                )
-            }
             lists
         }
     }
