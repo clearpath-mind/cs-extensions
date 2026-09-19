@@ -353,7 +353,7 @@ class YacineTvProvider : MainAPI() {
         return runCatching {
             val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
             fmt.timeZone = TimeZone.getTimeZone("UTC")
-            fmt.time.parse(iso)?.time
+            fmt.parse(iso)?.time
         }.getOrNull()
     }
 
