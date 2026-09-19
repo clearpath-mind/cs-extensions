@@ -1,11 +1,11 @@
-version = 62
+version = 63
 
 android {
     namespace = "com.yacin"
 }
 
 cloudstream {
-    description = "YacineTV - Live sports, matches of the day and Arabic live channels"
+    description = "YacineTV - Live football on beIN Sports, official guide with Yacine streams"
     authors = listOf("clearpath-mind")
     language = "ar"
 
