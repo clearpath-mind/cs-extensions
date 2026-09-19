@@ -36,11 +36,10 @@ import java.util.TimeZone
 import kotlin.math.abs
 
 /** YacineTV: match guide from the official beIN Sports EPG (ar-mena),
- * playback from the Yacine TV API event streams.
- * A row appears only when an EPG fixture pairs with a Yacine event
- * (kickoff within 10 min + same normalized channel), so every card
- * is playable. No art or live-state upstreams: neutral placeholder
- * art, status from Yacine clocks. */
+ * banners from TheSportsDB (alias-free event search), playback from
+ * the Yacine TV API event streams (paired at watch time).
+ * No art or live-state upstreams beyond that: status from kickoff
+ * clocks, neutral placeholder when no banner resolves. */
 class YacineTvProvider : MainAPI() {
     override var mainUrl = "https://def.ycnapi.com/api"
     private val fallbackUrl = "https://deft.yacinelive.com/api"
@@ -62,15 +61,17 @@ class YacineTvProvider : MainAPI() {
 
     data class LinkData(
         @JsonProperty("kind") val kind: String = "event",
-        @JsonProperty("id") val id: Long? = null, // Yacine event id (stream source)
+        @JsonProperty("id") val id: Long? = null, // Yacine event id (v63 links; v64 pairs at watch)
         @JsonProperty("name") val name: String = "",
         @JsonProperty("poster") val poster: String? = null,
         @JsonProperty("league") val league: String? = null, // EPG competition
         @JsonProperty("channel") val channel: String? = null, // official beIN channel
+        @JsonProperty("channels") val channels: List<String> = emptyList(), // all airing channels
         @JsonProperty("commentary") val commentary: String? = null,
         @JsonProperty("kickoff") val kickoff: String? = null, // baked, refreshed at load
-        @JsonProperty("startTime") val startTime: Long? = null, // epoch sec (Yacine)
-        @JsonProperty("endTime") val endTime: Long? = null, // epoch sec (Yacine)
+        @JsonProperty("kickoffMs") val kickoffMs: Long? = null, // EPG kickoff epoch ms
+        @JsonProperty("startTime") val startTime: Long? = null, // epoch sec (v63 links)
+        @JsonProperty("endTime") val endTime: Long? = null, // epoch sec (v63 links)
         @JsonProperty("desc") val desc: String? = null, // EPG Opta preview text
         @JsonProperty("related") val related: List<LinkData>? = null,
         @JsonProperty("plot") val plot: String? = null,
@@ -287,7 +288,16 @@ class YacineTvProvider : MainAPI() {
         val league: String?,
         val channels: List<String>, // official beIN channel names
         val desc: String?,
-        val yacine: YacineEvent, // paired stream source
+        val kickoffMs: Long, // EPG kickoff epoch ms
+    )
+
+    /** EPG core football channels (normalized). NEWS/AFC/MAX/XTRA are
+     * filler loops or out of Yacine scope; plain 6 has no EPG entry. */
+    private val guideChannelNorms = setOf(
+        "bein sports 1", "bein sports 2", "bein sports 3",
+        "bein sports 4", "bein sports 5", "bein sports 6",
+        "bein sports 7", "bein sports 8", "bein sports 9",
+        "bein sports en 1", "bein sports en 2", "bein 4k",
     )
 
     private suspend fun getEpgChannels(): List<EpgChannel> {
@@ -374,28 +384,24 @@ class YacineTvProvider : MainAPI() {
         return fmt.format(Date(ms))
     }
 
-    /** Guide fixtures for a 48h UTC window: EPG events on channels that
-     * Yacine airs, each paired to its Yacine event (kickoff within
-     * 10 min + same normalized channel). Unpaired rows are dropped:
-     * every card must be playable. */
+    /** Guide fixtures for today (UTC): EPG football events on the core
+     * channels, merged across channels by fixture + day. No Yacine fetch
+     * here — pairing happens at watch time, so the guide renders even
+     * during Yacine outages. Rows older than 3h past kickoff are
+     * dropped (likely finished; no live source to confirm). */
     private suspend fun guideFixtures(): List<GuideFixture> {
         return coroutineScope {
-            val eventsDeferred = async { withTimeoutOrNull(20_000) { getEvents() } ?: emptyList() }
-            val channelsDeferred = async { withTimeoutOrNull(15_000) { getEpgChannels() } ?: emptyList() }
-            val events = eventsDeferred.await()
-            if (events.isEmpty()) return@coroutineScope emptyList()
-            val epgByNorm = channelsDeferred.await()
-                .mapNotNull { c ->
-                    val name = c.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    val id = c.id?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    normChannel(name) to (name to id)
-                }.toMap()
-            // Only query EPG channels Yacine actually airs today.
-            val wanted = events.mapNotNull { it.channel?.let { ch -> normChannel(ch) } }
-                .toSet().mapNotNull { epgByNorm[it] }.distinct()
+            val nowMs = System.currentTimeMillis()
+            val channels = withTimeoutOrNull(15_000) { getEpgChannels() } ?: emptyList()
+            val wanted = channels.mapNotNull { c ->
+                val name = c.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val id = c.id?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                if (normChannel(name) !in guideChannelNorms) return@mapNotNull null
+                name to id
+            }.distinct()
             if (wanted.isEmpty()) return@coroutineScope emptyList()
             val winStart = utcDayStart(0)
-            val winEnd = utcDayStart(2)
+            val winEnd = utcDayStart(1)
             val epgEvents = wanted.map { (name, id) ->
                 async {
                     withTimeoutOrNull(15_000) {
@@ -403,24 +409,18 @@ class YacineTvProvider : MainAPI() {
                     }.orEmpty().map { it to name }
                 }
             }.awaitAll().flatten()
-            // Index Yacine events by normalized channel for pairing.
             // Same fixture airs on several channels: merge into one row
             // with the channel union (deduped by fixture + UTC day).
-            val yacineByChan = events.groupBy { normChannel(it.channel.orEmpty()) }
             val out = mutableListOf<GuideFixture>()
             epgEvents.forEach { (epg, channelName) ->
                 val parsed = parseEpgTitle(epg.title) ?: return@forEach
                 val (home, away, league) = parsed
                 val epgMs = epgStartMs(epg.startDate) ?: return@forEach
-                val yc = yacineByChan[normChannel(channelName)].orEmpty().mapNotNull { ev ->
-                    val st = ev.startTime?.times(1000) ?: return@mapNotNull null
-                    val dt = abs(st - epgMs)
-                    if (dt > 10 * 60 * 1000) return@mapNotNull null
-                    ev to dt
-                }.minByOrNull { it.second }?.first ?: return@forEach
+                if (epgMs < nowMs - 3 * 3600 * 1000) return@forEach
+                if (epgMs < winStart || epgMs >= winEnd) return@forEach
                 val key = "${normTeam(home)}|${normTeam(away)}|${dayOf(epgMs)}"
                 val existing = out.firstOrNull {
-                    "${normTeam(it.home)}|${normTeam(it.away)}|${dayOf(it.yacine.startTime?.times(1000) ?: epgMs)}" == key
+                    "${normTeam(it.home)}|${normTeam(it.away)}|${dayOf(it.kickoffMs)}" == key
                 }
                 if (existing != null) {
                     if (existing.channels.none { it.equals(channelName, ignoreCase = true) }) {
@@ -436,14 +436,14 @@ class YacineTvProvider : MainAPI() {
                         league = league,
                         channels = listOf(channelName),
                         desc = epg.description?.trim()?.takeIf { it.isNotBlank() },
-                        yacine = yc,
+                        kickoffMs = epgMs,
                     )
                 )
             }
             out.sortedWith(
                 compareBy(
-                    { matchRank(matchStatus(it.yacine, System.currentTimeMillis() / 1000)) },
-                    { it.yacine.startTime ?: Long.MAX_VALUE },
+                    { matchRank(matchStatus(it.kickoffMs, System.currentTimeMillis())) },
+                    { it.kickoffMs },
                 )
             )
         }
@@ -492,13 +492,11 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { "" }
     }
 
-    /** Match state derived from start/end_time vs now. Missing times
-     * keep the match playable: unknown start -> LIVE if end not passed. */
-    private fun matchStatus(e: YacineEvent, nowSec: Long): String {
-        val start = e.startTime?.takeIf { it > 0 }
-        val end = e.endTime?.takeIf { it > 0 }
-        if (end != null && nowSec > end) return "ENDED"
-        if (start != null && nowSec < start) return "UPCOMING"
+    /** Match state from kickoff clocks only (no live source):
+     * upcoming before kickoff, live after. Rows older than 3h past
+     * kickoff are filtered at guide time (likely finished). */
+    private fun matchStatus(kickoffMs: Long?, nowMs: Long): String {
+        if (kickoffMs == null || kickoffMs <= 0 || nowMs < kickoffMs) return "UPCOMING"
         return "LIVE"
     }
 
@@ -513,6 +511,56 @@ class YacineTvProvider : MainAPI() {
         "LIVE" -> 0
         "UPCOMING" -> 1
         else -> 2
+    }
+
+    data class SportsDbEvents(
+        @JsonProperty("event") val event: List<SportsDbEvent>? = null,
+    )
+
+    data class SportsDbEvent(
+        @JsonProperty("dateEvent") val dateEvent: String? = null,
+        @JsonProperty("strEvent") val strEvent: String? = null,
+        @JsonProperty("strThumb") val strThumb: String? = null,
+    )
+
+    /** Accent/case-insensitive compare for team names across providers. */
+    private fun normThumb(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "").lowercase()
+
+    /** TheSportsDB banner for EPG English names, no alias file: both team
+     * orders are queried, the day-matching event whose name contains
+     * every significant word of both sides wins. Null when nothing
+     * day-matches (caller uses the placeholder). */
+    private suspend fun searchThumb(home: String, away: String, day: String?): String? {
+        if (home.isBlank() || away.isBlank()) return null
+        fun words(s: String) = normThumb(s).split(Regex("""\s+"""))
+            .map { it.trim() }.filter { it.length > 2 }
+        val hw = words(home)
+        val aw = words(away)
+        if (hw.isEmpty() || aw.isEmpty()) return null
+        fun hasAll(ev: String?): Boolean {
+            if (ev.isNullOrBlank()) return false
+            val n = normThumb(ev)
+            return (hw + aw).all { w -> n.contains(w) }
+        }
+        for ((a, b) in listOf(home to away, away to home)) {
+            val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
+            val res = retryIO(times = 2) {
+                runCatching {
+                    app.get(
+                        "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$q",
+                        headers = noCacheHeaders,
+                        timeout = 8,
+                    ).text.takeIf { it.isNotBlank() }
+                }.getOrNull()
+            } ?: continue
+            val events = runCatching { parseJson<SportsDbEvents>(res).event }.getOrNull().orEmpty()
+            if (events.isEmpty()) continue
+            val pool = if (day.isNullOrBlank()) events else events.filter { it.dateEvent == day }
+            pool.firstOrNull { !it.strThumb.isNullOrBlank() && hasAll(it.strEvent) }
+                ?.strThumb?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        return null
     }
 
     /** Neutral placeholder banner: the EPG carries no artwork. */
@@ -534,62 +582,61 @@ class YacineTvProvider : MainAPI() {
     }
 
     private suspend fun buildHomeLists(): List<HomePageList> {
-        val nowSec = System.currentTimeMillis() / 1000
-        val fixtures = withTimeoutOrNull(60_000) { guideFixtures() } ?: emptyList()
-        if (fixtures.isEmpty()) return emptyList()
-        // Split rows by UTC day: today vs tomorrow.
-        val today = dayOf(nowSec * 1000)
-        val (todayFix, laterFix) = fixtures.partition {
-            dayOf(it.yacine.startTime?.times(1000) ?: Long.MAX_VALUE) <= today
-        }
-        return listOf("Today's Matches" to todayFix, "Tomorrow's Matches" to laterFix)
-            .mapNotNull { (title, list) ->
-                if (list.isEmpty()) return@mapNotNull null
-                val items = list.map { f ->
-                    val status = matchStatus(f.yacine, nowSec)
-                    val link = LinkData(
-                        id = f.yacine.id,
-                        name = "${statusEmoji(status)} ${f.home} vs ${f.away}",
-                        poster = noArtBanner,
-                        league = f.league,
-                        channel = f.channels.firstOrNull(),
-                        commentary = f.yacine.commentary?.trim()?.takeIf { it.isNotBlank() },
-                        kickoff = formatKickoff(f.yacine.startTime, nowSec).takeIf { it.isNotBlank() },
-                        startTime = f.yacine.startTime,
-                        endTime = f.yacine.endTime,
-                        desc = f.desc,
-                        plot = "${f.home} vs ${f.away}",
-                    )
-                    val withRelated = link.copy(
-                        related = list.filter { it !== f }.take(12).map { rel ->
-                            val rs = matchStatus(rel.yacine, nowSec)
-                            LinkData(
-                                id = rel.yacine.id,
-                                name = "${statusEmoji(rs)} ${rel.home} vs ${rel.away}",
-                                poster = noArtBanner,
-                                league = rel.league,
-                                channel = rel.channels.firstOrNull(),
-                                commentary = rel.yacine.commentary?.trim()?.takeIf { it.isNotBlank() },
-                                kickoff = formatKickoff(rel.yacine.startTime, nowSec).takeIf { it.isNotBlank() },
-                                startTime = rel.yacine.startTime,
-                                endTime = rel.yacine.endTime,
-                                desc = rel.desc,
-                                plot = "${rel.home} vs ${rel.away}",
-                            )
-                        },
-                    )
-                    newLiveSearchResponse(withRelated.name, withRelated.toJson(), TvType.Live) {
-                        this.posterUrl = withRelated.poster
+        return coroutineScope {
+            val nowMs = System.currentTimeMillis()
+            val fixtures = withTimeoutOrNull(60_000) { guideFixtures() } ?: emptyList()
+            if (fixtures.isEmpty()) return@coroutineScope emptyList()
+            // Banners resolve in parallel; each is guarded so one slow
+            // lookup never blocks the homepage.
+            val thumbs = fixtures.map { f ->
+                async {
+                    withTimeoutOrNull(8_000) {
+                        searchThumb(f.home, f.away, dayOf(f.kickoffMs))
                     }
                 }
-                HomePageList(title, items, isHorizontalImages = true)
+            }.awaitAll()
+        val items = fixtures.zip(thumbs).mapNotNull { (f, thumb) ->
+            val status = matchStatus(f.kickoffMs, nowMs)
+            val link = LinkData(
+                name = "${statusEmoji(status)} ${f.home} vs ${f.away}",
+                poster = thumb ?: noArtBanner,
+                league = f.league,
+                channel = f.channels.firstOrNull(),
+                channels = f.channels,
+                kickoff = formatKickoff(f.kickoffMs / 1000, nowMs / 1000).takeIf { it.isNotBlank() },
+                kickoffMs = f.kickoffMs,
+                desc = f.desc,
+                plot = "${f.home} vs ${f.away}",
+            )
+            val withRelated = link.copy(
+                related = fixtures.filter { it !== f }.take(12).map { rel ->
+                    val rs = matchStatus(rel.kickoffMs, nowMs)
+                    LinkData(
+                        name = "${statusEmoji(rs)} ${rel.home} vs ${rel.away}",
+                        poster = noArtBanner,
+                        league = rel.league,
+                        channel = rel.channels.firstOrNull(),
+                        channels = rel.channels,
+                        kickoff = formatKickoff(rel.kickoffMs / 1000, nowMs / 1000).takeIf { it.isNotBlank() },
+                        kickoffMs = rel.kickoffMs,
+                        desc = rel.desc,
+                        plot = "${rel.home} vs ${rel.away}",
+                    )
+                },
+            )
+            newLiveSearchResponse(withRelated.name, withRelated.toJson(), TvType.Live) {
+                this.posterUrl = withRelated.poster
             }
+        }
+        if (items.isEmpty()) return@coroutineScope emptyList()
+        listOf(HomePageList("Today's Matches", items, isHorizontalImages = true))
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val q = query.trim()
-        val nowSec = System.currentTimeMillis() / 1000
+        val nowMs = System.currentTimeMillis()
         val out = mutableListOf<SearchResponse>()
         withTimeoutOrNull(60_000) { guideFixtures() }.orEmpty()
             .filter { f ->
@@ -597,17 +644,15 @@ class YacineTvProvider : MainAPI() {
                     .joinToString(" ").contains(q, ignoreCase = true)
             }.take(30)
             .forEach { f ->
-                val status = matchStatus(f.yacine, nowSec)
+                val status = matchStatus(f.kickoffMs, nowMs)
                 val link = LinkData(
-                    id = f.yacine.id,
                     name = "${statusEmoji(status)} ${f.home} vs ${f.away}",
                     poster = noArtBanner,
                     league = f.league,
                     channel = f.channels.firstOrNull(),
-                    commentary = f.yacine.commentary?.trim()?.takeIf { it.isNotBlank() },
-                    kickoff = formatKickoff(f.yacine.startTime, nowSec).takeIf { it.isNotBlank() },
-                    startTime = f.yacine.startTime,
-                    endTime = f.yacine.endTime,
+                    channels = f.channels,
+                    kickoff = formatKickoff(f.kickoffMs / 1000, nowMs / 1000).takeIf { it.isNotBlank() },
+                    kickoffMs = f.kickoffMs,
                     desc = f.desc,
                     plot = "${f.home} vs ${f.away}",
                 )
@@ -622,21 +667,27 @@ class YacineTvProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
-        val nowSec = System.currentTimeMillis() / 1000
-        // Fresh emoji + countdown from the baked clocks (no live source).
-        val status = if (data.id != null) {
-            matchStatus(
-                YacineEvent(startTime = data.startTime, endTime = data.endTime),
-                nowSec,
-            )
-        } else null
+        val nowMs = System.currentTimeMillis()
+        // Fresh emoji + countdown from the baked kickoff (no live source).
+        // Old v63 links carry Yacine startTime instead of kickoffMs.
+        val kickoffMs = data.kickoffMs ?: data.startTime?.times(1000)
+        val status = matchStatus(kickoffMs, nowMs)
         val matchup = data.plot?.takeIf { it.isNotBlank() } ?: data.name
-        val name = if (status != null) "${statusEmoji(status)} $matchup" else data.name
-        val kickoff = data.startTime
-            ?.let { formatKickoff(it, nowSec) }?.takeIf { it.isNotBlank() }
+        val name = "${statusEmoji(status)} $matchup"
+        val kickoff = kickoffMs
+            ?.let { formatKickoff(it / 1000, nowMs / 1000) }?.takeIf { it.isNotBlank() }
             ?: data.kickoff?.takeIf { it.isNotBlank() }
+        // Banner enrich: TheSportsDB by matchup teams (bounded, detail
+        // can afford it). Falls back to the baked poster, then placeholder.
+        val matchupTeams = matchup.split(" vs ").map { it.trim() }.takeIf { it.size == 2 }
+        val thumb = if (matchupTeams != null) {
+            withTimeoutOrNull(5_000) {
+                searchThumb(matchupTeams[0], matchupTeams[1], kickoffMs?.let { dayOf(it) })
+            }
+        } else null
+        val banner = thumb ?: data.poster ?: noArtBanner
         // Detail description: kickoff, competition, channel, commentator,
-        // then the EPG Opta preview. Joined with <br> (not \n): the app
+        // then the EPG Opta preview. Joined with <br><br> (not \n): the app
         // renders plot via setTextHtml, which collapses raw newlines.
         val lines = listOfNotNull(
             kickoff?.let { "🕐 $it" },
@@ -648,8 +699,8 @@ class YacineTvProvider : MainAPI() {
             .takeIf { it.isNotEmpty() }?.joinToString("<br><br>")
             ?: data.name
         return newMovieLoadResponse(name, url, TvType.Live, url) {
-            this.posterUrl = data.poster ?: noArtBanner
-            this.backgroundPosterUrl = data.poster ?: noArtBanner
+            this.posterUrl = banner
+            this.backgroundPosterUrl = banner
             this.plot = plot
             data.related?.takeIf { it.isNotEmpty() }?.let { related ->
                 this.recommendations = related.map { rel ->
@@ -659,6 +710,24 @@ class YacineTvProvider : MainAPI() {
                 }
             }
         }
+    }
+
+    /** Watch-time pairing: Yacine event with kickoff within 35 min and
+     * a normalized channel on both sides. Null when nothing pairs
+     * (caller fails gracefully). */
+    private suspend fun pairYacineEvent(info: LinkData): Long? {
+        val kickoff = info.kickoffMs ?: return null
+        val wanted = info.channels.map { normChannel(it) }.filter { it.isNotBlank() }.toSet()
+        if (wanted.isEmpty()) return null
+        val events = withTimeoutOrNull(20_000) { getEvents() } ?: return null
+        return events.mapNotNull { ev ->
+            val st = ev.startTime?.times(1000) ?: return@mapNotNull null
+            val dt = abs(st - kickoff)
+            if (dt > 35 * 60 * 1000) return@mapNotNull null
+            val ec = ev.channel?.let { normChannel(it) }?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            if (wanted.none { it == ec }) return@mapNotNull null
+            ev.id?.let { it to dt }
+        }.minByOrNull { it.second }?.first
     }
 
     private fun streamHeaders(s: YacineStream): Map<String, String> {
@@ -761,7 +830,9 @@ class YacineTvProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val info = parseJson<LinkData>(data)
-        val eventId = info.id ?: return false
+        // v63 links carry the Yacine event id directly; v64 pairs at
+        // watch time (kickoff within 35 min + same normalized channel).
+        val eventId = info.id ?: pairYacineEvent(info) ?: return false
         val streams = getEventStreams(eventId)
         val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() } ?: info.name
         var found = false

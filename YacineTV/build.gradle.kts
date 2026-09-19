@@ -1,11 +1,10 @@
-version = 63
+version = 64
 
 android {
     namespace = "com.yacin"
 }
 
 cloudstream {
-    description = "YacineTV - Live football on beIN Sports, official guide with Yacine streams"
     authors = listOf("clearpath-mind")
     language = "ar"
 
