@@ -33,7 +33,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import kotlin.math.abs
 
 /** YacineTV: match guide from the official beIN Sports EPG (ar-mena),
  * banners from TheSportsDB (alias-free event search), playback from
@@ -164,18 +163,7 @@ class YacineTvProvider : MainAPI() {
 
     private fun prefsKey(path: String) = "payload_" + path.replace(Regex("[^A-Za-z0-9]"), "_")
 
-    // Raw Yacine models (slim: guide pairing + playback only).
-    data class YacineEventResponse(
-        @JsonProperty("data") val data: List<YacineEvent>? = null,
-    )
-
-    data class YacineEvent(
-        @JsonProperty("id") val id: Long? = null,
-        @JsonProperty("channel") val channel: String? = null,
-        @JsonProperty("commentary") val commentary: String? = null,
-        @JsonProperty("start_time") val startTime: Long? = null,
-        @JsonProperty("end_time") val endTime: Long? = null,
-    )
+    // Raw Yacine models (slim: catalog + channel streams only).
 
     data class YacineStreamResponse(
         @JsonProperty("data") val data: List<YacineStream>? = null,
@@ -243,21 +231,78 @@ class YacineTvProvider : MainAPI() {
         runCatching { prefs()?.edit()?.putString(prefsKey(path), json)?.apply() }
     }
 
-    private suspend fun getEvents(): List<YacineEvent> {
-        val json = getPayload("events") ?: return emptyList()
+    // Raw Yacine models (slim: catalog + channel streams only).
+    data class YacineCategoryEnvelope(
+        @JsonProperty("data") val data: List<YacineCategory>? = null,
+    )
+
+    data class YacineCategory(
+        @JsonProperty("id") val id: Long? = null,
+        @JsonProperty("name") val name: String? = null,
+    )
+
+    data class YacineChannelResponse(
+        @JsonProperty("data") val data: List<YacineChannel>? = null,
+    )
+
+    data class YacineChannel(
+        @JsonProperty("id") val id: Long? = null,
+        @JsonProperty("name") val name: String? = null,
+    )
+
+    /** beIN quality groups share channel names across qualities
+     * ("beIN SPORTS (1080P/720P/360P/244P)"). Matched by name: category
+     * ids rotate (were 4/5/6/7, now 19-digit), names are stable. */
+    private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
+
+    private fun isBeinQuality(cat: YacineCategory): Boolean {
+        return beinQualityRegex.containsMatchIn(cat.name.orEmpty())
+    }
+
+    private fun qualityRank(cat: YacineCategory): Int {
+        val m = beinQualityRegex.find(cat.name.orEmpty())
+        val num = m?.groupValues?.getOrNull(1)?.replace(Regex("""\D"""), "")?.toIntOrNull()
+        // Higher resolution first; unknown quality sorts last.
+        return -(num ?: -1)
+    }
+
+    private suspend fun getCategories(): List<YacineCategory> {
+        val json = getPayload("categories") ?: return emptyList()
         return runCatching {
-            parseJson<YacineEventResponse>(json).data ?: emptyList()
+            parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
     }
 
-    private suspend fun getEventStreams(eventId: Long): List<YacineStream> {
-        // /event/{id} and /event/{id}/servers return the same server list.
+    private suspend fun getChannels(categoryId: Long): List<YacineChannel> {
+        val json = getPayload("categories/$categoryId/channels") ?: return emptyList()
+        return runCatching {
+            parseJson<YacineChannelResponse>(json).data ?: emptyList()
+        }.getOrNull() ?: emptyList()
+    }
+
+    private suspend fun getChannelStreams(channelId: Long): List<YacineStream> {
         // Streams stay fresh-only: stale URLs die fast.
-        val (json) = getDecrypted("event/$eventId") ?: getDecrypted("event/$eventId/servers") ?: return emptyList()
+        val (json) = getDecrypted("channel/$channelId") ?: return emptyList()
         if (json.isBlank()) return emptyList()
         return runCatching {
             parseJson<YacineStreamResponse>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
+    }
+
+    /** Yacine channel id for an official EPG channel name, best quality
+     * first. Null when Yacine carries no such channel. */
+    private suspend fun resolveChannelId(channelName: String): Long? {
+        val want = normChannel(channelName)
+        if (want.isBlank()) return null
+        val groups = withTimeoutOrNull(20_000) { getCategories() }
+            .orEmpty().filter { isBeinQuality(it) }.sortedBy { qualityRank(it) }
+        for (g in groups) {
+            val gid = g.id ?: continue
+            val hit = withTimeoutOrNull(15_000) { getChannels(gid) }
+                .orEmpty().firstOrNull { normChannel(it.name.orEmpty()) == want }
+            if (hit?.id != null) return hit.id
+        }
+        return null
     }
 
     // ---- Official beIN EPG backend (guide authority) ----
@@ -712,24 +757,6 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Watch-time pairing: Yacine event with kickoff within 35 min and
-     * a normalized channel on both sides. Null when nothing pairs
-     * (caller fails gracefully). */
-    private suspend fun pairYacineEvent(info: LinkData): Long? {
-        val kickoff = info.kickoffMs ?: return null
-        val wanted = info.channels.map { normChannel(it) }.filter { it.isNotBlank() }.toSet()
-        if (wanted.isEmpty()) return null
-        val events = withTimeoutOrNull(20_000) { getEvents() } ?: return null
-        return events.mapNotNull { ev ->
-            val st = ev.startTime?.times(1000) ?: return@mapNotNull null
-            val dt = abs(st - kickoff)
-            if (dt > 35 * 60 * 1000) return@mapNotNull null
-            val ec = ev.channel?.let { normChannel(it) }?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            if (wanted.none { it == ec }) return@mapNotNull null
-            ev.id?.let { it to dt }
-        }.minByOrNull { it.second }?.first
-    }
-
     private fun streamHeaders(s: YacineStream): Map<String, String> {
         val out = mutableMapOf<String, String>()
         s.headers?.forEach { (k, v) ->
@@ -830,14 +857,21 @@ class YacineTvProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val info = parseJson<LinkData>(data)
-        // v63 links carry the Yacine event id directly; v64 pairs at
-        // watch time (kickoff within 35 min + same normalized channel).
-        val eventId = info.id ?: pairYacineEvent(info) ?: return false
-        val streams = getEventStreams(eventId)
-        val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() } ?: info.name
+        // Channel playback: resolve each airing channel (in order) to its
+        // Yacine channel id, best quality first. v63 links carry only a
+        // single channel: it rides along as fallback. First channel with
+        // playable streams wins.
+        val candidates = (info.channels + listOfNotNull(info.channel)).distinct()
+        val streams = candidates.firstNotNullOfOrNull { ch ->
+            val cid = withTimeoutOrNull(30_000) { resolveChannelId(ch) } ?: return@firstNotNullOfOrNull null
+            withTimeoutOrNull(20_000) { getChannelStreams(cid) }
+                ?.takeIf { it.isNotEmpty() }?.let { ch to it }
+        } ?: return false
+        val (channelName, channelStreams) = streams
+        val tag = channelName.trim().takeIf { it.isNotEmpty() } ?: info.name
         var found = false
         val seenUrls = mutableSetOf<String>()
-        streams.forEach { s ->
+        channelStreams.forEach { s ->
             val raw = s.url?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
             if (!seenUrls.add(raw)) return@forEach
             val headers = streamHeaders(s)
