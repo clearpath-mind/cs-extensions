@@ -137,7 +137,7 @@ class YacineTvProvider : MainAPI() {
      * Both bases reset connections at times; when a fresh fetch fails,
      * getters fall back to these instead of rendering empty rows.
      * Memory-first, SharedPreferences-backed so stale data survives
-     * process death. Search payloads are never cached (unbounded keys). */
+     * process death. */
     @Volatile
     private var lastPayloads: Map<String, String> = emptyMap()
 
@@ -149,15 +149,14 @@ class YacineTvProvider : MainAPI() {
     /** Fresh payload, or the last-good cached one when the API flaps.
      * Only non-blank responses are remembered, so a genuine empty
      * ({"data":[]}) still parses to empty instead of serving stale data. */
-    private suspend fun getPayload(path: String, cacheable: Boolean = true): String? {
-        val (json) = getDecrypted(path) ?: return stalePayload(path, cacheable)
-        if (json.isBlank()) return stalePayload(path, cacheable)
-        if (cacheable) rememberPayload(path, json)
+    private suspend fun getPayload(path: String): String? {
+        val (json) = getDecrypted(path) ?: return stalePayload(path)
+        if (json.isBlank()) return stalePayload(path)
+        rememberPayload(path, json)
         return json
     }
 
-    private fun stalePayload(path: String, cacheable: Boolean): String? {
-        if (!cacheable) return null
+    private fun stalePayload(path: String): String? {
         lastPayloads[path]?.let { return it }
         // Warm memory from disk so the next lookup is cheap.
         return prefs()?.getString(prefsKey(path), null)?.takeIf { it.isNotBlank() }?.also {
@@ -414,13 +413,17 @@ class YacineTvProvider : MainAPI() {
         return matchStatus(e, nowSec)
     }
 
-    /** Card title: status emoji + matchup, e.g. "🔴 Everton vs Wolves".
-     * No minute/score inline (title already tells live vs ended);
-     * matchup is home-first when upstream orderedTitle resolved. */
+    /** Card title: status emoji + matchup, live minute when in play,
+     * e.g. "🔴 65' Everton vs Wolves". No scores inline.
+     * Matchup is home-first when upstream orderedTitle resolved. */
     private fun eventDisplayName(e: YacineEvent, nowSec: Long, art: MatchArt? = null): String {
         val matchup = art?.orderedTitle ?: eventBaseTitle(e)
         val status = displayStatus(e, nowSec, art?.state)
-        return "${statusEmoji(status)} $matchup"
+        val emoji = statusEmoji(status)
+        if (status == "LIVE") {
+            art?.state?.progress?.trim()?.takeIf { it.isNotBlank() }?.let { return "$emoji $it $matchup" }
+        }
+        return "$emoji $matchup"
     }
 
     private fun matchRank(status: String): Int = when (status) {
@@ -672,21 +675,24 @@ class YacineTvProvider : MainAPI() {
     )
 
     /** Ready-made 1280x720 match banner + English league from TheSportsDB
-     * (free key). Cricify-style: no cache — every build fetches fresh
-     * (Cache-Control: no-cache), same request also carrying the home-first
-     * title and live state. No banner renders empty (null poster, no
-     * team-logo fallback); league falls back to Arabic champions.
-     * orderedTitle is the home-first "A vs B" from TheSportsDB
-     * (strHomeTeam/strAwayTeam, else strEvent order): Yacine team_1/team_2
-     * is not reliably home-first (e.g. 2026-09-16 Everton-Wolves and
-     * Coventry-Aston Villa were both reversed upstream). */
+     * (free key), live state and official club names from FotMob.
+     * Cricify-style: no cache — every build fetches fresh
+     * (Cache-Control: no-cache). Thumb stays TheSportsDB-only (FotMob
+     * serves no match banners); without one the card uses the neutral
+     * placeholder. League falls back to raw Arabic champions.
+     * orderedTitle is the home-first "A vs B" (FotMob official names,
+     * else TheSportsDB strHomeTeam/strAwayTeam, else strEvent order):
+     * Yacine team_1/team_2 is not reliably home-first (e.g. 2026-09-16
+     * Everton-Wolves and Coventry-Aston Villa were both reversed
+     * upstream). */
     private data class MatchArt(
         val thumb: String? = null,
         val league: String? = null,
         val orderedTitle: String? = null,
         val state: MatchState? = null,
     )
-    /** Live score/progress from the day-matching TheSportsDB event.
+    /** Live score/progress from the day-matching upstream fixture
+     * (TheSportsDB or FotMob).
      * Scores always follow the canonical home-first order (same fixture
      * as orderedTitle), never Yacine team_1/team_2 order. Scores parse
      * from String because the API mixes "2" and 2. */
@@ -726,14 +732,6 @@ class YacineTvProvider : MainAPI() {
         return if (n.indexOf(nb) < n.indexOf(na)) "$b vs $a" else "$a vs $b"
     }
 
-    private suspend fun matchThumb(e: YacineEvent): String? {
-        return matchArt(e).thumb
-    }
-
-    private suspend fun matchLeague(e: YacineEvent): String? {
-        return matchArt(e).league
-    }
-
     /** Cricify-style: no art/state cache — every build fetches fresh
      * (Cache-Control: no-cache), same request returning thumb + league +
      * home-first title + live state. Bounded by caller timeouts.
@@ -745,14 +743,25 @@ class YacineTvProvider : MainAPI() {
         val day = e.startTime?.let { dayString(it) }
         val t1 = teamAlias(e.team1?.id) ?: return MatchArt()
         val t2 = teamAlias(e.team2?.id) ?: return MatchArt()
-        // Both team orders are always consulted: the first order often
-        // returns a league-only result (day pool empty, league falls back to
-        // any leg) while the reversed order holds the day-matching banner.
-        // Returning early on league-only is what left cards on logo fallback.
+        // FotMob first for title (official club names), league and live
+        // state; TheSportsDB fills the thumb plus anything FotMob misses.
+        // Thumb stays TheSportsDB-only (FotMob serves no match banners).
         var bestThumb: String? = null
         var bestLeague: String? = null
         var bestTitle: String? = null
         var bestState: MatchState? = null
+        if (fotmobPool != null) {
+            val fb = fotmobPair(fotmobPool, t1, t2)
+            if (fb != null) {
+                bestTitle = fotmobOrderedTitle(fb)
+                bestLeague = fb.league?.trim()?.takeIf { it.isNotBlank() }
+                bestState = fotmobState(fb)
+            }
+        }
+        // Both team orders are always consulted: the first order often
+        // returns a league-only result (day pool empty, league falls back to
+        // any leg) while the reversed order holds the day-matching banner.
+        // Returning early on league-only is what left cards on logo fallback.
         for ((a, b) in listOf(t1 to t2, t2 to t1)) {
             val art = searchEventArt(a, b, day)
             if (art.thumb != null && bestThumb == null) bestThumb = art.thumb
@@ -763,17 +772,6 @@ class YacineTvProvider : MainAPI() {
         }
         // No backoff cache: empty/failed lookups simply return nothing and
         // are retried on the next build (Cricify-style always-fresh).
-        // FotMob fallback for league + live state when TheSportsDB has no
-        // day match (flaps, rate limits, unmapped fixtures). Thumb stays
-        // TheSportsDB-only (FotMob serves no match banners).
-        if ((bestLeague == null || bestState == null || bestTitle == null) && fotmobPool != null) {
-            val fb = fotmobPair(fotmobPool, t1, t2)
-            if (fb != null) {
-                if (bestLeague == null) bestLeague = fb.league?.trim()?.takeIf { it.isNotBlank() }
-                if (bestState == null) bestState = fotmobState(fb)
-                if (bestTitle == null) bestTitle = fotmobOrderedTitle(fb, t1, t2)
-            }
-        }
         if (bestThumb == null && bestLeague == null) {
             return MatchArt(null, null, bestTitle, bestState)
         }
@@ -843,10 +841,6 @@ class YacineTvProvider : MainAPI() {
             }
         }
         return MatchArt(thumb, league, orderedTitle, state)
-    }
-
-    private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
-        return searchEventArt(a, b, day).thumb
     }
 
     data class FotmobMatches(
@@ -949,19 +943,14 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Home-first "A vs B" from a FotMob pairing (aliases in display
-     * casing). Both sides verified exact, so scores stay canonical. */
-    private fun fotmobOrderedTitle(dm: FotmobDayMatch, a: String, b: String): String? {
-        val na = normFotmob(a)
-        val nb = normFotmob(b)
-        if (na.isBlank() || nb.isBlank() || na == nb) return null
-        fun names(t: FotmobTeam?): List<String> =
-            listOfNotNull(t?.name, t?.shortName).map { normFotmob(it) }.filter { it.isNotBlank() }
-        val h = names(dm.match.home)
-        val w = names(dm.match.away)
-        if (na in h && nb in w) return "$a vs $b"
-        if (nb in h && na in w) return "$b vs $a"
-        return null
+    /** Official club names from a FotMob pairing, home-first
+     * ("Athletic Club vs Deportivo Alavés"). Verbatim pool names:
+     * pairing already verified both sides, so scores stay canonical. */
+    private fun fotmobOrderedTitle(dm: FotmobDayMatch): String? {
+        val home = dm.match.home?.name?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val away = dm.match.away?.name?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        if (home.equals(away, ignoreCase = true)) return null
+        return "$home vs $away"
     }
 
     /** FotMob pairing -> canonical home-first MatchState. Null when the
@@ -986,38 +975,6 @@ class YacineTvProvider : MainAPI() {
                 MatchState(status = "1H", progress = min, homeScore = hs, awayScore = aws)
                     .takeIf { min != null || hs != null || aws != null }
             else -> null
-        }
-    }
-
-    data class SportsDbTeams(
-        @JsonProperty("teams") val teams: List<SportsDbTeam>? = null,
-    )
-
-    data class SportsDbTeam(
-        @JsonProperty("strTeam") val strTeam: String? = null,
-        @JsonProperty("strBadge") val strBadge: String? = null,
-    )
-
-    /** 500px team badge (much sharper than the 96px API logos) used as the
-     * card poster when no event thumb exists. Cricify-style: fetched fresh
-     * every time, no cache. */
-    private suspend fun teamBadge(englishName: String): String? {
-        if (englishName.isBlank()) return null
-        return retryIO(times = 2) {
-            val q = URLEncoder.encode(englishName, "UTF-8")
-            val res = app.get(
-                "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=$q",
-                headers = noCacheHeaders,
-                timeout = 8,
-            ).text.takeIf { it.isNotBlank() } ?: return@retryIO null
-            runCatching { parseJson<SportsDbTeams>(res).teams }
-                .getOrNull()
-                .orEmpty()
-                .filter { !it.strBadge.isNullOrBlank() }
-                .firstOrNull {
-                    it.strTeam?.trim().equals(englishName, ignoreCase = true)
-                }?.strBadge
-                ?: return@retryIO null
         }
     }
 
