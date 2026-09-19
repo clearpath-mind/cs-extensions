@@ -34,6 +34,11 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
+/** YacineTV: match guide from the official beIN Sports EPG (ar-mena),
+ * banners from TheSportsDB (alias-free event search), playback from
+ * the Yacine TV API event streams (paired at watch time).
+ * No art or live-state upstreams beyond that: status from kickoff
+ * clocks, neutral placeholder when no banner resolves. */
 class YacineTvProvider : MainAPI() {
     override var mainUrl = "https://def.ycnapi.com/api"
     private val fallbackUrl = "https://deft.yacinelive.com/api"
@@ -53,25 +58,21 @@ class YacineTvProvider : MainAPI() {
         appContext = context.applicationContext
     }
 
-    /** Categories merged into one beIN SPORTS row (one per quality upstream).
-     * IDs are upstream strings (API migrated off ints); match by name. */
-    private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
-
     data class LinkData(
-        @JsonProperty("kind") val kind: String = "channel", // channel | event
-        @JsonProperty("ids") val ids: List<String> = emptyList(), // merged channel ids
-        @JsonProperty("id") val id: String? = null, // event id (upstream string)
+        @JsonProperty("kind") val kind: String = "event",
+        @JsonProperty("id") val id: Long? = null, // Yacine event id (v63 links; v64 pairs at watch)
         @JsonProperty("name") val name: String = "",
         @JsonProperty("poster") val poster: String? = null,
-        @JsonProperty("poster2") val poster2: String? = null, // match: other team logo
-        @JsonProperty("channel") val channel: String? = null, // match: broadcast channel
-        @JsonProperty("competition") val competition: String? = null, // match: champions
-        @JsonProperty("commentary") val commentary: String? = null, // match: commentator
-        @JsonProperty("kickoff") val kickoff: String? = null, // match: formatted start time
-        @JsonProperty("team1Id") val team1Id: Int? = null, // match: Yacine team id (lazy art)
-        @JsonProperty("team2Id") val team2Id: Int? = null, // match: Yacine team id (lazy art)
-        @JsonProperty("startTime") val startTime: Long? = null, // match: epoch sec (lazy art)
-        @JsonProperty("related") val related: List<LinkData>? = null, // detail recommendations
+        @JsonProperty("league") val league: String? = null, // EPG competition
+        @JsonProperty("channel") val channel: String? = null, // official beIN channel
+        @JsonProperty("channels") val channels: List<String> = emptyList(), // all airing channels
+        @JsonProperty("commentary") val commentary: String? = null,
+        @JsonProperty("kickoff") val kickoff: String? = null, // baked, refreshed at load
+        @JsonProperty("kickoffMs") val kickoffMs: Long? = null, // EPG kickoff epoch ms
+        @JsonProperty("startTime") val startTime: Long? = null, // epoch sec (v63 links)
+        @JsonProperty("endTime") val endTime: Long? = null, // epoch sec (v63 links)
+        @JsonProperty("desc") val desc: String? = null, // EPG Opta preview text
+        @JsonProperty("related") val related: List<LinkData>? = null,
         @JsonProperty("plot") val plot: String? = null,
     )
 
@@ -93,28 +94,11 @@ class YacineTvProvider : MainAPI() {
         return "$b/$p"
     }
 
-    private suspend fun getDecrypted(path: String): Pair<String, String>? {
-        // The API flaps (connection resets on both bases); retry across
-        // both so one bad window doesn't wipe entire rows. Attempts are
-        // cheap when connections reset fast; the 15s timeout covers
-        // slow-but-alive responses.
-        return retryIO(times = 5) {
-            for (base in resolveBases()) {
-                try {
-                    val res = app.get(
-                        join(base, path),
-                        headers = mapOf("User-Agent" to "okhttp/4.12.0"),
-                        timeout = 15,
-                    )
-                    if (res.code == 200 && res.text.isNotBlank()) {
-                        val t = res.headers["t"] ?: ""
-                        return@retryIO decrypt(res.text, t) to t
-                    }
-                } catch (_: Exception) { continue }
-            }
-            null
-        }
-    }
+    /** Cricify parity: every data request opts out of HTTP caching. */
+    private val noCacheHeaders = mapOf(
+        "User-Agent" to BROWSER_UA,
+        "Cache-Control" to "no-cache, no-store",
+    )
 
     /** Retries a nullable suspend block (first non-null wins). */
     private suspend inline fun <T> retryIO(
@@ -129,51 +113,9 @@ class YacineTvProvider : MainAPI() {
         return null
     }
 
-    // Raw API models (categories + channels share id/name/logo shape).
-    // NOTE: /categories and /events have different data shapes, so each
-    // endpoint parses its own envelope (no generic shared response type).
-
-    /** Last-good decrypted payloads per path (stale-while-revalidate).
-     * Both bases reset connections at times; when a fresh fetch fails,
-     * getters fall back to these instead of rendering empty rows.
-     * Memory-first, SharedPreferences-backed so stale data survives
-     * process death. Search payloads are never cached (unbounded keys). */
-    @Volatile
-    private var lastPayloads: Map<String, String> = emptyMap()
-
-    private fun prefs() =
-        runCatching { appContext?.getSharedPreferences("yacinetv", Context.MODE_PRIVATE) }.getOrNull()
-
-    private fun prefsKey(path: String) = "payload_" + path.replace(Regex("[^A-Za-z0-9]"), "_")
-
-    /** Fresh payload, or the last-good cached one when the API flaps.
-     * Only non-blank responses are remembered, so a genuine empty
-     * ({"data":[]}) still parses to empty instead of serving stale data. */
-    private suspend fun getPayload(path: String, cacheable: Boolean = true): String? {
-        val (json) = getDecrypted(path) ?: return stalePayload(path, cacheable)
-        if (json.isBlank()) return stalePayload(path, cacheable)
-        if (cacheable) rememberPayload(path, json)
-        return json
-    }
-
-    private fun stalePayload(path: String, cacheable: Boolean): String? {
-        if (!cacheable) return null
-        lastPayloads[path]?.let { return it }
-        // Warm memory from disk so the next lookup is cheap.
-        return prefs()?.getString(prefsKey(path), null)?.takeIf { it.isNotBlank() }?.also {
-            lastPayloads = lastPayloads + (path to it)
-        }
-    }
-
-    private fun rememberPayload(path: String, json: String) {
-        lastPayloads = lastPayloads + (path to json)
-        runCatching { prefs()?.edit()?.putString(prefsKey(path), json)?.apply() }
-    }
-
-    /** Remote API-base config (Cricify-style remote config without
-     * Firebase): primary + fallbacks fetched from GitHub at runtime so
-     * hosts can move without an app update. Hardcoded pair below is the
-     * default when remote is unreachable or malformed. */
+    /** Remote API-base config: primary + fallbacks fetched from GitHub at
+     * runtime so hosts can move without an app update. Hardcoded pair is
+     * the default when remote is unreachable or malformed. */
     private val apiBasesUrl =
         "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/api_bases.json"
 
@@ -215,42 +157,13 @@ class YacineTvProvider : MainAPI() {
         }
         return resolved
     }
-    data class YacineChannelResponse(
-        @JsonProperty("data") val data: List<YacineChannel>? = null,
-    )
 
-    data class YacineCategory(
-        @JsonProperty("id") val id: String = "",
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("logo") val logo: String? = null,
-    )
+    private fun prefs() =
+        runCatching { appContext?.getSharedPreferences("yacinetv", Context.MODE_PRIVATE) }.getOrNull()
 
-    data class YacineChannel(
-        @JsonProperty("id") val id: String? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("logo") val logo: String? = null,
-    )
+    private fun prefsKey(path: String) = "payload_" + path.replace(Regex("[^A-Za-z0-9]"), "_")
 
-    data class YacineEventResponse(
-        @JsonProperty("data") val data: List<YacineEvent>? = null,
-    )
-
-    data class YacineEvent(
-        @JsonProperty("id") val id: String? = null,
-        @JsonProperty("champions") val champions: String? = null,
-        @JsonProperty("channel") val channel: String? = null,
-        @JsonProperty("commentary") val commentary: String? = null,
-        @JsonProperty("start_time") val startTime: Long? = null,
-        @JsonProperty("end_time") val endTime: Long? = null,
-        @JsonProperty("team_1") val team1: YacineTeam? = null,
-        @JsonProperty("team_2") val team2: YacineTeam? = null,
-    )
-
-    data class YacineTeam(
-        @JsonProperty("id") val id: Int? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("logo") val logo: String? = null,
-    )
+    // Raw Yacine models (slim: catalog + channel streams only).
 
     data class YacineStreamResponse(
         @JsonProperty("data") val data: List<YacineStream>? = null,
@@ -265,16 +178,100 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("headers") val headers: Map<String, Any?>? = null,
     )
 
+    private suspend fun getDecrypted(path: String): Pair<String, String>? {
+        // The API flaps (connection resets on both bases); retry across
+        // all resolved bases. Attempts are cheap when connections reset
+        // fast; the 15s timeout covers slow-but-alive responses.
+        return retryIO(times = 5) {
+            for (base in resolveBases()) {
+                try {
+                    val res = app.get(
+                        join(base, path),
+                        headers = mapOf("User-Agent" to "okhttp/4.12.0"),
+                        timeout = 15,
+                    )
+                    if (res.code == 200 && res.text.isNotBlank()) {
+                        val t = res.headers["t"] ?: ""
+                        return@retryIO decrypt(res.text, t) to t
+                    }
+                } catch (_: Exception) { continue }
+            }
+            null
+        }
+    }
+
+    /** Last-good decrypted payloads per path (stale-while-revalidate).
+     * Both bases reset connections at times; when a fresh fetch fails,
+     * getters fall back to these instead of rendering empty rows.
+     * Memory-first, SharedPreferences-backed so stale data survives
+     * process death. */
+    @Volatile
+    private var lastPayloads: Map<String, String> = emptyMap()
+
+    /** Fresh payload, or the last-good cached one when the API flaps.
+     * Only non-blank responses are remembered, so a genuine empty
+     * ({"data":[]}) still parses to empty instead of serving stale data. */
+    private suspend fun getPayload(path: String): String? {
+        val (json) = getDecrypted(path) ?: return stalePayload(path)
+        if (json.isBlank()) return stalePayload(path)
+        rememberPayload(path, json)
+        return json
+    }
+
+    private fun stalePayload(path: String): String? {
+        lastPayloads[path]?.let { return it }
+        // Warm memory from disk so the next lookup is cheap.
+        return prefs()?.getString(prefsKey(path), null)?.takeIf { it.isNotBlank() }?.also {
+            lastPayloads = lastPayloads + (path to it)
+        }
+    }
+
+    private fun rememberPayload(path: String, json: String) {
+        lastPayloads = lastPayloads + (path to json)
+        runCatching { prefs()?.edit()?.putString(prefsKey(path), json)?.apply() }
+    }
+
+    // Raw Yacine models (slim: catalog + channel streams only).
+    data class YacineCategoryEnvelope(
+        @JsonProperty("data") val data: List<YacineCategory>? = null,
+    )
+
+    data class YacineCategory(
+        @JsonProperty("id") val id: String = "",
+        @JsonProperty("name") val name: String? = null,
+    )
+
+    data class YacineChannelResponse(
+        @JsonProperty("data") val data: List<YacineChannel>? = null,
+    )
+
+    data class YacineChannel(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("name") val name: String? = null,
+    )
+
+    /** beIN quality groups share channel names across qualities
+     * ("beIN SPORTS (1080P/720P/360P/244P)"). Matched by name: category
+     * ids rotate (were 4/5/6/7, now 19-digit), names are stable. */
+    private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
+
+    private fun isBeinQuality(cat: YacineCategory): Boolean {
+        return beinQualityRegex.containsMatchIn(cat.name.orEmpty())
+    }
+
+    private fun qualityRank(cat: YacineCategory): Int {
+        val m = beinQualityRegex.find(cat.name.orEmpty())
+        val num = m?.groupValues?.getOrNull(1)?.replace(Regex("""\D"""), "")?.toIntOrNull()
+        // Higher resolution first; unknown quality sorts last.
+        return -(num ?: -1)
+    }
+
     private suspend fun getCategories(): List<YacineCategory> {
         val json = getPayload("categories") ?: return emptyList()
         return runCatching {
             parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
     }
-
-    data class YacineCategoryEnvelope(
-        @JsonProperty("data") val data: List<YacineCategory>? = null,
-    )
 
     private suspend fun getChannels(categoryId: String): List<YacineChannel> {
         val json = getPayload("categories/$categoryId/channels") ?: return emptyList()
@@ -283,80 +280,242 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
-    private suspend fun getEvents(): List<YacineEvent> {
-        val json = getPayload("events") ?: return emptyList()
+    private suspend fun getChannelStreams(channelId: String): List<YacineStream> {
+        // Streams stay fresh-only: stale URLs die fast.
+        val (json) = getDecrypted("channel/$channelId") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
         return runCatching {
-            parseJson<YacineEventResponse>(json).data ?: emptyList()
+            parseJson<YacineStreamResponse>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
     }
 
-    private fun isBeinQuality(cat: YacineCategory): Boolean {
-        return cat.name?.let { beinQualityRegex.containsMatchIn(it) } == true
+    /** Official EPG name -> Yacine catalog name. The EN channels differ
+     * ("beIN SPORTS EN 1" vs "beIN English 1"); without this they never
+     * resolve and those fixtures can't play. */
+    private val epgToYacineChannel = mapOf(
+        "bein sports en 1" to "bein english 1",
+        "bein sports en 2" to "bein english 2",
+    )
+
+    /** Yacine channel ids for an official EPG channel name, best quality
+     * first (one id per quality group). Empty when Yacine carries no such
+     * channel. */
+    private suspend fun resolveChannelIds(channelName: String): List<String> {
+        val want = epgToYacineChannel[normChannel(channelName)] ?: normChannel(channelName)
+        if (want.isBlank()) return emptyList()
+        val groups = withTimeoutOrNull(20_000) { getCategories() }
+            .orEmpty().filter { isBeinQuality(it) }.sortedBy { qualityRank(it) }
+        val out = mutableListOf<String>()
+        for (g in groups) {
+            val gid = g.id.takeIf { it.isNotBlank() } ?: continue
+            val hit = withTimeoutOrNull(15_000) { getChannels(gid) }
+                .orEmpty().firstOrNull { normChannel(it.name.orEmpty()) == want }
+            hit?.id?.takeIf { it.isNotBlank() }?.let { if (it !in out) out.add(it) }
+        }
+        return out
     }
 
-    private fun qualityTag(cat: YacineCategory): String {
-        val m = cat.name?.let { Regex("""(\d+\s*P)""", RegexOption.IGNORE_CASE).find(it) }
-        if (m != null) return m.groupValues[1].replace(" ", "").uppercase()
-        return ""
+    // ---- Official beIN EPG backend (guide authority) ----
+
+    data class EpgChannels(
+        @JsonProperty("rows") val rows: List<EpgChannel>? = null,
+    )
+
+    data class EpgChannel(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("name") val name: String? = null,
+    )
+
+    data class EpgEvents(
+        @JsonProperty("rows") val rows: List<EpgEvent>? = null,
+    )
+
+    data class EpgEvent(
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("description") val description: String? = null,
+        @JsonProperty("startDate") val startDate: String? = null,
+        @JsonProperty("endDate") val endDate: String? = null,
+    )
+
+    private data class GuideFixture(
+        val home: String,
+        val away: String,
+        val league: String?,
+        val channels: List<String>, // official beIN channel names
+        val desc: String?,
+        val kickoffMs: Long, // EPG kickoff epoch ms
+    )
+
+    /** EPG core football channels (normalized). NEWS/AFC/MAX/XTRA/FR are
+     * filler loops or out of Yacine scope; plain 6 has no EPG entry; 4K
+     * has no Yacine feed (unplayable, excluded). */
+    private val guideChannelNorms = setOf(
+        "bein sports 1", "bein sports 2", "bein sports 3",
+        "bein sports 4", "bein sports 5", "bein sports 6",
+        "bein sports 7", "bein sports 8", "bein sports 9",
+        "bein sports en 1", "bein sports en 2",
+    )
+
+    private suspend fun getEpgChannels(): List<EpgChannel> {
+        val txt = retryIO(times = 2) {
+            runCatching {
+                app.get(
+                    "https://www.beinsports.com/api/opta/tv-channel?region=ar-mena",
+                    headers = mapOf("User-Agent" to BROWSER_UA, "Accept" to "application/json"),
+                    timeout = 10,
+                ).text.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        } ?: return emptyList()
+        return runCatching { parseJson<EpgChannels>(txt).rows.orEmpty() }.getOrNull() ?: emptyList()
     }
 
-    private fun normalizeName(n: String): String {
-        return n.trim().lowercase()
+    private suspend fun getEpgEvents(channelId: String, startBefore: String, endAfter: String): List<EpgEvent> {
+        val q = "startBefore=${URLEncoder.encode(startBefore, "UTF-8")}" +
+            "&endAfter=${URLEncoder.encode(endAfter, "UTF-8")}" +
+            "&channelIds=${URLEncoder.encode(channelId, "UTF-8")}"
+        val txt = retryIO(times = 2) {
+            runCatching {
+                app.get(
+                    "https://www.beinsports.com/api/opta/tv-event?$q",
+                    headers = mapOf("User-Agent" to BROWSER_UA, "Accept" to "application/json"),
+                    timeout = 10,
+                ).text.takeIf { it.isNotBlank() }
+            }.getOrNull()
+        } ?: return emptyList()
+        return runCatching {
+            // Envelope {rows:[...]}; fall back to a bare array just in case.
+            runCatching { parseJson<EpgEvents>(txt).rows.orEmpty() }.getOrNull()
+                ?: parseJson<List<EpgEvent>>(txt)
+        }.getOrNull() ?: emptyList()
+    }
+
+    /** Channel compare across providers: case-insensitive, HD dropped
+     * ("beIN Sports HD 1" vs "beIN SPORTS 1"). */
+    private fun normChannel(s: String): String {
+        return s.lowercase()
+            .replace(Regex("""\bhd\b"""), " ")
             .replace(Regex("""\s+"""), " ")
-            .replace(Regex("""[-_–—]+"""), " ")
             .trim()
     }
 
-    /** Arabic champions -> English fallback when TheSportsDB has no league
-     * (unmapped teams, no day match). Substring matching so minor API
-     * wording variants still hit. Returns null when nothing matches. */
-    private fun translateChampions(arabic: String?): String? {
-        val s = arabic?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        val t = s.replace(Regex("""[ً-ٰٟ]"""), "")
-        fun has(vararg keys: String) = keys.any { t.contains(it) }
-        return when {
-            has("تشامبيونشيب") || (has("البطولة") && has("الإنجليزي", "الانجليزي")) -> "English League Championship"
-            has("الهولندي", "هولندا") -> "Dutch Eredivisie"
-            has("أبطال أوروبا", "ابطال اوروبا") -> "UEFA Champions League"
-            has("المؤتمر الأوروبي", "المؤتمر الاوروبي") -> "UEFA Conference League"
-            has("الأوروبي", "الاوروبي") && has("الدوري") -> "UEFA Europa League"
-            has("الإنجليزي", "الانجليزي", "البريميرليج") -> "Premier League"
-            has("الإسباني", "الاسباني", "الليجا") -> "La Liga"
-            has("الإيطالي", "الايطالي", "الكالتشيو") -> "Serie A"
-            has("الألماني", "الالماني", "البوندسليجا") -> "Bundesliga"
-            has("الفرنسي") -> "Ligue 1"
-            has("السعودي", "روشن") -> "Saudi Pro League"
-            has("المغربي", "البطولة الاحترافية", "البطولة") -> "Botola Pro"
-            has("المصري") -> "Egyptian Premier League"
-            has("أبطال أفريقيا", "ابطال افريقيا") -> "CAF Champions League"
-            has("أبطال آسيا", "ابطال اسيا") -> "AFC Champions League"
-            has("أمم أفريقيا", "امم افريقيا") -> "Africa Cup of Nations"
-            has("أمم أوروبا", "امم اوروبا") -> "UEFA Euro"
-            has("القارات") -> "FIFA Intercontinental Cup"
-            has("كأس العالم", "كاس العالم") -> "FIFA World Cup"
-            else -> null
+    private fun normTeam(s: String): String {
+        return s.lowercase().replace(Regex("""\s+"""), " ").trim()
+    }
+
+    /** EPG title -> (home, away, league). "Brighton vs Arsenal -
+     * English Premier League 2026/2027 - Week 5". Non-football titles
+     * ("Team A @ Team B", channel filler) return null. */
+    private fun parseEpgTitle(title: String?): Triple<String, String, String?>? {
+        val parts = title?.split(" - ").orEmpty().map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.size < 2) return null
+        val teams = parts[0].split(" vs ").map { it.replace(Regex("""\s+"""), " ").trim() }
+        if (teams.size != 2 || teams.any { it.isBlank() }) return null
+        val league = parts[1].replace(Regex("""\s+\d{4}/\d{2,4}\s*$"""), "").trim().takeIf { it.isNotBlank() }
+        return Triple(teams[0], teams[1], league)
+    }
+
+    private fun epgStartMs(iso: String?): Long? {
+        if (iso.isNullOrBlank()) return null
+        return runCatching {
+            val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            fmt.parse(iso)?.time
+        }.getOrNull()
+    }
+
+    private fun utcDayStart(offsetDays: Int): Long {
+        val cal = java.util.Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+            add(java.util.Calendar.DAY_OF_YEAR, offsetDays)
+        }
+        return cal.timeInMillis
+    }
+
+    private fun isoUtc(ms: Long): String {
+        val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+        fmt.timeZone = TimeZone.getTimeZone("UTC")
+        return fmt.format(Date(ms))
+    }
+
+    /** Guide fixtures for today (UTC): EPG football events on the core
+     * channels, merged across channels by fixture + day. No Yacine fetch
+     * here — pairing happens at watch time, so the guide renders even
+     * during Yacine outages. Rows older than 3h past kickoff are
+     * dropped (likely finished; no live source to confirm). */
+    private suspend fun guideFixtures(): List<GuideFixture> {
+        return coroutineScope {
+            val nowMs = System.currentTimeMillis()
+            val channels = withTimeoutOrNull(15_000) { getEpgChannels() } ?: emptyList()
+            val wanted = channels.mapNotNull { c ->
+                val name = c.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val id = c.id?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                if (normChannel(name) !in guideChannelNorms) return@mapNotNull null
+                name to id
+            }.distinct()
+            if (wanted.isEmpty()) return@coroutineScope emptyList()
+            val winStart = utcDayStart(0)
+            val winEnd = utcDayStart(1)
+            val epgEvents = wanted.map { (name, id) ->
+                async {
+                    withTimeoutOrNull(15_000) {
+                        getEpgEvents(id, isoUtc(winEnd), isoUtc(winStart))
+                    }.orEmpty().map { it to name }
+                }
+            }.awaitAll().flatten()
+            // Same fixture airs on several channels: merge into one row
+            // with the channel union (deduped by fixture + UTC day).
+            val out = mutableListOf<GuideFixture>()
+            epgEvents.forEach { (epg, channelName) ->
+                val parsed = parseEpgTitle(epg.title) ?: return@forEach
+                val (home, away, league) = parsed
+                val epgMs = epgStartMs(epg.startDate) ?: return@forEach
+                if (epgMs < nowMs - 3 * 3600 * 1000) return@forEach
+                if (epgMs < winStart || epgMs >= winEnd) return@forEach
+                val key = "${normTeam(home)}|${normTeam(away)}|${dayOf(epgMs)}"
+                val existing = out.firstOrNull {
+                    "${normTeam(it.home)}|${normTeam(it.away)}|${dayOf(it.kickoffMs)}" == key
+                }
+                if (existing != null) {
+                    if (existing.channels.none { it.equals(channelName, ignoreCase = true) }) {
+                        val idx = out.indexOf(existing)
+                        out[idx] = existing.copy(channels = existing.channels + channelName)
+                    }
+                    return@forEach
+                }
+                out.add(
+                    GuideFixture(
+                        home = home,
+                        away = away,
+                        league = league,
+                        channels = listOf(channelName),
+                        desc = epg.description?.trim()?.takeIf { it.isNotBlank() },
+                        kickoffMs = epgMs,
+                    )
+                )
+            }
+            out.sortedWith(
+                compareBy(
+                    { matchRank(matchStatus(it.kickoffMs, System.currentTimeMillis())) },
+                    { it.kickoffMs },
+                )
+            )
         }
     }
 
-    /** Preferred competition label: TheSportsDB English league, then the
-     * Arabic->English map, then raw Arabic (never blank). */
-    private fun competitionEnglish(league: String?, champions: String?): String? {
-        league?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
-        val raw = champions?.trim()?.takeIf { it.isNotBlank() } ?: return null
-        return translateChampions(raw) ?: raw
-    }
-
-    private fun cleanCategoryName(name: String?): String {
-        val n = (name ?: "أخرى").trim()
-        if (beinQualityRegex.containsMatchIn(n)) return "beIN SPORTS"
-        if (normalizeName(n) == "mbc channels") return "MBC Channels"
-        return n
+    private fun dayOf(ms: Long): String {
+        return try {
+            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            fmt.timeZone = TimeZone.getTimeZone("UTC")
+            fmt.format(Date(ms))
+        } catch (_: Exception) { "" }
     }
 
     /** Local kickoff with countdown, e.g. "Today 19:45 (in 2h 05m)",
      * "Tomorrow 20:00", "22 Sep, 18:45". Device-local timezone, Latin
-     * digits. Empty when not upcoming (live cards show the minute, ended
-     * cards show FT) so detail tags stay relevant. */
+     * digits. Empty when already started. */
     private fun formatKickoff(epochSec: Long?, nowSec: Long = System.currentTimeMillis() / 1000): String {
         if (epochSec == null || epochSec <= 0 || epochSec <= nowSec) return ""
         return try {
@@ -389,38 +548,11 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { "" }
     }
 
-    private fun eventTitle(e: YacineEvent): String {
-        val t1 = e.team1?.name?.trim().orEmpty()
-        val t2 = e.team2?.name?.trim().orEmpty()
-        if (t1.isNotBlank() && t2.isNotBlank()) return "$t1 × $t2"
-        return e.champions?.trim().orEmpty().ifBlank { "مباراة" }
-    }
-
-    private fun eventEnglishTitle(e: YacineEvent): String? {
-        // ID -> English via team_aliases.json (remote, no extra network here).
-        // Null when either side is unmapped -> caller falls back to Arabic.
-        val a = teamAlias(e.team1?.id)?.trim().takeIf { !it.isNullOrBlank() }
-        val b = teamAlias(e.team2?.id)?.trim().takeIf { !it.isNullOrBlank() }
-        if (a.isNullOrBlank() || b.isNullOrBlank()) return null
-        if (a == b) return a
-        return "$a vs $b"
-    }
-
-    private fun eventBaseTitle(e: YacineEvent): String {
-        return eventEnglishTitle(e) ?: eventTitle(e)
-    }
-
-    private fun matchPlot(title: String): String {
-        return "شاهد البث المباشر لمباراة $title"
-    }
-
-    /** Match state derived from start/end_time vs now. Missing times
-     * keep the match playable: unknown start -> LIVE if end not passed. */
-    private fun matchStatus(e: YacineEvent, nowSec: Long): String {
-        val start = e.startTime?.takeIf { it > 0 }
-        val end = e.endTime?.takeIf { it > 0 }
-        if (end != null && nowSec > end) return "ENDED"
-        if (start != null && nowSec < start) return "UPCOMING"
+    /** Match state from kickoff clocks only (no live source):
+     * upcoming before kickoff, live after. Rows older than 3h past
+     * kickoff are filtered at guide time (likely finished). */
+    private fun matchStatus(kickoffMs: Long?, nowMs: Long): String {
+        if (kickoffMs == null || kickoffMs <= 0 || nowMs < kickoffMs) return "UPCOMING"
         return "LIVE"
     }
 
@@ -431,68 +563,65 @@ class YacineTvProvider : MainAPI() {
         else -> "✅"
     }
 
-    /** Display status: live TheSportsDB state wins over Yacine clocks
-     * (clock skew / missing times); otherwise Yacine start/end_time. */
-    private fun displayStatus(e: YacineEvent, nowSec: Long, state: MatchState?): String {
-        val s = state?.status?.trim()?.uppercase()
-        if (s != null) {
-            if (isInPlayScore(s)) return "LIVE"
-            if (isFinalScore(s)) return "ENDED"
-        }
-        return matchStatus(e, nowSec)
-    }
-
-    /** Minute tag for live cards: 65' | HT | FT | LIVE | null. */
-    private fun minuteLabel(state: MatchState?): String? {
-        val s = state ?: return null
-        val raw = s.status?.trim()?.uppercase() ?: return null
-        if (isFinalScore(raw)) return "FT"
-        if (raw == "HT") return "HT"
-        if (!isInPlayScore(raw)) return null
-        val p = s.progress?.trim()?.takeIf { it.isNotBlank() } ?: return "LIVE"
-        return if (p[0].isDigit() && !p.endsWith("'")) "$p'" else p
-    }
-
-    /** Card title, option (a): score inline when TheSportsDB has it on the
-     * day-matching fixture, e.g. "🔴 65' Everton 1-0 Wolves",
-     * "✅ FT Coventry City 2-1 Aston Villa". Scores only ever pair with
-     * orderedTitle (canonical home-first); without it, plain "A vs B". */
-    private fun eventDisplayName(e: YacineEvent, nowSec: Long, art: MatchArt? = null): String {
-        val matchup = art?.orderedTitle ?: eventBaseTitle(e)
-        val teams = art?.orderedTitle?.split(" vs ")?.takeIf { it.size == 2 }
-        val st = art?.state
-        val hs = st?.homeScore
-        val aws = st?.awayScore
-        val status = displayStatus(e, nowSec, st)
-        val emoji = statusEmoji(status)
-        if (teams != null && hs != null && aws != null) {
-            val score = "${teams[0]} $hs-$aws ${teams[1]}"
-            return when (status) {
-                "LIVE" -> {
-                    val tag = if (st?.status?.trim()?.uppercase() == "HT") "HT" else (minuteLabel(st) ?: "LIVE")
-                    "$emoji $tag $score"
-                }
-                "UPCOMING" -> "$emoji $matchup"
-                else -> {
-                    val tag = if (isFinalScore(st?.status)) "FT " else ""
-                    "$emoji $tag$score"
-                }
-            }
-        }
-        return when (status) {
-            "LIVE" -> {
-                val min = minuteLabel(st)
-                if (min != null) "$emoji $min $matchup" else "$emoji $matchup"
-            }
-            else -> "$emoji $matchup"
-        }
-    }
-
     private fun matchRank(status: String): Int = when (status) {
         "LIVE" -> 0
         "UPCOMING" -> 1
         else -> 2
     }
+
+    data class SportsDbEvents(
+        @JsonProperty("event") val event: List<SportsDbEvent>? = null,
+    )
+
+    data class SportsDbEvent(
+        @JsonProperty("dateEvent") val dateEvent: String? = null,
+        @JsonProperty("strEvent") val strEvent: String? = null,
+        @JsonProperty("strThumb") val strThumb: String? = null,
+    )
+
+    /** Accent/case-insensitive compare for team names across providers. */
+    private fun normThumb(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{Mn}+"), "").lowercase()
+
+    /** TheSportsDB banner for EPG English names, no alias file: both team
+     * orders are queried, the day-matching event whose name contains
+     * every significant word of both sides wins. Null when nothing
+     * day-matches (caller uses the placeholder). */
+    private suspend fun searchThumb(home: String, away: String, day: String?): String? {
+        if (home.isBlank() || away.isBlank()) return null
+        fun words(s: String) = normThumb(s).split(Regex("""\s+"""))
+            .map { it.trim() }.filter { it.length > 2 }
+        val hw = words(home)
+        val aw = words(away)
+        if (hw.isEmpty() || aw.isEmpty()) return null
+        fun hasAll(ev: String?): Boolean {
+            if (ev.isNullOrBlank()) return false
+            val n = normThumb(ev)
+            return (hw + aw).all { w -> n.contains(w) }
+        }
+        for ((a, b) in listOf(home to away, away to home)) {
+            val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
+            val res = retryIO(times = 2) {
+                runCatching {
+                    app.get(
+                        "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$q",
+                        headers = noCacheHeaders,
+                        timeout = 8,
+                    ).text.takeIf { it.isNotBlank() }
+                }.getOrNull()
+            } ?: continue
+            val events = runCatching { parseJson<SportsDbEvents>(res).event }.getOrNull().orEmpty()
+            if (events.isEmpty()) continue
+            val pool = if (day.isNullOrBlank()) events else events.filter { it.dateEvent == day }
+            pool.firstOrNull { !it.strThumb.isNullOrBlank() && hasAll(it.strEvent) }
+                ?.strThumb?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        return null
+    }
+
+    /** Neutral placeholder banner: the EPG carries no artwork. */
+    private val noArtBanner =
+        "https://thumb.wikimedia.org/wikipedia/commons/thumb/6/60/No-Image-Placeholder-banner.svg/960px-No-Image-Placeholder-banner.svg.png"
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         // All rows fit on one page (no API pagination). Answer single-row
@@ -510,680 +639,125 @@ class YacineTvProvider : MainAPI() {
 
     private suspend fun buildHomeLists(): List<HomePageList> {
         return coroutineScope {
-            runCatching { ensureTeamAliases() }
-            val eventsDeferred = async { getEvents() }
-            val categories = getCategories()
-
-            val beinCats = categories.filter { isBeinQuality(it) }
-            val otherCats = categories.filter { !isBeinQuality(it) }
-
-            // Fetch beIN quality groups in parallel, then merge by channel name.
-            val beinGroups = beinCats.map { cat ->
+            val nowMs = System.currentTimeMillis()
+            val fixtures = withTimeoutOrNull(60_000) { guideFixtures() } ?: emptyList()
+            if (fixtures.isEmpty()) return@coroutineScope emptyList()
+            // Banners resolve in parallel; each is guarded so one slow
+            // lookup never blocks the homepage.
+            val thumbs = fixtures.map { f ->
                 async {
-                    cat to getChannels(cat.id)
+                    withTimeoutOrNull(8_000) {
+                        searchThumb(f.home, f.away, dayOf(f.kickoffMs))
+                    }
                 }
             }.awaitAll()
-
-            val lists = mutableListOf<HomePageList>()
-
-            // 1) Matches first (horizontal cards with API banners).
-            // Ended matches stay visible with an [ENDED] label.
-            val nowSec = System.currentTimeMillis() / 1000
-            val events = eventsDeferred.await().sortedWith(
-                compareBy(
-                    { matchRank(matchStatus(it, nowSec)) },
-                    { it.startTime ?: Long.MAX_VALUE },
-                    { -(it.endTime ?: Long.MIN_VALUE) },
-                )
+        val items = fixtures.zip(thumbs).mapNotNull { (f, thumb) ->
+            val status = matchStatus(f.kickoffMs, nowMs)
+            val link = LinkData(
+                name = "${statusEmoji(status)} ${f.home} vs ${f.away}",
+                poster = thumb ?: noArtBanner,
+                league = f.league,
+                channel = f.channels.firstOrNull(),
+                channels = f.channels,
+                kickoff = formatKickoff(f.kickoffMs / 1000, nowMs / 1000).takeIf { it.isNotBlank() },
+                kickoffMs = f.kickoffMs,
+                desc = f.desc,
+                plot = "${f.home} vs ${f.away}",
             )
-            if (events.isNotEmpty()) {
-                // Thumbs/badges/leagues resolve in parallel; each is guarded
-                // so one slow lookup never blocks the homepage.
-                // TheSportsDB art (thumb + English strLeague) reuses one request.
-                // Cricify-style: no cache, every card fetches fresh.
-                val arts = events.map { e ->
-                    async {
-                        // No team-logo fallback: cards show the TheSportsDB
-                        // banner, else the neutral placeholder (never empty).
-                        val art = withTimeoutOrNull(8_000) { matchArt(e) } ?: MatchArt()
-                        art to (art.thumb ?: noArtBanner)
-                    }
-                }.awaitAll()
-                val matchLinks = events.zip(arts).mapNotNull { (e, artAndPoster) ->
-                    val (art, poster) = artAndPoster
-                    val league = art.league
-                    val id = e.id ?: return@mapNotNull null
-                    // Home-first matchup from TheSportsDB when day-matched;
-                    // Yacine team_1/team_2 order is not reliable. The card
-                    // title adds live minute + score inline (option a).
-                    val matchup = art.orderedTitle ?: eventBaseTitle(e)
-                    val displayName = eventDisplayName(e, nowSec, art)
-                    // TheSportsDB banner or placeholder (no team-logo fallback);
-                    // poster2 stays null so detail shows banner or placeholder.
-                    LinkData(
-                        kind = "event",
-                        id = id,
-                        name = displayName,
-                        poster = poster,
-                        poster2 = null,
-                        channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                        competition = competitionEnglish(league, e.champions),
-                        commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
-                        kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
-                        team1Id = e.team1?.id,
-                        team2Id = e.team2?.id,
-                        startTime = e.startTime,
-                        plot = matchPlot(matchup),
-                    )
-                }
-                // Detail recommendations: the other matches (no extra network).
-                val matchItems = matchLinks.map { link ->
-                    val withRelated = link.copy(
-                        related = matchLinks.filter { it.id != link.id }.take(12),
-                    )
-                    newLiveSearchResponse(link.name, withRelated.toJson(), TvType.Live) {
-                        this.posterUrl = link.poster
-                    }
-                }
-                if (matchItems.isNotEmpty()) {
-                    lists.add(HomePageList("Today's Matches", matchItems, isHorizontalImages = true))
-                }
-            }
-
-            // 2) Single merged beIN SPORTS row (quality picked in player sources).
-            if (beinGroups.isNotEmpty()) {
-                val merged = linkedMapOf<String, MergedChannel>()
-                beinGroups.forEach { (cat, channels) ->
-                    val tag = qualityTag(cat)
-                    channels.forEach { ch ->
-                        val cid = ch.id ?: return@forEach
-                        val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
-                        val key = normalizeName(nm)
-                        val cur = merged[key]
-                        if (cur == null) {
-                            merged[key] = MergedChannel(nm, ch.logo, mutableListOf(cid to tag))
-                        } else {
-                            if (cur.ids.none { it.first == cid }) cur.ids.add(cid to tag)
-                            if (cur.logo.isNullOrBlank() && !ch.logo.isNullOrBlank()) cur.logo = ch.logo
-                        }
-                    }
-                }
-                val beinLinks = merged.values.map { m ->
-                    val logo = m.logo?.takeIf { it.isNotBlank() }
-                    LinkData(
-                        kind = "channel",
-                        ids = m.ids.map { it.first }.distinct(),
-                        name = m.name,
-                        poster = logo,
-                        plot = "شاهد البث المباشر لقناة ${m.name}",
-                    )
-                }
-                // Detail recommendations: row siblings (no extra network).
-                val beinItems = beinLinks.map { link ->
-                    val withRelated = link.copy(
-                        related = beinLinks.filter { it.name != link.name }.take(12),
-                    )
-                    newLiveSearchResponse(link.name, withRelated.toJson(), TvType.Live) {
-                        this.posterUrl = link.poster
-                    }
-                }
-                if (beinItems.isNotEmpty()) {
-                    lists.add(HomePageList("beIN SPORTS", beinItems, isHorizontalImages = true))
-                }
-            }
-
-            // 3) Curated homepage rows only:
-            // Today's Matches, beIN SPORTS, Morocco Channels, MBC Channels.
-            val wantedTopRows = setOf("mbc channels")
-            val otherRows = otherCats.mapNotNull { cat ->
-                val norm = normalizeName(cat.name ?: "")
-                when {
-                    norm == "arabic channels" -> cat to true // parent
-                    wantedTopRows.contains(norm) -> cat to false
-                    else -> null // dropped: entertainment, france, turkish, weyyak, shahid, other countries
-                }
-            }.map { (cat, isParent) ->
-                async {
-                    if (!isParent) {
-                        val channels = getChannels(cat.id)
-                        if (channels.isEmpty()) return@async emptyList()
-                        return@async listOfNotNull(channelRow(cleanCategoryName(cat.name), channels))
-                    }
-                    // Morocco only from the ARABIC parent (id by name: upstream ids are strings).
-                    val subs = getSubcategories(cat.id)
-                    val morocco = subs.firstOrNull {
-                        normalizeName(it.name ?: "") == "morocco"
-                    } ?: return@async emptyList()
-                    val subChannels = getChannels(morocco.id)
-                    if (subChannels.isEmpty()) return@async emptyList()
-                    listOfNotNull(channelRow("Moroccan Channels", subChannels, moroccoThumbs))
-                }
-            }.awaitAll().flatten()
-
-            lists.addAll(otherRows)
-            lists
-        }
-    }
-
-    /** Yacine team id -> English alias for TheSportsDB lookups.
-     * Cricify-style: fetched fresh from remote on every build, no
-     * memory/disk cache. Unknown IDs skip the thumbnail API and fall back
-     * to API logos. */
-    private val teamAliasesUrl =
-        "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/team_aliases.json"
-
-    @Volatile
-    private var teamAliases: Map<Int, String>? = null
-
-    private fun teamAlias(id: Int?): String? {
-        if (id == null) return null
-        return teamAliases?.get(id)
-    }
-
-    /** Fetches the team id -> alias map from the remote JSON on every call.
-     * Never throws: any failure keeps the last map (possibly empty). */
-    private suspend fun ensureTeamAliases() {
-        fetchRemoteAliases()?.takeIf { it.isNotEmpty() }?.let {
-            teamAliases = it
-            return
-        }
-        if (teamAliases == null) teamAliases = emptyMap()
-    }
-
-    private suspend fun fetchRemoteAliases(): Map<Int, String>? {
-        return retryIO(times = 2) {
-            app.get(
-                teamAliasesUrl,
-                headers = noCacheHeaders,
-                timeout = 8,
-            ).text.takeIf { it.isNotBlank() }?.let { parseAliasesJson(it) }
-                ?.takeIf { it.isNotEmpty() }
-        }
-    }
-
-    private fun parseAliasesJson(json: String): Map<Int, String>? {
-        return runCatching {
-            parseJson<Map<String, String>>(json)
-                .mapNotNull { (k, v) ->
-                    val id = k.trim().toIntOrNull() ?: return@mapNotNull null
-                    val alias = v.trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    id to alias
-                }.toMap()
-        }.getOrNull()
-    }
-
-    data class SportsDbEvents(
-        @JsonProperty("event") val event: List<SportsDbEvent>? = null,
-    )
-
-    data class SportsDbEvent(
-        @JsonProperty("dateEvent") val dateEvent: String? = null,
-        @JsonProperty("strEvent") val strEvent: String? = null,
-        @JsonProperty("strHomeTeam") val strHomeTeam: String? = null,
-        @JsonProperty("strAwayTeam") val strAwayTeam: String? = null,
-        @JsonProperty("strThumb") val strThumb: String? = null,
-        @JsonProperty("strLeague") val strLeague: String? = null,
-        @JsonProperty("strStatus") val strStatus: String? = null,
-        @JsonProperty("strProgress") val strProgress: String? = null,
-        @JsonProperty("intHomeScore") val intHomeScore: String? = null,
-        @JsonProperty("intAwayScore") val intAwayScore: String? = null,
-        @JsonProperty("strTimestamp") val strTimestamp: String? = null,
-    )
-
-    /** Ready-made 1280x720 match banner + English league from TheSportsDB
-     * (free key). Cricify-style: no cache — every build fetches fresh
-     * (Cache-Control: no-cache), same request also carrying the home-first
-     * title and live state. No banner renders empty (null poster, no
-     * team-logo fallback); league falls back to Arabic champions.
-     * orderedTitle is the home-first "A vs B" from TheSportsDB
-     * (strHomeTeam/strAwayTeam, else strEvent order): Yacine team_1/team_2
-     * is not reliably home-first (e.g. 2026-09-16 Everton-Wolves and
-     * Coventry-Aston Villa were both reversed upstream). */
-    private data class MatchArt(
-        val thumb: String? = null,
-        val league: String? = null,
-        val orderedTitle: String? = null,
-        val state: MatchState? = null,
-    )
-    /** Live score/progress from the day-matching TheSportsDB event.
-     * Scores always follow the canonical home-first order (same fixture
-     * as orderedTitle), never Yacine team_1/team_2 order. Scores parse
-     * from String because the API mixes "2" and 2. */
-    private data class MatchState(
-        val status: String? = null, // NS | 1H | HT | 2H | ET | FT ...
-        val progress: String? = null, // e.g. 65'
-        val homeScore: Int? = null,
-        val awayScore: Int? = null,
-    )
-    private fun isInPlayScore(s: String?) =
-        s?.trim()?.uppercase() in setOf("1H", "HT", "2H", "ET", "BT", "P")
-    private fun isFinalScore(s: String?) =
-        s?.trim()?.uppercase() in setOf("FT", "AET", "AP")
-    /** Cricify parity: every data request opts out of HTTP caching. */
-    private val noCacheHeaders = mapOf(
-        "User-Agent" to BROWSER_UA,
-        "Cache-Control" to "no-cache, no-store",
-    )
-
-    /** Accent/case-insensitive compare for team names across APIs. */
-    private fun normArt(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
-        .replace(Regex("\\p{Mn}+"), "").lowercase()
-
-    /** Home-first "A vs B" from a TheSportsDB event. a/b are our aliases
-     * (proper casing for display). Prefers strHomeTeam/strAwayTeam exact
-     * match, falls back to whichever alias comes first in strEvent. */
-    private fun orderedTitleFor(ev: SportsDbEvent, a: String, b: String): String? {
-        val na = normArt(a)
-        val nb = normArt(b)
-        if (na.isBlank() || nb.isBlank() || na == nb) return null
-        val home = ev.strHomeTeam?.let { normArt(it) }?.takeIf { it.isNotBlank() }
-        val away = ev.strAwayTeam?.let { normArt(it) }?.takeIf { it.isNotBlank() }
-        if (home == na && away == nb) return "$a vs $b"
-        if (home == nb && away == na) return "$b vs $a"
-        val n = ev.strEvent?.let { normArt(it) } ?: return null
-        if (!n.contains(na) || !n.contains(nb)) return null
-        return if (n.indexOf(nb) < n.indexOf(na)) "$b vs $a" else "$a vs $b"
-    }
-
-    private suspend fun matchThumb(e: YacineEvent): String? {
-        return matchArt(e).thumb
-    }
-
-    private suspend fun matchLeague(e: YacineEvent): String? {
-        return matchArt(e).league
-    }
-
-    /** Cricify-style: no art/state cache — every build fetches fresh
-     * (Cache-Control: no-cache), same request returning thumb + league +
-     * home-first title + live state. Bounded by caller timeouts. */
-    private suspend fun matchArt(e: YacineEvent): MatchArt {
-        e.id ?: return MatchArt()
-        val day = e.startTime?.let { dayString(it) }
-        val t1 = teamAlias(e.team1?.id) ?: return MatchArt()
-        val t2 = teamAlias(e.team2?.id) ?: return MatchArt()
-        // Both team orders are always consulted: the first order often
-        // returns a league-only result (day pool empty, league falls back to
-        // any leg) while the reversed order holds the day-matching banner.
-        // Returning early on league-only is what left cards on logo fallback.
-        var bestThumb: String? = null
-        var bestLeague: String? = null
-        var bestTitle: String? = null
-        var bestState: MatchState? = null
-        for ((a, b) in listOf(t1 to t2, t2 to t1)) {
-            val art = searchEventArt(a, b, day)
-            if (art.thumb != null && bestThumb == null) bestThumb = art.thumb
-            if (art.league != null && bestLeague == null) bestLeague = art.league
-            if (art.orderedTitle != null && bestTitle == null) bestTitle = art.orderedTitle
-            if (art.state != null && bestState == null) bestState = art.state
-            if (bestThumb != null && bestLeague != null && bestTitle != null && bestState != null) break
-        }
-        // No backoff cache: empty/failed lookups simply return nothing and
-        // are retried on the next build (Cricify-style always-fresh).
-        if (bestThumb == null && bestLeague == null) {
-            return MatchArt(null, null, bestTitle, bestState)
-        }
-        return MatchArt(bestThumb, bestLeague, bestTitle, bestState)
-    }
-
-    private fun dayString(epochSec: Long): String {
-        return try {
-            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            fmt.timeZone = TimeZone.getTimeZone("UTC")
-            fmt.format(Date(epochSec * 1000))
-        } catch (_: Exception) { "" }
-    }
-
-    private suspend fun searchEventArt(a: String, b: String, day: String?): MatchArt {
-        // Shared free key flaps (000s); retry the request, but a clean
-        // response with no day-matching art is final (no pointless retry).
-        val q = URLEncoder.encode("${a.replace(' ', '_')}_vs_${b.replace(' ', '_')}", "UTF-8")
-        val res = retryIO(times = 2) {
-            app.get(
-                "https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=$q",
-                headers = noCacheHeaders,
-                timeout = 8,
-            ).text.takeIf { it.isNotBlank() }
-        } ?: return MatchArt()
-        val events = runCatching { parseJson<SportsDbEvents>(res).event }.getOrNull().orEmpty()
-        if (events.isEmpty()) return MatchArt()
-        // Thumb stays day-strict (wrong-leg banners are worse than none),
-        // but league is the same across legs so it falls back to any event.
-        val pool = if (day.isNullOrBlank()) events else events.filter { it.dateEvent == day }
-        // Prefer the banner whose event name contains BOTH teams
-        // (accents/case-insensitive): the query can return other legs sharing
-        // one side, and the first day-match is not always ours.
-        val na = normArt(a)
-        val nb = normArt(b)
-        fun hasBoth(ev: String?): Boolean {
-            if (ev.isNullOrBlank()) return false
-            val n = normArt(ev)
-            return n.contains(na) && n.contains(nb)
-        }
-        val thumbEvent = pool.firstOrNull {
-            !it.strThumb.isNullOrBlank() && hasBoth(it.strEvent)
-        } ?: pool.firstOrNull { !it.strThumb.isNullOrBlank() }
-        val thumb = thumbEvent?.strThumb
-        val league = pool.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
-            ?: events.firstOrNull { !it.strLeague.isNullOrBlank() }?.strLeague?.trim()
-        // Home-first title from the day-matching fixture (thumb event when
-        // present, else any both-teams pool event): Yacine order is not
-        // reliable, TheSportsDB strHomeTeam/strAwayTeam is.
-        val orderSource = thumbEvent
-            ?: pool.firstOrNull { hasBoth(it.strEvent) }
-            ?: pool.firstOrNull()
-        val orderedTitle = orderSource?.let { orderedTitleFor(it, a, b) }
-        // Live state from the same fixture (scores follow canonical
-        // home-first order, same as orderedTitle). Null when no day match:
-        // callers fall back to Yacine clocks, no score shown.
-        fun num(v: String?) =
-            v?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }?.toIntOrNull()
-        val state = orderSource?.let { src ->
-            MatchState(
-                status = src.strStatus?.trim()?.takeIf { it.isNotBlank() },
-                progress = src.strProgress?.trim()?.takeIf { it.isNotBlank() },
-                homeScore = num(src.intHomeScore),
-                awayScore = num(src.intAwayScore),
-            ).takeIf { s ->
-                s.status != null || s.progress != null || s.homeScore != null || s.awayScore != null
-            }
-        }
-        return MatchArt(thumb, league, orderedTitle, state)
-    }
-
-    private suspend fun searchEventThumb(a: String, b: String, day: String?): String? {
-        return searchEventArt(a, b, day).thumb
-    }
-
-    data class SportsDbTeams(
-        @JsonProperty("teams") val teams: List<SportsDbTeam>? = null,
-    )
-
-    data class SportsDbTeam(
-        @JsonProperty("strTeam") val strTeam: String? = null,
-        @JsonProperty("strBadge") val strBadge: String? = null,
-    )
-
-    /** 500px team badge (much sharper than the 96px API logos) used as the
-     * card poster when no event thumb exists. Cricify-style: fetched fresh
-     * every time, no cache. */
-    private suspend fun teamBadge(englishName: String): String? {
-        if (englishName.isBlank()) return null
-        return retryIO(times = 2) {
-            val q = URLEncoder.encode(englishName, "UTF-8")
-            val res = app.get(
-                "https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=$q",
-                headers = noCacheHeaders,
-                timeout = 8,
-            ).text.takeIf { it.isNotBlank() } ?: return@retryIO null
-            runCatching { parseJson<SportsDbTeams>(res).teams }
-                .getOrNull()
-                .orEmpty()
-                .filter { !it.strBadge.isNullOrBlank() }
-                .firstOrNull {
-                    it.strTeam?.trim().equals(englishName, ignoreCase = true)
-                }?.strBadge
-                ?: return@retryIO null
-        }
-    }
-
-    /** Neutral placeholder banner for matches with zero upstream art
-     * (verified 200, ~9 KB PNG). Used instead of rendering empty. */
-    private val noArtBanner =
-        "https://thumb.wikimedia.org/wikipedia/commons/thumb/6/60/No-Image-Placeholder-banner.svg/960px-No-Image-Placeholder-banner.svg.png"
-
-    /** Official snrtlive.ma vignette arts for the SNRT channels
-     * (verified 200; ~5-7 KB each). Other Morocco entries (2M, Medi 1,
-     * Télé Maroc) keep API logos. Keys are normalized channel names. */
-    private val moroccoThumbs = mapOf(
-        "2m" to "https://thumb.wikimedia.org/wikipedia/commons/thumb/2/29/2M_TV_logo.svg/1280px-2M_TV_logo.svg.png",
-        "al aoula" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-03/alaoula-16x9.jpeg",
-        "laayoune" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/laayoune-16x9.jpeg",
-        "arryadia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/arriyadia-16x9.jpeg",
-        "arryadia tv" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/arriyadia-16x9.jpeg",
-        "athaqafia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/attakafiya-16x9.jpeg",
-        "athaqafia tv" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/attakafiya-16x9.jpeg",
-        "al maghribia" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/almaghribia-16x9.jpeg",
-        "assadissa" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/assadissa-16x9.jpeg",
-        "tamazight" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/tamazight-16x9.jpeg",
-        "tamazight tv" to "https://snrtlive.ma/sites/default/files/styles/vignette/public/2023-04/tamazight-16x9.jpeg",
-    )
-
-    /** Single horizontal channel row, deduped by normalized name. API logos as-is. */
-    private suspend fun channelRow(
-        title: String,
-        channels: List<YacineChannel>,
-        thumbOverrides: Map<String, String>? = null,
-    ): HomePageList? {
-        val seen = linkedMapOf<String, YacineChannel>()
-        channels.forEach { ch ->
-            val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
-            seen.putIfAbsent(normalizeName(nm), ch)
-        }
-        val links = seen.values.mapNotNull { ch ->
-            val cid = ch.id ?: return@mapNotNull null
-            val nm = ch.name?.trim() ?: return@mapNotNull null
-            val logo = thumbOverrides?.get(normalizeName(nm))?.takeIf { it.isNotBlank() }
-                ?: ch.logo?.takeIf { it.isNotBlank() }
-            LinkData(
-                kind = "channel",
-                ids = listOf(cid),
-                name = nm,
-                poster = logo,
-                plot = "شاهد البث المباشر لقناة $nm",
-            )
-        }
-        // Detail recommendations: row siblings (no extra network).
-        val items = links.map { link ->
             val withRelated = link.copy(
-                related = links.filter { it.name != link.name }.take(12),
+                related = fixtures.filter { it !== f }.take(12).map { rel ->
+                    val rs = matchStatus(rel.kickoffMs, nowMs)
+                    LinkData(
+                        name = "${statusEmoji(rs)} ${rel.home} vs ${rel.away}",
+                        poster = noArtBanner,
+                        league = rel.league,
+                        channel = rel.channels.firstOrNull(),
+                        channels = rel.channels,
+                        kickoff = formatKickoff(rel.kickoffMs / 1000, nowMs / 1000).takeIf { it.isNotBlank() },
+                        kickoffMs = rel.kickoffMs,
+                        desc = rel.desc,
+                        plot = "${rel.home} vs ${rel.away}",
+                    )
+                },
             )
-            newLiveSearchResponse(link.name, withRelated.toJson(), TvType.Live) {
-                this.posterUrl = link.poster
+            newLiveSearchResponse(withRelated.name, withRelated.toJson(), TvType.Live) {
+                this.posterUrl = withRelated.poster
             }
         }
-        if (items.isEmpty()) return null
-        return HomePageList(title, items, isHorizontalImages = true)
+        if (items.isEmpty()) return@coroutineScope emptyList()
+        listOf(HomePageList("Today's Matches", items, isHorizontalImages = true))
+        }
     }
-
-    /** Child categories of a parent (e.g. ARABIC CHANNELS -> 20 countries). */
-    private suspend fun getSubcategories(categoryId: String): List<YacineCategory> {
-        val json = getPayload("categories/$categoryId") ?: return emptyList()
-        return runCatching {
-            parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
-        }.getOrNull() ?: emptyList()
-    }
-    private data class MergedChannel(
-        val name: String,
-        var logo: String?,
-        val ids: MutableList<Pair<String, String>>,
-    )
-
-    private data class SearchHit(
-        val name: String,
-        var poster: String?,
-        val ids: MutableList<String>,
-    )
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-        return coroutineScope {
-            runCatching { ensureTeamAliases() }
-            val eventsDeferred = async { getEvents() }
-            val q = query.trim()
-
-            // Server-side global channel search (Latin only, all quality
-            // groups incl. XTRA/RMC/DAZN): one request instead of crawling
-            // every curated category. Events are still matched locally below.
-            val channelHits = runCatching {
-                val (json) = getDecrypted("search?query=${URLEncoder.encode(q, "UTF-8")}")
-                    ?: return@runCatching emptyList<YacineChannel>()
-                if (json.isBlank()) return@runCatching emptyList<YacineChannel>()
-                parseJson<YacineChannelResponse>(json).data ?: emptyList()
-            }.getOrNull() ?: emptyList()
-
-            val out = mutableListOf<SearchResponse>()
-            // Merge hits by channel name so beIN search results keep all quality ids.
-            val mergedHits = linkedMapOf<String, SearchHit>()
-            channelHits.forEach { ch ->
-                val nm = ch.name?.trim() ?: return@forEach
-                val cid = ch.id ?: return@forEach
-                val key = "c:${normalizeName(nm)}"
-                val cur = mergedHits[key]
-                if (cur == null) {
-                    mergedHits[key] = SearchHit(
-                        nm,
-                        moroccoThumbs[normalizeName(nm)]?.takeIf { it.isNotBlank() }
-                            ?: ch.logo,
-                        mutableListOf(cid),
-                    )
-                } else {
-                    if (!cur.ids.contains(cid)) cur.ids.add(cid)
-                    if (cur.poster.isNullOrBlank() && !ch.logo.isNullOrBlank()) cur.poster = ch.logo
-                }
-            }
-            mergedHits.values.forEach { hit ->
-                val logo = hit.poster?.takeIf { it.isNotBlank() }
-                val data = LinkData(
-                    kind = "channel",
-                    ids = hit.ids.toList(),
-                    name = hit.name,
-                    poster = logo,
-                    plot = "شاهد البث المباشر لقناة ${hit.name}",
-                ).toJson()
+        val q = query.trim()
+        val nowMs = System.currentTimeMillis()
+        val out = mutableListOf<SearchResponse>()
+        withTimeoutOrNull(60_000) { guideFixtures() }.orEmpty()
+            .filter { f ->
+                listOf("${f.home} vs ${f.away}", f.league.orEmpty(), f.channels.joinToString(" "))
+                    .joinToString(" ").contains(q, ignoreCase = true)
+            }.take(30)
+            .forEach { f ->
+                val status = matchStatus(f.kickoffMs, nowMs)
+                val link = LinkData(
+                    name = "${statusEmoji(status)} ${f.home} vs ${f.away}",
+                    poster = noArtBanner,
+                    league = f.league,
+                    channel = f.channels.firstOrNull(),
+                    channels = f.channels,
+                    kickoff = formatKickoff(f.kickoffMs / 1000, nowMs / 1000).takeIf { it.isNotBlank() },
+                    kickoffMs = f.kickoffMs,
+                    desc = f.desc,
+                    plot = "${f.home} vs ${f.away}",
+                )
                 out.add(
-                    newLiveSearchResponse(hit.name, data, TvType.Live) {
-                        this.posterUrl = logo
+                    newLiveSearchResponse(link.name, link.toJson(), TvType.Live) {
+                        this.posterUrl = link.poster
                     }
                 )
             }
-
-            val nowSec = System.currentTimeMillis() / 1000
-            val matched = eventsDeferred.await().filter { e ->
-                val title = eventBaseTitle(e)
-                val arabicTitle = eventTitle(e)
-                val displayName = eventDisplayName(e, nowSec)
-                val hay = listOfNotNull(title, arabicTitle, displayName, e.champions, e.channel, e.team1?.name, e.team2?.name)
-                    .joinToString(" ")
-                hay.contains(q, ignoreCase = true)
-            }
-            // English league + home-first title + live state per match
-            // (cached; bounded lookup so search stays fast).
-            val artMap = matched.map { e ->
-                async { e.id to withTimeoutOrNull(4_000) { matchArt(e) } }
-            }.awaitAll().toMap()
-            matched.forEach { e ->
-                val art = artMap[e.id]
-                val matchup = art?.orderedTitle ?: eventBaseTitle(e)
-                val displayName = eventDisplayName(e, nowSec, art)
-                val id = e.id ?: return@forEach
-                // TheSportsDB banner or placeholder (no team-logo fallback).
-                val poster = art?.thumb ?: noArtBanner
-                val data = LinkData(
-                    kind = "event",
-                    id = id,
-                    name = displayName,
-                    poster = poster,
-                    poster2 = null,
-                    channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    competition = competitionEnglish(art?.league, e.champions),
-                    commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
-                    kickoff = formatKickoff(e.startTime, nowSec).takeIf { it.isNotBlank() },
-                    team1Id = e.team1?.id,
-                    team2Id = e.team2?.id,
-                    startTime = e.startTime,
-                    plot = matchPlot(matchup),
-                ).toJson()
-                out.add(
-                    newLiveSearchResponse(displayName, data, TvType.Live) {
-                        this.posterUrl = poster
-                    }
-                )
-            }
-            out
-        }
+        return out
     }
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
-        // Lazy art enrich for non-priority cards (homepage renders those
-        // cache-only): resolves banner + live state on detail open and warms
-        // the cache for the next homepage build. Bounded so detail stays fast.
-        val nowSec = System.currentTimeMillis() / 1000
-        val lazyEvent = if (data.kind == "event" && data.id != null &&
-            (data.team1Id != null || data.team2Id != null)
-        ) {
-            YacineEvent(
-                id = data.id,
-                startTime = data.startTime,
-                team1 = data.team1Id?.let { YacineTeam(it) },
-                team2 = data.team2Id?.let { YacineTeam(it) },
-            )
-        } else null
-        val lazyArt = lazyEvent?.let { ev ->
+        val nowMs = System.currentTimeMillis()
+        // Fresh emoji + countdown from the baked kickoff (no live source).
+        // Old v63 links carry Yacine startTime instead of kickoffMs.
+        val kickoffMs = data.kickoffMs ?: data.startTime?.times(1000)
+        val status = matchStatus(kickoffMs, nowMs)
+        val matchup = data.plot?.takeIf { it.isNotBlank() } ?: data.name
+        val name = "${statusEmoji(status)} $matchup"
+        val kickoff = kickoffMs
+            ?.let { formatKickoff(it / 1000, nowMs / 1000) }?.takeIf { it.isNotBlank() }
+            ?: data.kickoff?.takeIf { it.isNotBlank() }
+        // Banner enrich: TheSportsDB by matchup teams (bounded, detail
+        // can afford it). Falls back to the baked poster, then placeholder.
+        val matchupTeams = matchup.split(" vs ").map { it.trim() }.takeIf { it.size == 2 }
+        val thumb = if (matchupTeams != null) {
             withTimeoutOrNull(5_000) {
-                runCatching { ensureTeamAliases() }
-                matchArt(ev)
+                searchThumb(matchupTeams[0], matchupTeams[1], kickoffMs?.let { dayOf(it) })
             }
-        }
-        // Fresh title only when the canonical home-first matchup resolved;
-        // otherwise the baked card name (rebuilding from id-only teams
-        // would degrade to "مباراة").
-        val name = if (lazyArt?.orderedTitle != null && lazyEvent != null) {
-            eventDisplayName(lazyEvent, nowSec, lazyArt)
-        } else data.name
-        val banner = data.poster ?: lazyArt?.thumb ?: noArtBanner
-        // Match meta, in order: status, competition, kickoff,
-        // commentator, broadcast channel. Accepts new emoji prefix
-        // (🔴/🔜/✅) and legacy [LIVE]/[UPCOMING]/[ENDED] saved links.
-        // Old saved links carry Arabic champions + old date format;
-        // re-translate so detail shows English without re-adding.
-        val status = if (data.kind == "event") when {
-            name.startsWith("🔴") -> "LIVE"
-            name.startsWith("🔜") -> "UPCOMING"
-            name.startsWith("✅") -> "ENDED"
-            else -> Regex("""^\[(LIVE|UPCOMING|ENDED)\]""").find(name)?.groupValues?.get(1)
         } else null
-        val competition = if (data.kind == "event") {
-            lazyArt?.league?.takeIf { it.isNotBlank() }
-                ?: competitionEnglish(null, data.competition)
-        } else null
-        // Fresh countdown when the kickoff epoch rode along;
-        // otherwise the baked value (old saved links).
-        val kickoff = if (data.kind == "event") {
-            data.startTime
-                ?.let { formatKickoff(it, nowSec) }?.takeIf { it.isNotBlank() }
-                ?: data.kickoff?.takeIf { it.isNotBlank() }
-        } else null
-        // Cricify-style emoji plot, no tags: one line per available
-        // field, kickoff first, then status, competition, channel,
-        // commentary last. Joined with <br><br> (not \n): the app
+        val banner = thumb ?: data.poster ?: noArtBanner
+        // Detail description: kickoff, competition, channel, commentator,
+        // then the EPG Opta preview. Joined with <br><br> (not \n): the app
         // renders plot via setTextHtml, which collapses raw newlines.
-        // UPCOMING gets no status line (the kickoff
-        // line covers it); channels keep their watch plot below.
-        val matchPlotLines = if (data.kind == "event") listOfNotNull(
+        val lines = listOfNotNull(
             kickoff?.let { "🕐 $it" },
-            when (status) {
-                "LIVE" -> "🔴 LIVE"
-                "ENDED" -> "✅ ENDED"
-                else -> null
-            },
-            competition?.let { "🏆 $it" },
+            data.league?.takeIf { it.isNotBlank() }?.let { "🏆 $it" },
             data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
             data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
-        ) else emptyList()
-        val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("<br><br>")
-            ?: data.plot
-            ?: if (data.kind == "event") matchPlot(name)
-            else "شاهد البث المباشر لقناة ${data.name}"
+        )
+        val plot = (lines + listOfNotNull(data.desc?.takeIf { it.isNotBlank() }))
+            .takeIf { it.isNotEmpty() }?.joinToString("<br><br>")
+            ?: data.name
         return newMovieLoadResponse(name, url, TvType.Live, url) {
             this.posterUrl = banner
-            // Matches: hero shows the same homepage thumbnail (banner),
-            // falling back to the neutral placeholder (never empty).
-            if (data.kind == "event") {
-                this.backgroundPosterUrl = banner ?: data.poster2
-            }
+            this.backgroundPosterUrl = banner
             this.plot = plot
-            // Recommendations ride in LinkData (row siblings / other matches).
             data.related?.takeIf { it.isNotEmpty() }?.let { related ->
                 this.recommendations = related.map { rel ->
                     newLiveSearchResponse(rel.name, rel.toJson(), TvType.Live) {
@@ -1206,57 +780,11 @@ class YacineTvProvider : MainAPI() {
         }
         val ua = s.userAgent?.takeIf { it.isNotBlank() }
             ?: out["User-Agent"]?.takeIf { it.isNotBlank() }
-            ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+            ?: BROWSER_UA
         out["User-Agent"] = ua
         val ref = s.referer?.takeIf { it.isNotBlank() } ?: out["Referer"]
         if (!ref.isNullOrBlank()) out["Referer"] = ref
         return out
-    }
-
-    /** Broadcast label (e.g. "beIN SPORTS 1") -> live channel ids.
-     * Global server search first (exact normalized-name match, all
-     * quality dupes kept for the quality picker), then the beIN quality
-     * categories crawl. Empty when nothing resolves (caller falls back
-     * to event servers). */
-    private suspend fun resolveChannelIds(label: String): List<String> {
-        val want = normalizeName(label)
-        runCatching {
-            val (json) = getDecrypted("search?query=${URLEncoder.encode(label.trim(), "UTF-8")}")
-                ?: return@runCatching null
-            if (json.isBlank()) return@runCatching null
-            parseJson<YacineChannelResponse>(json).data.orEmpty()
-                .filter { normalizeName(it.name ?: "") == want }
-                .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
-                .distinct()
-        }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
-        // beIN crawl across quality groups (same merge as the homepage row).
-        return runCatching {
-            coroutineScope {
-                getCategories().filter { isBeinQuality(it) }.map { cat ->
-                    async { getChannels(cat.id) }
-                }.awaitAll().flatten()
-                    .filter { normalizeName(it.name ?: "") == want }
-                    .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
-                    .distinct()
-            }
-        }.getOrNull() ?: emptyList()
-    }
-
-    private suspend fun getChannelStreams(channelId: String): List<YacineStream> {
-        val (json) = getDecrypted("channel/$channelId") ?: return emptyList()
-        if (json.isBlank()) return emptyList()
-        return runCatching {
-            parseJson<YacineStreamResponse>(json).data ?: emptyList()
-        }.getOrNull() ?: emptyList()
-    }
-
-    private suspend fun getEventStreams(eventId: String): List<YacineStream> {
-        // /event/{id} and /event/{id}/servers return the same server list.
-        val (json) = getDecrypted("event/$eventId") ?: getDecrypted("event/$eventId/servers") ?: return emptyList()
-        if (json.isBlank()) return emptyList()
-        return runCatching {
-            parseJson<YacineStreamResponse>(json).data ?: emptyList()
-        }.getOrNull() ?: emptyList()
     }
 
     private fun qualityFor(label: String, url: String): Int {
@@ -1274,178 +802,8 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Verified direct EdgeNext CDN streams (iptv-org) used when the API has
-     * nothing playable for an MBC channel (empty data or dead embeds).
-     * Keys are normalized channel names. */
-    private val mbcFallbacks = mapOf(
-        "mbc 1" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-1/15cf99af5de54063fdabfefe66adc075/index.m3u8",
-        "mbc 3" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-3-usa/5d58265a862a476dc7f97694addb5ded/index.m3u8",
-        "mbc 4" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-4/24f134f1cd63db9346439e96b86ca6ed/index.m3u8",
-        "mbc 5" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-5/ee6b000cee0629411b666ab26cb13e9b/index.m3u8",
-        "mbc bollywood" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-bollywood/546eb40d7dcf9a209255dd2496903764/index.m3u8",
-        "mbc drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-drama/2c28a458e2f3253e678b07ac7d13fe71/index.m3u8",
-        "mbc fm" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-fm/3f36f7db6086acf058dc51681c87f8ad/index.m3u8",
-        "mbc masr" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr/956eac069c78a35d47245db6cdbb1575/index.m3u8",
-        "mbc maser" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr/956eac069c78a35d47245db6cdbb1575/index.m3u8",
-        "mbc masr 2" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-2/754931856515075b0aabf0e583495c68/index.m3u8",
-        "mbc masr drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-drama/567b703c19ede6598222de81b0e4508b/index.m3u8",
-        "mbc maser drama" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-masr-drama/567b703c19ede6598222de81b0e4508b/index.m3u8",
-        "mbc drama +" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-mbc-plus-drama/e37251ec2aac8f6c98f75cd0fa37cd28/index.m3u8",
-        "wanasah" to "https://shd-gcp-live.edgenextcdn.net/live/bitmovin-wanasah/13e82ea6232fa647c43b26e8a41f173d/index.m3u8",
-    )
-
-    /** Verified public backups for Kids channels whose API entries are
-     * dead embeds or stale shahid assets (all verified 200 + multivariant).
-     * Keys are normalized channel names. */
-    private val kidsFallbacks = mapOf(
-        "spacetoon" to "https://live-uae-next.spacetoongo.com/ST_MENA_NEXT/hls/r9p2hjipmw2kl.m3u8",
-        "taha kids" to "https://stream.starmenajo.com/hls/app/live/ts:fhd.m3u8",
-        "atfal wa mawahib" to "https://5d658d7e9f562.streamlock.net/atfal1.com/atfal2/playlist.m3u8",
-    )
-
-    data class EasyBroadcastEvent(
-        @JsonProperty("stream") val stream: String? = null,
-        @JsonProperty("stream_no_timeshift") val streamNoTimeshift: String? = null,
-    )
-
-    /** SNRT channels point at snrtlive.ma pages (no extractor). Resolve via the
-     * EasyBroadcast iframe slug -> player API -> direct m3u8. Returns true if emitted. */
-    private suspend fun emitSnrt(
-        channelName: String,
-        pageUrl: String,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        return try {
-            val page = app.get(
-                pageUrl,
-                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to "https://snrtlive.ma/"),
-                timeout = 15,
-            ).text
-            val slug = extractEasyBroadcastSlug(page) ?: return false
-            val ev = runCatching {
-                parseJson<EasyBroadcastEvent>(
-                    app.get(
-                        "https://snrt.player.easybroadcast.io/api/events/$slug",
-                        headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
-                        timeout = 15,
-                    ).text
-                )
-            }.getOrNull() ?: return false
-            // DVR playlist keeps timeshift; plain playlist is the live edge.
-            val stream = ev.stream?.takeIf { it.isNotBlank() }
-                ?: ev.streamNoTimeshift?.takeIf { it.isNotBlank() }
-                ?: return false
-            if (playEasyBroadcast(stream, "$channelName • SNRT", pageUrl, callback)) {
-                return true
-            }
-            return false
-        } catch (_: Exception) { false }
-    }
-
-    /** Medi 1 embeds are JWPlayer pages with no static file URL, but the
-     * underlying streams live on the same EasyBroadcast CDN (bases below,
-     * via iptv-org). Resolved the same way as SNRT. Keys are normalized
-     * channel names. */
-    private val medi1Streams = mapOf(
-        "medi 1 tv maghreb" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-maghreb_jnbspmg/playlist.m3u8",
-        "medi 1 maghreb" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-maghreb_jnbspmg/playlist.m3u8",
-        "medi 1 tv arabic" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-arabic_g90v4ec/playlist.m3u8",
-        "medi 1 arabic" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-arabic_g90v4ec/playlist.m3u8",
-        "medi 1 tv afrique" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-afrique_tm7tu45/playlist.m3u8",
-        "medi 1 afrique" to "https://cdn.live.easybroadcast.io/abr_corp/83_medi1tv-afrique_tm7tu45/playlist.m3u8",
-    )
-
-    private suspend fun emitMedi1(
-        channelName: String,
-        pageUrl: String,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        val base = medi1Streams[normalizeName(channelName)] ?: return false
-        return playEasyBroadcast(base, "$channelName • Medi1", pageUrl, callback)
-    }
-
-    /** Signs an EasyBroadcast master URL and emits the signed best variant
-     * (players drop the ?token query on relative variant URLs, so the
-     * master itself is unplayable; .ts segments need no token). */
-    private suspend fun playEasyBroadcast(
-        baseStreamUrl: String,
-        label: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        return try {
-            // The CDN gates playlists (token_authentication): sign the URL
-            // first (token endpoint needs no auth). Unsigned -> 403.
-            val signedMaster = signEasyBroadcast(baseStreamUrl, referer) ?: return false
-            // Players resolve relative variant URLs against the master and
-            // drop the ?token query -> 403 on variants. Emit the signed best
-            // variant instead; .ts segments play ungated.
-            val playable = bestSignedVariant(signedMaster, referer) ?: signedMaster
-            callback.invoke(
-                newExtractorLink(this.name, label, playable) {
-                    this.headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to referer)
-                    this.referer = referer
-                    this.quality = Qualities.Unknown.value
-                    this.type = ExtractorLinkType.M3U8
-                }
-            )
-            true
-        } catch (_: Exception) { false }
-    }
-
-    /** Signs an EasyBroadcast CDN stream URL via the (unauthenticated)
-     * token endpoint. Returns null when signing fails (caller must drop
-     * the stream: the CDN answers 403 on unsigned URLs). */
-    private suspend fun signEasyBroadcast(streamUrl: String, pageUrl: String): String? {
-        return runCatching {
-            val q = URLEncoder.encode(streamUrl, "UTF-8")
-            val res = app.get(
-                "https://token.easybroadcast.io/all?url=$q",
-                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
-                timeout = 10,
-            ).text.trim()
-            // "token=...&token_path=...&expires=..."
-            if (!res.contains("token=") || !res.contains("expires=")) return@runCatching null
-            val sep = if ("?" in streamUrl) "&" else "?"
-            "$streamUrl$sep$res"
-        }.getOrNull()
-    }
-
-    /** Fetches the signed master playlist, picks the highest-bandwidth
-     * variant and returns it freshly signed. Null when anything fails
-     * (caller falls back to the signed master). */
-    private suspend fun bestSignedVariant(signedMasterUrl: String, pageUrl: String): String? {
-        return runCatching {
-            val master = app.get(
-                signedMasterUrl,
-                headers = mapOf("User-Agent" to BROWSER_UA, "Referer" to pageUrl),
-                timeout = 10,
-            ).text
-            if ("#EXTM3U" !in master) return@runCatching null
-            var bestUri: String? = null
-            var bestBw = -1
-            val lines = master.lines()
-            for (i in lines.indices) {
-                val bw = Regex("""BANDWIDTH=(\d+)""").find(lines[i])
-                    ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: continue
-                val uri = lines.getOrNull(i + 1)?.trim()
-                    ?.takeIf { it.isNotEmpty() && !it.startsWith("#") } ?: continue
-                if (bw > bestBw) {
-                    bestBw = bw
-                    bestUri = uri
-                }
-            }
-            val rel = bestUri ?: return@runCatching null
-            val abs = if (rel.startsWith("http")) rel
-            else join(signedMasterUrl.substringBeforeLast("/"), rel)
-            signEasyBroadcast(abs, pageUrl)
-        }.getOrNull()
-    }
-
     /** Emits the best variant of a tokenized master playlist with the
-     * original query re-attached (shahid ?t=&e=, ycncdn, boing...).
-     * Players drop ?query on relative refs, so emitting the master URL
-     * alone yields dead subrequests.
+     * original query re-attached (?t=&e=).
      * Returns 1 if emitted, 0 if the master is not multivariant (caller
      * falls back to the raw master URL), -1 if it IS multivariant but no
      * variant resolves (caller must NOT emit the master: it has no TS and
@@ -1503,22 +861,6 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { 0 }
     }
 
-    private fun extractEasyBroadcastSlug(page: String): String? {
-        // Page HTML varies (escaped slashes, single/double quotes, query strings).
-        val clean = page.replace("\\/", "/").replace("\\\"", "\"")
-        val patterns = listOf(
-            Regex("""snrt\.player\.easybroadcast\.io/events/([A-Za-z0-9_-]+)"""),
-            Regex("""easybroadcast[^"'\s<>]*?/events/([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE),
-            Regex("""data-event(?:-slug)?=["']([A-Za-z0-9_-]+)["']""", RegexOption.IGNORE_CASE),
-        )
-        for (rx in patterns) {
-            rx.find(clean)?.groupValues?.getOrNull(1)
-                ?.trim()?.trimEnd('/', '?', '#')
-                ?.takeIf { it.isNotBlank() }?.let { return it }
-        }
-        return null
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -1526,176 +868,75 @@ class YacineTvProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val info = parseJson<LinkData>(data)
+        // Channel playback: resolve each airing channel (in order) to its
+        // Yacine channel ids (all qualities, best first). v63 links carry
+        // only a single channel: it rides along as fallback. First channel
+        // with playable streams wins; all its qualities are emitted.
+        val candidates = (info.channels + listOfNotNull(info.channel)).distinct()
+        val streams = candidates.firstNotNullOfOrNull { ch ->
+            val ids = withTimeoutOrNull(60_000) { resolveChannelIds(ch) }.orEmpty()
+            if (ids.isEmpty()) return@firstNotNullOfOrNull null
+            val all = ids.mapNotNull { cid ->
+                withTimeoutOrNull(20_000) { getChannelStreams(cid) }
+                    ?.takeIf { it.isNotEmpty() }
+            }.flatten()
+            all.takeIf { it.isNotEmpty() }?.let { ch to it }
+        } ?: return false
+        val (channelName, channelStreams) = streams
+        val tag = channelName.trim().takeIf { it.isNotEmpty() } ?: info.name
         var found = false
         val seenUrls = mutableSetOf<String>()
-
-        suspend fun emit(channelName: String, s: YacineStream): Boolean {
-            val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
-                ?: return false
-            if (!seenUrls.add(raw)) return false
-            // SNRT pages need one extra resolution hop (no extractor exists).
-            if ("snrtlive.ma" in raw.lowercase()) {
-                if (emitSnrt(channelName, raw, callback)) {
-                    found = true
-                    return true
-                }
-                // Fall through to the generic extractor attempt below instead
-                // of giving up: page markup may change upstream.
-            }
-            // Medi 1 embeds are dynamic JWPlayer pages: resolve via the
-            // EasyBroadcast CDN bases instead of the extractor registry.
-            if ("medi1tv.ma" in raw.lowercase()) {
-                if (emitMedi1(channelName, raw, callback)) {
-                    found = true
-                    return true
-                }
-                // Fall through to the generic extractor attempt below.
-            }
+        channelStreams.forEach { s ->
+            val raw = s.url?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
+            if (!seenUrls.add(raw)) return@forEach
             val headers = streamHeaders(s)
-            val referer = headers["Referer"]?.takeIf { it.isNotBlank() }
-                ?: s.referer?.takeIf { it.isNotBlank() }
-                ?: raw
             val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
+            val label = if (tag.isNotEmpty() && !serverName.equals(tag, ignoreCase = true)) "$tag • $serverName" else serverName
             val lower = raw.lowercase()
-            // url_type 5/6 (and other non-media pages like mbch.live / arab-stream.live)
-            // are web players, not streams: hand them to the extractor registry.
+            // url_type 5/6 and other non-media pages are web players, not
+            // streams: hand them to the extractor registry.
             val isDirect = ".m3u8" in lower || s.urlType == 1 || s.urlType == 3 ||
                 lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".ts")
             if (!isDirect) {
+                val eventReferer = headers["Referer"]?.takeIf { it.isNotBlank() }
+                    ?: s.referer?.takeIf { it.isNotBlank() }
+                    ?: raw
                 var resolved = false
                 val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
-                runCatching { loadExtractor(raw, referer, subtitleCallback, countCb) }
+                runCatching { loadExtractor(raw, eventReferer, subtitleCallback, countCb) }
                 if (resolved) found = true
-                return resolved
+                return@forEach
             }
             // Tokenized masters (?t=&e=): players drop the query on relative
             // refs, so resolve the best variant up-front with query kept.
             // A multivariant master with no resolvable variant is unplayable:
             // skip it instead of emitting a link the player errors on.
             if (".m3u8" in lower && "?" in raw) {
-                when (emitBestVariant(channelName, serverName, raw, headers, referer, callback)) {
+                val eventRef = headers["Referer"]?.takeIf { it.isNotBlank() }
+                    ?: s.referer?.takeIf { it.isNotBlank() }
+                    ?: raw
+                when (emitBestVariant(tag, serverName, raw, headers, eventRef, callback)) {
                     1 -> {
                         found = true
-                        return true
+                        return@forEach
                     }
-                    -1 -> return false
+                    -1 -> return@forEach
                 }
                 // Fall through to the raw master URL below (0).
             }
             callback.invoke(
                 newExtractorLink(
                     this.name,
-                    "$channelName • $serverName",
+                    label,
                     raw,
                 ) {
                     this.headers = headers
                     this.referer = headers["Referer"] ?: ""
-                    this.quality = qualityFor("$channelName $serverName", raw)
+                    this.quality = qualityFor(label, raw)
                     this.type = if (".m3u8" in raw) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 }
             )
             found = true
-            return true
-        }
-
-        if (info.kind == "event" && info.id != null) {
-            // What the card promised (e.g. "beIN SPORTS 1") is what must
-            // play: resolve the broadcast label to live channel feeds
-            // first. Blind /event/{id} servers caused wrong-channel
-            // playback on stale/mislabeled events. Event servers stay as
-            // fallback when the channel name resolves to nothing.
-            val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
-            if (tag != null) {
-                val channelIds = resolveChannelIds(tag)
-                if (channelIds.isNotEmpty()) {
-                    val grouped = coroutineScope {
-                        channelIds.map { cid ->
-                            async { getChannelStreams(cid) }
-                        }.awaitAll()
-                    }
-                    grouped.forEach { streams ->
-                        streams.forEach { if (emit(tag, it)) found = true }
-                    }
-                    if (found) return true
-                }
-            }
-            val streams = getEventStreams(info.id)
-            // Label with the broadcast channel (no match name): "beIN SPORTS 1 • HD".
-            streams.forEach { s ->
-                val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
-                    ?: return@forEach
-                if (!seenUrls.add(raw)) return@forEach
-                val headers = streamHeaders(s)
-                val serverName = s.name?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
-                val label = if (tag != null && !serverName.equals(tag, ignoreCase = true)) "$tag • $serverName" else serverName
-                val lower = raw.lowercase()
-                val isDirect = ".m3u8" in lower || s.urlType == 1 || s.urlType == 3 ||
-                    lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".ts")
-                if (!isDirect) {
-                    val eventReferer = headers["Referer"]?.takeIf { it.isNotBlank() }
-                        ?: s.referer?.takeIf { it.isNotBlank() }
-                        ?: raw
-                    var resolved = false
-                    val countCb: (ExtractorLink) -> Unit = { resolved = true; callback(it) }
-                    runCatching { loadExtractor(raw, eventReferer, subtitleCallback, countCb) }
-                    if (resolved) found = true
-                    return@forEach
-                }
-                // Same tokenized-master handling as channels (beIN ?t=&e=).
-                if (".m3u8" in lower && "?" in raw) {
-                    val eventRef = headers["Referer"]?.takeIf { it.isNotBlank() }
-                        ?: s.referer?.takeIf { it.isNotBlank() }
-                        ?: raw
-                    when (emitBestVariant(tag ?: info.name, serverName, raw, headers, eventRef, callback)) {
-                        1 -> {
-                            found = true
-                            return@forEach
-                        }
-                        -1 -> return@forEach
-                    }
-                }
-                callback.invoke(
-                    newExtractorLink(this.name, label, raw) {
-                        this.headers = headers
-                        this.referer = headers["Referer"] ?: ""
-                        this.quality = qualityFor(label, raw)
-                        this.type = if (".m3u8" in lower) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    }
-                )
-                found = true
-            }
-            return found
-        }
-
-        // Channel (possibly merged beIN ids across qualities).
-        val ids = info.ids.ifEmpty { emptyList() }
-        if (ids.isEmpty()) return false
-        val grouped = coroutineScope {
-            ids.map { cid ->
-                async { cid to getChannelStreams(cid) }
-            }.awaitAll()
-        }
-        var emitted = false
-        grouped.forEach { (_, streams) ->
-            streams.forEach { if (emit(info.name, it)) emitted = true }
-        }
-        // Last resort: verified direct backups when the API has nothing playable.
-        if (!emitted) {
-            val backup = mbcFallbacks[normalizeName(info.name)]
-                ?: kidsFallbacks[normalizeName(info.name)]
-            backup?.let { url ->
-                if (seenUrls.add(url)) {
-                    callback.invoke(
-                        newExtractorLink(this.name, "${info.name} • IPTV", url) {
-                            this.headers = mapOf("User-Agent" to BROWSER_UA)
-                            this.referer = ""
-                            this.quality = Qualities.P1080.value
-                            this.type = ExtractorLinkType.M3U8
-                        }
-                    )
-                    found = true
-                }
-            }
         }
         return found
     }
