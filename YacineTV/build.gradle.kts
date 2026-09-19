@@ -1,4 +1,4 @@
-version = 57
+version = 66
 
 android {
     namespace = "com.yacin"
