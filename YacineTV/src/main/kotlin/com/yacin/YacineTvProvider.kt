@@ -1156,20 +1156,21 @@ class YacineTvProvider : MainAPI() {
                 ?: data.kickoff?.takeIf { it.isNotBlank() }
         } else null
         // Cricify-style emoji plot, no tags: one line per available
-        // field in fixed order. Joined with <br><br> (not \n): the app
+        // field, kickoff first, then status, competition, channel,
+        // commentary last. Joined with <br><br> (not \n): the app
         // renders plot via setTextHtml, which collapses raw newlines.
         // UPCOMING gets no status line (the kickoff
         // line covers it); channels keep their watch plot below.
         val matchPlotLines = if (data.kind == "event") listOfNotNull(
+            kickoff?.let { "🕐 $it" },
             when (status) {
                 "LIVE" -> "🔴 LIVE"
                 "ENDED" -> "✅ ENDED"
                 else -> null
             },
             competition?.let { "🏆 $it" },
-            kickoff?.let { "🕐 $it" },
-            data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
             data.channel?.takeIf { it.isNotBlank() }?.let { "📺 $it" },
+            data.commentary?.takeIf { it.isNotBlank() }?.let { "🎙️ $it" },
         ) else emptyList()
         val plot = matchPlotLines.takeIf { it.isNotEmpty() }?.joinToString("<br><br>")
             ?: data.plot
