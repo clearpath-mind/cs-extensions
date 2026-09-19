@@ -319,6 +319,8 @@ class YacineTvProvider : MainAPI() {
         val t = s.replace(Regex("""[ً-ٰٟ]"""), "")
         fun has(vararg keys: String) = keys.any { t.contains(it) }
         return when {
+            has("تشامبيونشيب") || (has("البطولة") && has("الإنجليزي", "الانجليزي")) -> "English League Championship"
+            has("الهولندي", "هولندا") -> "Dutch Eredivisie"
             has("أبطال أوروبا", "ابطال اوروبا") -> "UEFA Champions League"
             has("المؤتمر الأوروبي", "المؤتمر الاوروبي") -> "UEFA Conference League"
             has("الأوروبي", "الاوروبي") && has("الدوري") -> "UEFA Europa League"
@@ -334,6 +336,7 @@ class YacineTvProvider : MainAPI() {
             has("أبطال آسيا", "ابطال اسيا") -> "AFC Champions League"
             has("أمم أفريقيا", "امم افريقيا") -> "Africa Cup of Nations"
             has("أمم أوروبا", "امم اوروبا") -> "UEFA Euro"
+            has("القارات") -> "FIFA Intercontinental Cup"
             has("كأس العالم", "كاس العالم") -> "FIFA World Cup"
             else -> null
         }
