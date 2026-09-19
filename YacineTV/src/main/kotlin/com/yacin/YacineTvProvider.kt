@@ -99,7 +99,7 @@ class YacineTvProvider : MainAPI() {
         // cheap when connections reset fast; the 15s timeout covers
         // slow-but-alive responses.
         return retryIO(times = 5) {
-            for (base in listOf(mainUrl, fallbackUrl)) {
+            for (base in resolveBases()) {
                 try {
                     val res = app.get(
                         join(base, path),
@@ -136,18 +136,84 @@ class YacineTvProvider : MainAPI() {
     /** Last-good decrypted payloads per path (stale-while-revalidate).
      * Both bases reset connections at times; when a fresh fetch fails,
      * getters fall back to these instead of rendering empty rows.
-     * Search payloads are never cached (unbounded query keys). */
+     * Memory-first, SharedPreferences-backed so stale data survives
+     * process death. Search payloads are never cached (unbounded keys). */
     @Volatile
     private var lastPayloads: Map<String, String> = emptyMap()
+
+    private fun prefs() =
+        runCatching { appContext?.getSharedPreferences("yacinetv", Context.MODE_PRIVATE) }.getOrNull()
+
+    private fun prefsKey(path: String) = "payload_" + path.replace(Regex("[^A-Za-z0-9]"), "_")
 
     /** Fresh payload, or the last-good cached one when the API flaps.
      * Only non-blank responses are remembered, so a genuine empty
      * ({"data":[]}) still parses to empty instead of serving stale data. */
     private suspend fun getPayload(path: String, cacheable: Boolean = true): String? {
-        val (json) = getDecrypted(path) ?: return lastPayloads[path]?.takeIf { cacheable }
-        if (json.isBlank()) return lastPayloads[path]?.takeIf { cacheable }
-        if (cacheable) lastPayloads = lastPayloads + (path to json)
+        val (json) = getDecrypted(path) ?: return stalePayload(path, cacheable)
+        if (json.isBlank()) return stalePayload(path, cacheable)
+        if (cacheable) rememberPayload(path, json)
         return json
+    }
+
+    private fun stalePayload(path: String, cacheable: Boolean): String? {
+        if (!cacheable) return null
+        lastPayloads[path]?.let { return it }
+        // Warm memory from disk so the next lookup is cheap.
+        return prefs()?.getString(prefsKey(path), null)?.takeIf { it.isNotBlank() }?.also {
+            lastPayloads = lastPayloads + (path to it)
+        }
+    }
+
+    private fun rememberPayload(path: String, json: String) {
+        lastPayloads = lastPayloads + (path to json)
+        runCatching { prefs()?.edit()?.putString(prefsKey(path), json)?.apply() }
+    }
+
+    /** Remote API-base config (Cricify-style remote config without
+     * Firebase): primary + fallbacks fetched from GitHub at runtime so
+     * hosts can move without an app update. Hardcoded pair below is the
+     * default when remote is unreachable or malformed. */
+    private val apiBasesUrl =
+        "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/YacineTV/api_bases.json"
+
+    data class ApiBases(
+        @JsonProperty("primary") val primary: String? = null,
+        @JsonProperty("fallbacks") val fallbacks: List<String>? = null,
+    )
+
+    @Volatile
+    private var resolvedBases: List<String>? = null
+
+    private fun sanitizeBase(u: String?): String? {
+        val s = u?.trim()?.trimEnd('/')?.takeIf { it.isNotBlank() } ?: return null
+        if (!s.startsWith("http://") && !s.startsWith("https://")) return null
+        return s
+    }
+
+    private suspend fun resolveBases(): List<String> {
+        resolvedBases?.takeIf { it.isNotEmpty() }?.let { return it }
+        val defaults = listOf(mainUrl, fallbackUrl)
+        val fresh = retryIO(times = 2) {
+            runCatching {
+                app.get(apiBasesUrl, headers = noCacheHeaders, timeout = 8).text
+                    .takeIf { it.isNotBlank() }?.let { txt ->
+                        val b = parseJson<ApiBases>(txt)
+                        listOfNotNull(sanitizeBase(b.primary)) +
+                            b.fallbacks.orEmpty().mapNotNull { sanitizeBase(it) }
+                    }?.takeIf { it.isNotEmpty() }
+            }.getOrNull()
+        }
+        val resolved = fresh
+            ?: prefs()?.getString("api_bases", null)
+                ?.split("|")?.mapNotNull { sanitizeBase(it) }
+                ?.takeIf { it.isNotEmpty() }
+            ?: defaults
+        resolvedBases = resolved
+        if (fresh != null) {
+            runCatching { prefs()?.edit()?.putString("api_bases", fresh.joinToString("|"))?.apply() }
+        }
+        return resolved
     }
     data class YacineChannelResponse(
         @JsonProperty("data") val data: List<YacineChannel>? = null,
