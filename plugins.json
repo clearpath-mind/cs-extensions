@@ -1,25 +1,5 @@
 [
     {
-        "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/beINSports.cs3",
-        "status": 1,
-        "version": 1,
-        "name": "beINSports",
-        "internalName": "beINSports",
-        "authors": [
-            "clearpath-mind"
-        ],
-        "description": "beINSports - Live football on beIN Sports, guide by FotMob, playback via Yacine TV",
-        "fileSize": 55469,
-        "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
-        "language": "en",
-        "tvTypes": [
-            "Live"
-        ],
-        "iconUrl": "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/5d/BeIN_Sports_logo.svg/960px-BeIN_Sports_logo.svg.png",
-        "apiVersion": 1,
-        "fileHash": "sha256-9bd043eecb0a6501b04e4362a92c72a9c42ce0d319148401f66ec9045fd0c486"
-    },
-    {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Pornhoarder.cs3",
         "status": 1,
         "version": 25,
@@ -62,14 +42,14 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
         "status": 1,
-        "version": 62,
+        "version": 63,
         "name": "YacineTV",
         "internalName": "YacineTV",
         "authors": [
             "clearpath-mind"
         ],
-        "description": "YacineTV - Live sports, matches of the day and Arabic live channels",
-        "fileSize": 106927,
+        "description": "YacineTV - Live football on beIN Sports, official guide with Yacine streams",
+        "fileSize": 61086,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -77,6 +57,6 @@
         ],
         "iconUrl": "https://yt3.googleusercontent.com/ulm35tweg3do5istps0TgCjMmJSVczGUL2NIrXMwI1DDRi5ty29BIzQSUHVgqZN5CSo1PHhiA6M=s900-c-k-c0x00ffffff-no-rj",
         "apiVersion": 1,
-        "fileHash": "sha256-d9a57299954002faf38c26cb632bef1d204624fa5fb3b65a5cea8d15a85d6f03"
+        "fileHash": "sha256-4408694b180166d221521ca39e9790dfe4f8b0eddab225705a9308bb2ce46b5d"
     }
 ]
