@@ -94,15 +94,17 @@ class YacineTvProvider : MainAPI() {
     }
 
     private suspend fun getDecrypted(path: String): Pair<String, String>? {
-        // The API flaps (connection resets); retry across both bases so one
-        // bad call doesn't wipe entire rows (e.g. matches-only homepage).
-        return retryIO(times = 3) {
+        // The API flaps (connection resets on both bases); retry across
+        // both so one bad window doesn't wipe entire rows. Attempts are
+        // cheap when connections reset fast; the 15s timeout covers
+        // slow-but-alive responses.
+        return retryIO(times = 5) {
             for (base in listOf(mainUrl, fallbackUrl)) {
                 try {
                     val res = app.get(
                         join(base, path),
                         headers = mapOf("User-Agent" to "okhttp/4.12.0"),
-                        timeout = 10,
+                        timeout = 15,
                     )
                     if (res.code == 200 && res.text.isNotBlank()) {
                         val t = res.headers["t"] ?: ""
@@ -130,6 +132,23 @@ class YacineTvProvider : MainAPI() {
     // Raw API models (categories + channels share id/name/logo shape).
     // NOTE: /categories and /events have different data shapes, so each
     // endpoint parses its own envelope (no generic shared response type).
+
+    /** Last-good decrypted payloads per path (stale-while-revalidate).
+     * Both bases reset connections at times; when a fresh fetch fails,
+     * getters fall back to these instead of rendering empty rows.
+     * Search payloads are never cached (unbounded query keys). */
+    @Volatile
+    private var lastPayloads: Map<String, String> = emptyMap()
+
+    /** Fresh payload, or the last-good cached one when the API flaps.
+     * Only non-blank responses are remembered, so a genuine empty
+     * ({"data":[]}) still parses to empty instead of serving stale data. */
+    private suspend fun getPayload(path: String, cacheable: Boolean = true): String? {
+        val (json) = getDecrypted(path) ?: return lastPayloads[path]?.takeIf { cacheable }
+        if (json.isBlank()) return lastPayloads[path]?.takeIf { cacheable }
+        if (cacheable) lastPayloads = lastPayloads + (path to json)
+        return json
+    }
     data class YacineChannelResponse(
         @JsonProperty("data") val data: List<YacineChannel>? = null,
     )
@@ -181,8 +200,7 @@ class YacineTvProvider : MainAPI() {
     )
 
     private suspend fun getCategories(): List<YacineCategory> {
-        val (json) = getDecrypted("categories") ?: return emptyList()
-        if (json.isBlank()) return emptyList()
+        val json = getPayload("categories") ?: return emptyList()
         return runCatching {
             parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
@@ -193,16 +211,14 @@ class YacineTvProvider : MainAPI() {
     )
 
     private suspend fun getChannels(categoryId: Int): List<YacineChannel> {
-        val (json) = getDecrypted("categories/$categoryId/channels") ?: return emptyList()
-        if (json.isBlank()) return emptyList()
+        val json = getPayload("categories/$categoryId/channels") ?: return emptyList()
         return runCatching {
             parseJson<YacineChannelResponse>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
     }
 
     private suspend fun getEvents(): List<YacineEvent> {
-        val (json) = getDecrypted("events") ?: return emptyList()
-        if (json.isBlank()) return emptyList()
+        val json = getPayload("events") ?: return emptyList()
         return runCatching {
             parseJson<YacineEventResponse>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
@@ -580,6 +596,25 @@ class YacineTvProvider : MainAPI() {
             }.awaitAll().flatten()
 
             lists.addAll(otherRows)
+            if (lists.isEmpty()) {
+                // Both bases down and no stale cache: say so instead of a
+                // silently empty homepage. The card carries no ids, so
+                // tapping it loads nothing — refresh to retry.
+                val data = LinkData(
+                    kind = "channel",
+                    ids = emptyList(),
+                    name = "⚠️ Couldn't reach server",
+                    plot = "تعذر الاتصال بالخادم — اسحب للتحديث",
+                ).toJson()
+                lists.add(
+                    HomePageList(
+                        "YacineTV",
+                        listOf(
+                            newLiveSearchResponse("⚠️ Couldn't reach server — pull to refresh", data, TvType.Live)
+                        ),
+                    )
+                )
+            }
             lists
         }
     }
@@ -901,8 +936,7 @@ class YacineTvProvider : MainAPI() {
 
     /** Child categories of a parent (e.g. ARABIC CHANNELS -> 20 countries). */
     private suspend fun getSubcategories(categoryId: Int): List<YacineCategory> {
-        val (json) = getDecrypted("categories/$categoryId") ?: return emptyList()
-        if (json.isBlank()) return emptyList()
+        val json = getPayload("categories/$categoryId") ?: return emptyList()
         return runCatching {
             parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
