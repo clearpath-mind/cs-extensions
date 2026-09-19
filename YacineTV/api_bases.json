@@ -1,6 +1,4 @@
 {
   "primary": "https://def.ycnapi.com/api",
-  "fallbacks": [
-    "https://deft.yacinelive.com/api"
-  ]
+  "fallbacks": ["https://deft.yacinelive.com/api"]
 }
