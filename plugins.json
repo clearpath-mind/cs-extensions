@@ -1,5 +1,25 @@
 [
     {
+        "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/beINSports.cs3",
+        "status": 1,
+        "version": 1,
+        "name": "beINSports",
+        "internalName": "beINSports",
+        "authors": [
+            "clearpath-mind"
+        ],
+        "description": "beINSports - Live football on beIN Sports, guide by FotMob, playback via Yacine TV",
+        "fileSize": 55469,
+        "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
+        "language": "en",
+        "tvTypes": [
+            "Live"
+        ],
+        "iconUrl": "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/5d/BeIN_Sports_logo.svg/960px-BeIN_Sports_logo.svg.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-9bd043eecb0a6501b04e4362a92c72a9c42ce0d319148401f66ec9045fd0c486"
+    },
+    {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Pornhoarder.cs3",
         "status": 1,
         "version": 25,
