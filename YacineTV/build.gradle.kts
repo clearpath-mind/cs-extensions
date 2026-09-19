@@ -1,10 +1,11 @@
-version = 65
+version = 57
 
 android {
     namespace = "com.yacin"
 }
 
 cloudstream {
+    description = "YacineTV - Live sports, matches of the day and Arabic live channels"
     authors = listOf("clearpath-mind")
     language = "ar"
 
