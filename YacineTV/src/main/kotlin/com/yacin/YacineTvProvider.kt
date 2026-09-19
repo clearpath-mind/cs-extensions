@@ -53,14 +53,14 @@ class YacineTvProvider : MainAPI() {
         appContext = context.applicationContext
     }
 
-    /** Categories merged into one beIN SPORTS row (one per quality upstream). */
-    private val beinQualityIds = setOf(4, 5, 6, 7)
+    /** Categories merged into one beIN SPORTS row (one per quality upstream).
+     * IDs are upstream strings (API migrated off ints); match by name. */
     private val beinQualityRegex = Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
 
     data class LinkData(
         @JsonProperty("kind") val kind: String = "channel", // channel | event
-        @JsonProperty("ids") val ids: List<Int> = emptyList(), // merged channel ids
-        @JsonProperty("id") val id: Long? = null, // event id
+        @JsonProperty("ids") val ids: List<String> = emptyList(), // merged channel ids
+        @JsonProperty("id") val id: String? = null, // event id (upstream string)
         @JsonProperty("name") val name: String = "",
         @JsonProperty("poster") val poster: String? = null,
         @JsonProperty("poster2") val poster2: String? = null, // match: other team logo
@@ -220,13 +220,13 @@ class YacineTvProvider : MainAPI() {
     )
 
     data class YacineCategory(
-        @JsonProperty("id") val id: Int = 0,
+        @JsonProperty("id") val id: String = "",
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("logo") val logo: String? = null,
     )
 
     data class YacineChannel(
-        @JsonProperty("id") val id: Int? = null,
+        @JsonProperty("id") val id: String? = null,
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("logo") val logo: String? = null,
     )
@@ -236,7 +236,7 @@ class YacineTvProvider : MainAPI() {
     )
 
     data class YacineEvent(
-        @JsonProperty("id") val id: Long? = null,
+        @JsonProperty("id") val id: String? = null,
         @JsonProperty("champions") val champions: String? = null,
         @JsonProperty("channel") val channel: String? = null,
         @JsonProperty("commentary") val commentary: String? = null,
@@ -276,7 +276,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("data") val data: List<YacineCategory>? = null,
     )
 
-    private suspend fun getChannels(categoryId: Int): List<YacineChannel> {
+    private suspend fun getChannels(categoryId: String): List<YacineChannel> {
         val json = getPayload("categories/$categoryId/channels") ?: return emptyList()
         return runCatching {
             parseJson<YacineChannelResponse>(json).data ?: emptyList()
@@ -291,17 +291,13 @@ class YacineTvProvider : MainAPI() {
     }
 
     private fun isBeinQuality(cat: YacineCategory): Boolean {
-        if (beinQualityIds.contains(cat.id)) return true
         return cat.name?.let { beinQualityRegex.containsMatchIn(it) } == true
     }
 
     private fun qualityTag(cat: YacineCategory): String {
         val m = cat.name?.let { Regex("""(\d+\s*P)""", RegexOption.IGNORE_CASE).find(it) }
         if (m != null) return m.groupValues[1].replace(" ", "").uppercase()
-        return when (cat.id) {
-            4 -> "1080P"; 5 -> "720P"; 6 -> "360P"; 7 -> "244P"
-            else -> ""
-        }
+        return ""
     }
 
     private fun normalizeName(n: String): String {
@@ -642,7 +638,7 @@ class YacineTvProvider : MainAPI() {
             val otherRows = otherCats.mapNotNull { cat ->
                 val norm = normalizeName(cat.name ?: "")
                 when {
-                    norm == "arabic channels" || cat.id == 9 -> cat to true // parent
+                    norm == "arabic channels" -> cat to true // parent
                     wantedTopRows.contains(norm) -> cat to false
                     else -> null // dropped: entertainment, france, turkish, weyyak, shahid, other countries
                 }
@@ -653,10 +649,10 @@ class YacineTvProvider : MainAPI() {
                         if (channels.isEmpty()) return@async emptyList()
                         return@async listOfNotNull(channelRow(cleanCategoryName(cat.name), channels))
                     }
-                    // Morocco only (id 15) from the ARABIC parent.
+                    // Morocco only from the ARABIC parent (id by name: upstream ids are strings).
                     val subs = getSubcategories(cat.id)
                     val morocco = subs.firstOrNull {
-                        it.id == 15 || normalizeName(it.name ?: "") == "morocco"
+                        normalizeName(it.name ?: "") == "morocco"
                     } ?: return@async emptyList()
                     val subChannels = getChannels(morocco.id)
                     if (subChannels.isEmpty()) return@async emptyList()
@@ -990,7 +986,7 @@ class YacineTvProvider : MainAPI() {
     }
 
     /** Child categories of a parent (e.g. ARABIC CHANNELS -> 20 countries). */
-    private suspend fun getSubcategories(categoryId: Int): List<YacineCategory> {
+    private suspend fun getSubcategories(categoryId: String): List<YacineCategory> {
         val json = getPayload("categories/$categoryId") ?: return emptyList()
         return runCatching {
             parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
@@ -999,13 +995,13 @@ class YacineTvProvider : MainAPI() {
     private data class MergedChannel(
         val name: String,
         var logo: String?,
-        val ids: MutableList<Pair<Int, String>>,
+        val ids: MutableList<Pair<String, String>>,
     )
 
     private data class SearchHit(
         val name: String,
         var poster: String?,
-        val ids: MutableList<Int>,
+        val ids: MutableList<String>,
     )
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -1217,7 +1213,36 @@ class YacineTvProvider : MainAPI() {
         return out
     }
 
-    private suspend fun getChannelStreams(channelId: Int): List<YacineStream> {
+    /** Broadcast label (e.g. "beIN SPORTS 1") -> live channel ids.
+     * Global server search first (exact normalized-name match, all
+     * quality dupes kept for the quality picker), then the beIN quality
+     * categories crawl. Empty when nothing resolves (caller falls back
+     * to event servers). */
+    private suspend fun resolveChannelIds(label: String): List<String> {
+        val want = normalizeName(label)
+        runCatching {
+            val (json) = getDecrypted("search?query=${URLEncoder.encode(label.trim(), "UTF-8")}")
+                ?: return@runCatching null
+            if (json.isBlank()) return@runCatching null
+            parseJson<YacineChannelResponse>(json).data.orEmpty()
+                .filter { normalizeName(it.name ?: "") == want }
+                .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
+                .distinct()
+        }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
+        // beIN crawl across quality groups (same merge as the homepage row).
+        return runCatching {
+            coroutineScope {
+                getCategories().filter { isBeinQuality(it) }.map { cat ->
+                    async { getChannels(cat.id) }
+                }.awaitAll().flatten()
+                    .filter { normalizeName(it.name ?: "") == want }
+                    .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
+                    .distinct()
+            }
+        }.getOrNull() ?: emptyList()
+    }
+
+    private suspend fun getChannelStreams(channelId: String): List<YacineStream> {
         val (json) = getDecrypted("channel/$channelId") ?: return emptyList()
         if (json.isBlank()) return emptyList()
         return runCatching {
@@ -1225,7 +1250,7 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
-    private suspend fun getEventStreams(eventId: Long): List<YacineStream> {
+    private suspend fun getEventStreams(eventId: String): List<YacineStream> {
         // /event/{id} and /event/{id}/servers return the same server list.
         val (json) = getDecrypted("event/$eventId") ?: getDecrypted("event/$eventId/servers") ?: return emptyList()
         if (json.isBlank()) return emptyList()
@@ -1574,9 +1599,28 @@ class YacineTvProvider : MainAPI() {
         }
 
         if (info.kind == "event" && info.id != null) {
+            // What the card promised (e.g. "beIN SPORTS 1") is what must
+            // play: resolve the broadcast label to live channel feeds
+            // first. Blind /event/{id} servers caused wrong-channel
+            // playback on stale/mislabeled events. Event servers stay as
+            // fallback when the channel name resolves to nothing.
+            val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
+            if (tag != null) {
+                val channelIds = resolveChannelIds(tag)
+                if (channelIds.isNotEmpty()) {
+                    val grouped = coroutineScope {
+                        channelIds.map { cid ->
+                            async { getChannelStreams(cid) }
+                        }.awaitAll()
+                    }
+                    grouped.forEach { streams ->
+                        streams.forEach { if (emit(tag, it)) found = true }
+                    }
+                    if (found) return true
+                }
+            }
             val streams = getEventStreams(info.id)
             // Label with the broadcast channel (no match name): "beIN SPORTS 1 • HD".
-            val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
             streams.forEach { s ->
                 val raw = s.url?.trim()?.takeIf { it.isNotBlank() }?.replace("www.elahmad.coo", "www.elahmad.com")
                     ?: return@forEach
