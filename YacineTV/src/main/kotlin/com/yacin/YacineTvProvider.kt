@@ -43,6 +43,9 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("eventId") val eventId: String? = null,
         @JsonProperty("name") val name: String = "",
         @JsonProperty("channel") val channel: String? = null,
+        @JsonProperty("competition") val competition: String? = null,
+        @JsonProperty("commentary") val commentary: String? = null,
+        @JsonProperty("kickoff") val kickoff: Long? = null, // start epoch sec
     )
 
     data class YacineEventResponse(
@@ -51,7 +54,9 @@ class YacineTvProvider : MainAPI() {
 
     data class YacineEvent(
         @JsonProperty("id") val id: String? = null,
+        @JsonProperty("champions") val champions: String? = null,
         @JsonProperty("channel") val channel: String? = null,
+        @JsonProperty("commentary") val commentary: String? = null,
         @JsonProperty("start_time") val startTime: Long? = null,
         @JsonProperty("end_time") val endTime: Long? = null,
         @JsonProperty("team_1") val team1: YacineTeam? = null,
@@ -239,6 +244,9 @@ class YacineTvProvider : MainAPI() {
                     eventId = e.id,
                     name = title,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
+                    competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                    commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
+                    kickoff = e.startTime?.takeIf { it > 0 },
                 ).toJson()
                 newLiveSearchResponse(title, data, TvType.Live)
             }
@@ -247,7 +255,44 @@ class YacineTvProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
-        return newMovieLoadResponse(data.name, url, TvType.Live, url)
+        // Plain detail lines from the baked event fields (no extra fetch).
+        // Missing fields are skipped, never placeholder text.
+        val lines = listOfNotNull(
+            data.kickoff?.let { formatKickoff(it) }?.takeIf { it.isNotBlank() },
+            data.competition?.takeIf { it.isNotBlank() },
+            data.channel?.takeIf { it.isNotBlank() },
+            data.commentary?.takeIf { it.isNotBlank() },
+        )
+        return newMovieLoadResponse(data.name, url, TvType.Live, url) {
+            if (lines.isNotEmpty()) this.plot = lines.joinToString("\n")
+        }
+    }
+
+    /** Device-local kickoff: "Today 19:45", "Tomorrow 20:00" or
+     * "22 Sep, 18:45". Blank when already started or unknown. */
+    private fun formatKickoff(epochSec: Long?): String {
+        if (epochSec == null || epochSec <= 0) return ""
+        val nowSec = System.currentTimeMillis() / 1000
+        if (epochSec <= nowSec) return ""
+        return try {
+            val tz = java.util.TimeZone.getDefault()
+            val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply { timeZone = tz }
+            val timeFmt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).apply { timeZone = tz }
+            val time = timeFmt.format(java.util.Date(epochSec * 1000))
+            val kickDate = dateFmt.format(java.util.Date(epochSec * 1000))
+            val nowDate = dateFmt.format(java.util.Date(nowSec * 1000))
+            if (kickDate == nowDate) {
+                "Today $time"
+            } else {
+                val cal = java.util.Calendar.getInstance(tz).apply {
+                    timeInMillis = nowSec * 1000
+                    add(java.util.Calendar.DAY_OF_YEAR, 1)
+                }
+                if (kickDate == dateFmt.format(cal.time)) "Tomorrow $time"
+                else java.text.SimpleDateFormat("dd MMM, HH:mm", java.util.Locale.US).apply { timeZone = tz }
+                    .format(java.util.Date(epochSec * 1000))
+            }
+        } catch (_: Exception) { "" }
     }
 
     private fun qualityFor(label: String, url: String): Int {
