@@ -218,13 +218,16 @@ class YacineTvProvider : MainAPI() {
         }
         val nowSec = System.currentTimeMillis() / 1000
         val items = getEvents()
-            .filter { e ->
-                val id = e.id?.takeIf { it.isNotBlank() } ?: return@filter false
-                id.isNotBlank() && (e.endTime == null || e.endTime <= 0 || nowSec <= e.endTime)
-            }
+            .filter { e -> !e.id.isNullOrBlank() }
             .sortedWith(
                 compareBy(
-                    { e -> if (e.startTime != null && e.startTime > 0 && nowSec < e.startTime) 1 else 0 },
+                    { e ->
+                        when {
+                            e.startTime != null && e.startTime > 0 && nowSec < e.startTime -> 1 // upcoming
+                            e.endTime != null && e.endTime > 0 && nowSec > e.endTime -> 2 // ended
+                            else -> 0 // live
+                        }
+                    },
                     { e -> e.startTime ?: Long.MAX_VALUE },
                 )
             )
@@ -239,7 +242,7 @@ class YacineTvProvider : MainAPI() {
                 ).toJson()
                 newLiveSearchResponse(title, data, TvType.Live)
             }
-        return newHomePageResponse(HomePageList("Today's Matches", items, isHorizontalImages = false), false)
+        return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = false)), false)
     }
 
     override suspend fun load(url: String): LoadResponse {
