@@ -479,6 +479,7 @@ class YacineTvProvider : MainAPI() {
             "360" in label || "360" in u -> Qualities.P360.value
             label.equals("HD", ignoreCase = true) -> Qualities.P1080.value
             label.equals("SD", ignoreCase = true) -> Qualities.P720.value
+            label.equals("Low", ignoreCase = true) -> Qualities.P480.value
             else -> Qualities.Unknown.value
         }
     }
@@ -601,8 +602,16 @@ class YacineTvProvider : MainAPI() {
             return true
         }
 
-        // The card's channel label is what must play (every quality).
+        // Event servers first: labeled per match (HD/SD/Low). The channel
+        // endpoints all return name "1" for every quality group, so
+        // channel-first produced "beIN SPORTS 4 • 1" xN with no quality.
         val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
+        val eid = info.eventId?.takeIf { it.isNotBlank() }
+        if (eid != null) {
+            getEventStreams(eid).forEach { if (emit(tag ?: info.name, it)) found = true }
+            if (found) return true
+        }
+        // Fallback: the card's channel label across quality groups.
         if (tag != null) {
             val ids = resolveChannelIds(tag)
             if (ids.isNotEmpty()) {
@@ -614,9 +623,6 @@ class YacineTvProvider : MainAPI() {
                 if (found) return true
             }
         }
-        // Fallback: event servers.
-        val eid = info.eventId?.takeIf { it.isNotBlank() } ?: return found
-        getEventStreams(eid).forEach { if (emit(tag ?: info.name, it)) found = true }
         return found
     }
 }
