@@ -225,13 +225,13 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
-    /** Display title with match info (Cricify structure): "A vs B",
+    /** Display title with match info (Cricify structure): "A × B",
      * single name when both sides are identical (a show, not a match),
      * fallback when teams are missing. */
     private fun createDisplayTitle(t1: String, t2: String): String {
         if (t1.isNotBlank() && t2.isNotBlank()) {
             if (t1 == t2) return t1
-            return "$t1 vs $t2"
+            return "$t1 × $t2"
         }
         return "مباراة"
     }
