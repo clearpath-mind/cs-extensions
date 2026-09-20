@@ -271,7 +271,7 @@ class YacineTvProvider : MainAPI() {
         val isEnded = endSec != null && endSec > 0 && nowSec > endSec
         return buildString {
             append("https://live-card-png.cricify.workers.dev/?")
-            append("title=${enc("football")}")
+            append("title=${enc("Football")}")
             append("&teamA=")
             append("&teamB=")
             logo1?.takeIf { it.isNotBlank() }?.let { append("&teamAImg=${enc(it)}") }
