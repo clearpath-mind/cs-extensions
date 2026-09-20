@@ -249,8 +249,9 @@ class YacineTvProvider : MainAPI() {
     }
 
     /** Cricify-style generated match card (480x280 PNG): team logos +
-     * kickoff + live/ended badge. No text params: the worker font has no
-     * Arabic glyphs (renders as boxes). Baked per card. */
+     * kickoff + live/ended badge. Title hardcoded to "football": the worker
+     * font has no Arabic glyphs (renders as boxes), and Yacine champions
+     * names are Arabic. Baked per card. */
     private fun generateCardUrl(
         logo1: String?,
         logo2: String?,
@@ -270,7 +271,7 @@ class YacineTvProvider : MainAPI() {
         val isEnded = endSec != null && endSec > 0 && nowSec > endSec
         return buildString {
             append("https://live-card-png.cricify.workers.dev/?")
-            append("title=")
+            append("title=${enc("football")}")
             append("&teamA=")
             append("&teamB=")
             logo1?.takeIf { it.isNotBlank() }?.let { append("&teamAImg=${enc(it)}") }
