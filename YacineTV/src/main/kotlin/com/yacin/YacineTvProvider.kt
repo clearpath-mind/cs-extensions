@@ -729,7 +729,9 @@ class YacineTvProvider : MainAPI() {
             val thumbs = fixtures.map { f ->
                 async {
                     withTimeoutOrNull(8_000) {
-                        searchThumb(f.home, f.away, dayOf(f.kickoffMs))
+                        // All airings of a fixture share the UTC day; the
+                        // banner lookup day-matches on it.
+                        searchThumb(f.home, f.away, f.airings.firstOrNull()?.let { dayOf(it.kickoffMs) })
                     }
                 }
             }.awaitAll()
