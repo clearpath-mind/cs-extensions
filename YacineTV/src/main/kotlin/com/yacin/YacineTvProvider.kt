@@ -12,7 +12,7 @@ import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newLiveSearchResponse
-import com.lagradost.cloudstream3.newMovieLoadResponse
+import com.lagradost.cloudstream3.newLiveStreamLoadResponse
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -224,6 +224,29 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
+    /** Display title with match info (Cricify structure): "A vs B",
+     * single name when both sides are identical (a show, not a match),
+     * fallback when teams are missing. */
+    private fun createDisplayTitle(t1: String, t2: String): String {
+        if (t1.isNotBlank() && t2.isNotBlank()) {
+            if (t1 == t2) return t1
+            return "$t1 vs $t2"
+        }
+        return "مباراة"
+    }
+
+    /** Event status from clocks (Cricify logic): ended when past end,
+     * live when past start, upcoming when before start. */
+    private fun getEventStatus(startSec: Long?, endSec: Long?): String {
+        val nowSec = System.currentTimeMillis() / 1000
+        return when {
+            endSec != null && endSec > 0 && nowSec >= endSec -> "✅"
+            startSec != null && startSec > 0 && nowSec >= startSec -> "🔴"
+            startSec != null && startSec > 0 && nowSec < startSec -> "🔜"
+            else -> ""
+        }
+    }
+
     /** Cricify-style generated match card (480x280 PNG): team logos +
      * kickoff + live/ended badge. No text params: the worker font has no
      * Arabic glyphs (renders as boxes). Baked per card. */
@@ -279,7 +302,12 @@ class YacineTvProvider : MainAPI() {
             .map { e ->
                 val t1 = e.team1?.name?.trim().orEmpty()
                 val t2 = e.team2?.name?.trim().orEmpty()
-                val title = if (t1.isNotBlank() && t2.isNotBlank()) "$t1 × $t2" else "مباراة"
+                val displayTitle = createDisplayTitle(t1, t2)
+                val status = getEventStatus(
+                    e.startTime?.takeIf { it > 0 },
+                    e.endTime?.takeIf { it > 0 },
+                )
+                val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
                 val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
                     generateCardUrl(
                         e.team1?.logo?.takeIf { it.isNotBlank() },
@@ -291,7 +319,7 @@ class YacineTvProvider : MainAPI() {
                 } else null
                 val data = LinkData(
                     eventId = e.id,
-                    name = title,
+                    name = fullTitle,
                     channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
                     competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
@@ -317,27 +345,90 @@ class YacineTvProvider : MainAPI() {
         return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = true)), false)
     }
 
+    override suspend fun search(query: String): List<SearchResponse> {
+        if (query.isBlank()) return emptyList()
+        val q = query.trim()
+        val nowSec = System.currentTimeMillis() / 1000
+        return getEvents()
+            .filter { e ->
+                listOfNotNull(
+                    e.team1?.name,
+                    e.team2?.name,
+                    e.champions,
+                    e.channel,
+                    e.commentary,
+                ).joinToString(" ").contains(q, ignoreCase = true)
+            }
+            .sortedWith(
+                compareBy(
+                    { e ->
+                        when {
+                            e.startTime != null && e.startTime > 0 && nowSec < e.startTime -> 1
+                            e.endTime != null && e.endTime > 0 && nowSec > e.endTime -> 2
+                            else -> 0
+                        }
+                    },
+                    { e -> e.startTime ?: Long.MAX_VALUE },
+                )
+            )
+            .map { e ->
+                val t1 = e.team1?.name?.trim().orEmpty()
+                val t2 = e.team2?.name?.trim().orEmpty()
+                val displayTitle = createDisplayTitle(t1, t2)
+                val status = getEventStatus(
+                    e.startTime?.takeIf { it > 0 },
+                    e.endTime?.takeIf { it > 0 },
+                )
+                val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
+                val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
+                    generateCardUrl(
+                        e.team1?.logo?.takeIf { it.isNotBlank() },
+                        e.team2?.logo?.takeIf { it.isNotBlank() },
+                        e.startTime?.takeIf { it > 0 },
+                        e.endTime?.takeIf { it > 0 },
+                        nowSec,
+                    )
+                } else null
+                val data = LinkData(
+                    eventId = e.id,
+                    name = fullTitle,
+                    channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
+                    competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                    commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
+                    kickoff = e.startTime?.takeIf { it > 0 },
+                    end = e.endTime?.takeIf { it > 0 },
+                    team1 = t1.takeIf { it.isNotBlank() },
+                    team2 = t2.takeIf { it.isNotBlank() },
+                    logo1 = e.team1?.logo?.takeIf { it.isNotBlank() },
+                    logo2 = e.team2?.logo?.takeIf { it.isNotBlank() },
+                ).toJson()
+                newLiveSearchResponse(fullTitle, data, TvType.Live) {
+                    this.posterUrl = poster
+                }
+            }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
-        // Fresh card (badges reflect now) + plain detail lines from the
-        // baked event fields (no extra fetch). Missing fields are skipped.
+        // Cricify-style plot (emoji fields) from the baked event data.
         // Lines join with <br><br>: the app renders plot via setTextHtml,
         // which collapses raw newlines.
+        val plot = buildString {
+            data.competition?.takeIf { it.isNotBlank() }?.let { append("🏆 $it<br><br>") }
+            data.kickoff?.let { formatKickoff(it) }?.takeIf { it.isNotBlank() }
+                ?.let { append("🕐 $it<br><br>") }
+            data.channel?.takeIf { it.isNotBlank() }?.let { append("📺 $it<br><br>") }
+            data.commentary?.takeIf { it.isNotBlank() }?.let { append("🎙️ $it") }
+        }.trim().takeIf { it.isNotBlank() }
         val banner = if (!data.team1.isNullOrBlank() && !data.team2.isNullOrBlank()) {
             generateCardUrl(data.logo1, data.logo2, data.kickoff, data.end)
         } else null
-        val lines = listOfNotNull(
-            data.kickoff?.let { formatKickoff(it) }?.takeIf { it.isNotBlank() },
-            data.channel?.takeIf { it.isNotBlank() },
-            data.competition?.takeIf { it.isNotBlank() },
-            data.commentary?.takeIf { it.isNotBlank() },
-        )
-        return newMovieLoadResponse(data.name, url, TvType.Live, url) {
+        return newLiveStreamLoadResponse(name = data.name, url = url, dataUrl = url) {
             banner?.let {
                 this.posterUrl = it
                 this.backgroundPosterUrl = it
             }
-            if (lines.isNotEmpty()) this.plot = lines.joinToString("<br><br>")
+            plot?.let { this.plot = it }
             data.related?.takeIf { it.isNotEmpty() }?.let { related ->
                 this.recommendations = related.map { rel ->
                     newLiveSearchResponse(rel.name, rel.toJson(), TvType.Live) {
