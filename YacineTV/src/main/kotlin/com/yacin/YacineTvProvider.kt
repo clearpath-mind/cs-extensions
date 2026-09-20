@@ -242,7 +242,7 @@ class YacineTvProvider : MainAPI() {
                 ).toJson()
                 newLiveSearchResponse(title, data, TvType.Live)
             }
-        return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = false)), false)
+        return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = true)), false)
     }
 
     override suspend fun load(url: String): LoadResponse {
