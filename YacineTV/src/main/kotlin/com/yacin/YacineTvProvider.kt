@@ -51,6 +51,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("team2") val team2: String? = null,
         @JsonProperty("logo1") val logo1: String? = null,
         @JsonProperty("logo2") val logo2: String? = null,
+        @JsonProperty("related") val related: List<LinkData>? = null,
     )
 
     data class YacineEventResponse(
@@ -223,14 +224,12 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
-    /** Cricify-style generated match card (480x280 PNG): competition +
-     * teams + logos + kickoff + live/ended badge. Baked per card. */
+    /** Cricify-style generated match card (480x280 PNG): team logos +
+     * kickoff + live/ended badge. No text params: the worker font has no
+     * Arabic glyphs (renders as boxes). Baked per card. */
     private fun generateCardUrl(
-        team1: String,
-        team2: String,
         logo1: String?,
         logo2: String?,
-        competition: String?,
         kickoffSec: Long?,
         endSec: Long?,
         nowSec: Long = System.currentTimeMillis() / 1000,
@@ -247,9 +246,9 @@ class YacineTvProvider : MainAPI() {
         val isEnded = endSec != null && endSec > 0 && nowSec > endSec
         return buildString {
             append("https://live-card-png.cricify.workers.dev/?")
-            append("title=${enc(competition?.takeIf { it.isNotBlank() } ?: "Today's Matches")}")
-            append("&teamA=${enc(team1)}")
-            append("&teamB=${enc(team2)}")
+            append("title=")
+            append("&teamA=")
+            append("&teamB=")
             logo1?.takeIf { it.isNotBlank() }?.let { append("&teamAImg=${enc(it)}") }
             logo2?.takeIf { it.isNotBlank() }?.let { append("&teamBImg=${enc(it)}") }
             if (time.isNotBlank()) append("&time=$time")
@@ -263,7 +262,7 @@ class YacineTvProvider : MainAPI() {
             return newHomePageResponse(emptyList(), false)
         }
         val nowSec = System.currentTimeMillis() / 1000
-        val items = getEvents()
+        val links = getEvents()
             .filter { e -> !e.id.isNullOrBlank() }
             .sortedWith(
                 compareBy(
@@ -283,10 +282,8 @@ class YacineTvProvider : MainAPI() {
                 val title = if (t1.isNotBlank() && t2.isNotBlank()) "$t1 × $t2" else "مباراة"
                 val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
                     generateCardUrl(
-                        t1, t2,
                         e.team1?.logo?.takeIf { it.isNotBlank() },
                         e.team2?.logo?.takeIf { it.isNotBlank() },
-                        e.champions?.trim()?.takeIf { it.isNotBlank() },
                         e.startTime?.takeIf { it > 0 },
                         e.endTime?.takeIf { it > 0 },
                         nowSec,
@@ -304,11 +301,19 @@ class YacineTvProvider : MainAPI() {
                     team2 = t2.takeIf { it.isNotBlank() },
                     logo1 = e.team1?.logo?.takeIf { it.isNotBlank() },
                     logo2 = e.team2?.logo?.takeIf { it.isNotBlank() },
-                ).toJson()
-                newLiveSearchResponse(title, data, TvType.Live) {
-                    this.posterUrl = poster
-                }
+                )
+                data to poster
             }
+        // Recommendations ride along: the other matches (base links, no
+        // nesting). Posters regenerate in load() (pure URL building).
+        val items = links.map { (data, poster) ->
+            val withRelated = data.copy(
+                related = links.map { it.first }.filter { it.eventId != data.eventId }.take(12),
+            )
+            newLiveSearchResponse(withRelated.name, withRelated.toJson(), TvType.Live) {
+                this.posterUrl = poster
+            }
+        }
         return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = true)), false)
     }
 
@@ -319,15 +324,12 @@ class YacineTvProvider : MainAPI() {
         // Lines join with <br><br>: the app renders plot via setTextHtml,
         // which collapses raw newlines.
         val banner = if (!data.team1.isNullOrBlank() && !data.team2.isNullOrBlank()) {
-            generateCardUrl(
-                data.team1, data.team2, data.logo1, data.logo2,
-                data.competition, data.kickoff, data.end,
-            )
+            generateCardUrl(data.logo1, data.logo2, data.kickoff, data.end)
         } else null
         val lines = listOfNotNull(
             data.kickoff?.let { formatKickoff(it) }?.takeIf { it.isNotBlank() },
-            data.competition?.takeIf { it.isNotBlank() },
             data.channel?.takeIf { it.isNotBlank() },
+            data.competition?.takeIf { it.isNotBlank() },
             data.commentary?.takeIf { it.isNotBlank() },
         )
         return newMovieLoadResponse(data.name, url, TvType.Live, url) {
@@ -336,6 +338,13 @@ class YacineTvProvider : MainAPI() {
                 this.backgroundPosterUrl = it
             }
             if (lines.isNotEmpty()) this.plot = lines.joinToString("<br><br>")
+            data.related?.takeIf { it.isNotEmpty() }?.let { related ->
+                this.recommendations = related.map { rel ->
+                    newLiveSearchResponse(rel.name, rel.toJson(), TvType.Live) {
+                        this.posterUrl = generateCardUrl(rel.logo1, rel.logo2, rel.kickoff, rel.end)
+                    }
+                }
+            }
         }
     }
 
