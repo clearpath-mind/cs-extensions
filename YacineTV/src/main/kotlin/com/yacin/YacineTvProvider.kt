@@ -46,6 +46,11 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("competition") val competition: String? = null,
         @JsonProperty("commentary") val commentary: String? = null,
         @JsonProperty("kickoff") val kickoff: Long? = null, // start epoch sec
+        @JsonProperty("end") val end: Long? = null, // end epoch sec
+        @JsonProperty("team1") val team1: String? = null,
+        @JsonProperty("team2") val team2: String? = null,
+        @JsonProperty("logo1") val logo1: String? = null,
+        @JsonProperty("logo2") val logo2: String? = null,
     )
 
     data class YacineEventResponse(
@@ -65,6 +70,7 @@ class YacineTvProvider : MainAPI() {
 
     data class YacineTeam(
         @JsonProperty("name") val name: String? = null,
+        @JsonProperty("logo") val logo: String? = null,
     )
 
     data class YacineCategoryEnvelope(
@@ -217,6 +223,41 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
+    /** Cricify-style generated match card (480x280 PNG): competition +
+     * teams + logos + kickoff + live/ended badge. Baked per card. */
+    private fun generateCardUrl(
+        team1: String,
+        team2: String,
+        logo1: String?,
+        logo2: String?,
+        competition: String?,
+        kickoffSec: Long?,
+        endSec: Long?,
+        nowSec: Long = System.currentTimeMillis() / 1000,
+    ): String {
+        fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+        val time = if (kickoffSec != null && kickoffSec > 0) {
+            try {
+                val fmt = java.text.SimpleDateFormat("MMM dd, yyyy hh:mm a", java.util.Locale.US)
+                enc(fmt.format(java.util.Date(kickoffSec * 1000)))
+            } catch (_: Exception) { "" }
+        } else ""
+        val isLive = kickoffSec != null && kickoffSec > 0 && nowSec >= kickoffSec &&
+            (endSec == null || endSec <= 0 || nowSec <= endSec)
+        val isEnded = endSec != null && endSec > 0 && nowSec > endSec
+        return buildString {
+            append("https://live-card-png.cricify.workers.dev/?")
+            append("title=${enc(competition?.takeIf { it.isNotBlank() } ?: "Today's Matches")}")
+            append("&teamA=${enc(team1)}")
+            append("&teamB=${enc(team2)}")
+            logo1?.takeIf { it.isNotBlank() }?.let { append("&teamAImg=${enc(it)}") }
+            logo2?.takeIf { it.isNotBlank() }?.let { append("&teamBImg=${enc(it)}") }
+            if (time.isNotBlank()) append("&time=$time")
+            append("&isLive=$isLive")
+            append("&isEnded=$isEnded")
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.name.isNotBlank() || page > 1) {
             return newHomePageResponse(emptyList(), false)
@@ -240,6 +281,17 @@ class YacineTvProvider : MainAPI() {
                 val t1 = e.team1?.name?.trim().orEmpty()
                 val t2 = e.team2?.name?.trim().orEmpty()
                 val title = if (t1.isNotBlank() && t2.isNotBlank()) "$t1 × $t2" else "مباراة"
+                val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
+                    generateCardUrl(
+                        t1, t2,
+                        e.team1?.logo?.takeIf { it.isNotBlank() },
+                        e.team2?.logo?.takeIf { it.isNotBlank() },
+                        e.champions?.trim()?.takeIf { it.isNotBlank() },
+                        e.startTime?.takeIf { it > 0 },
+                        e.endTime?.takeIf { it > 0 },
+                        nowSec,
+                    )
+                } else null
                 val data = LinkData(
                     eventId = e.id,
                     name = title,
@@ -247,16 +299,31 @@ class YacineTvProvider : MainAPI() {
                     competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
                     commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
                     kickoff = e.startTime?.takeIf { it > 0 },
+                    end = e.endTime?.takeIf { it > 0 },
+                    team1 = t1.takeIf { it.isNotBlank() },
+                    team2 = t2.takeIf { it.isNotBlank() },
+                    logo1 = e.team1?.logo?.takeIf { it.isNotBlank() },
+                    logo2 = e.team2?.logo?.takeIf { it.isNotBlank() },
                 ).toJson()
-                newLiveSearchResponse(title, data, TvType.Live)
+                newLiveSearchResponse(title, data, TvType.Live) {
+                    this.posterUrl = poster
+                }
             }
         return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = true)), false)
     }
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
-        // Plain detail lines from the baked event fields (no extra fetch).
-        // Missing fields are skipped, never placeholder text.
+        // Fresh card (badges reflect now) + plain detail lines from the
+        // baked event fields (no extra fetch). Missing fields are skipped.
+        // Lines join with <br><br>: the app renders plot via setTextHtml,
+        // which collapses raw newlines.
+        val banner = if (!data.team1.isNullOrBlank() && !data.team2.isNullOrBlank()) {
+            generateCardUrl(
+                data.team1, data.team2, data.logo1, data.logo2,
+                data.competition, data.kickoff, data.end,
+            )
+        } else null
         val lines = listOfNotNull(
             data.kickoff?.let { formatKickoff(it) }?.takeIf { it.isNotBlank() },
             data.competition?.takeIf { it.isNotBlank() },
@@ -264,7 +331,11 @@ class YacineTvProvider : MainAPI() {
             data.commentary?.takeIf { it.isNotBlank() },
         )
         return newMovieLoadResponse(data.name, url, TvType.Live, url) {
-            if (lines.isNotEmpty()) this.plot = lines.joinToString("\n")
+            banner?.let {
+                this.posterUrl = it
+                this.backgroundPosterUrl = it
+            }
+            if (lines.isNotEmpty()) this.plot = lines.joinToString("<br><br>")
         }
     }
 
