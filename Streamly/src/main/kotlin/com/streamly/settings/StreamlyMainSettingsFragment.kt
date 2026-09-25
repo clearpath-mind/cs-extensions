@@ -10,9 +10,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.Switch
 import androidx.appcompat.app.AlertDialog
-import androidx.core.content.edit
 import androidx.fragment.app.DialogFragment
 import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.streamly.BuildConfig
@@ -79,17 +77,10 @@ class StreamlyMainSettingsFragment(
         providersRow.background = getDrawable("settings_item_background")
         providersIcon.setImageDrawable(getDrawable("settings_icon"))
 
-        val hideMetaRow: View = view.findView("hideMetaRow")
-        hideMetaRow.background = getDrawable("settings_item_background")
-
-        val showMetaSwitch = view.findView<Switch>("hideMetaSwitch")
-        showMetaSwitch.isChecked = sharedPref.getBoolean("show_episode_meta", false)
-        showMetaSwitch.makeTvCompatible()
-
-        hideMetaRow.setOnClickListener { showMetaSwitch.isChecked = !showMetaSwitch.isChecked }
-        showMetaSwitch.setOnCheckedChangeListener { _, isChecked ->
-            sharedPref.edit { putBoolean("show_episode_meta", isChecked) }
-        }
+        val languageRow: View = view.findView("languageRow")
+        val languageIcon = view.findView<ImageView>("languageIcon")
+        languageRow.background = getDrawable("settings_item_background")
+        languageIcon.setImageDrawable(getDrawable("settings_icon"))
 
         val showSubFragment = { fragmentCreator: (() -> Unit) -> DialogFragment, tag: String ->
             val fm = activity?.supportFragmentManager
@@ -105,6 +96,10 @@ class StreamlyMainSettingsFragment(
 
         providersRow.setOnClickListener {
             showSubFragment({ cb -> StreamlyProvidersFragment(plugin, sharedPref, cb) }, "streamly_providers")
+        }
+
+        languageRow.setOnClickListener {
+            showSubFragment({ cb -> StreamlyLanguageFragment(plugin, sharedPref, cb) }, "streamly_language")
         }
 
         saveIcon.setOnClickListener {

@@ -194,12 +194,17 @@ open class Streamly : MainAPI() {
     private var appContext: Context? = null
     private var sharedPref: SharedPreferences? = null
 
+    /** Display language for TMDB metadata (titles, plots, episode names). */
+    val langCode: String
+        get() = (sharedPref ?: companionSharedPref)?.getString("tmdb_language_code", "ar-SA") ?: "ar-SA"
+
     /** Called by the plugin entry point — MainAPI has no context hook here. */
     fun init(context: Context) {
         appContext = context.applicationContext
         sharedPref = runCatching {
             context.getSharedPreferences("streamly_prefs", Context.MODE_PRIVATE)
         }.getOrNull()
+        companionSharedPref = sharedPref
         StreamlyCache.loadProviderStats(sharedPref)
     }
 
@@ -207,8 +212,7 @@ open class Streamly : MainAPI() {
         private const val TAG = "Streamly"
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val apiKey = BuildConfig.TMDB_API
-        // Display language for TMDB metadata (titles, plots, episode names)
-        private const val LANG = "ar"
+        var companionSharedPref: SharedPreferences? = null
         // English is required for link resolution: TopCinema slugs are Latin-script
         private const val RESOLVER_LANG = "en-US"
 
@@ -233,12 +237,13 @@ open class Streamly : MainAPI() {
 
         /**
          * Picks a title logo from TMDB so the result page can render it in
-         * place of the text title. Preference: Arabic raster logo → any
-         * Arabic logo → English raster → any English logo → highest-voted
-         * raster → highest-voted SVG. The voted fallbacks are language-blind
-         * (a Portuguese logo once won on votes), so English is pinned first.
+         * place of the text title. Preference: selected-language raster logo
+         * → any selected-language logo → English raster → any English logo →
+         * highest-voted raster → highest-voted SVG. The voted fallbacks are
+         * language-blind (a Portuguese logo once won on votes), so English
+         * is pinned first.
          */
-        suspend fun fetchLogoUrl(tmdbId: Int?, isMovie: Boolean): String? {
+        suspend fun fetchLogoUrl(tmdbId: Int?, isMovie: Boolean, lang: String = "ar"): String? {
             if (tmdbId == null) return null
             val kind = if (isMovie) "movie" else "tv"
             val images = runCatching {
@@ -255,8 +260,8 @@ open class Streamly : MainAPI() {
             fun voted(e: LogoEntry) = (e.voteAverage ?: 0.0) > 0.0 && (e.voteCount ?: 0) > 0
             val byVote = compareBy<LogoEntry>({ it.voteAverage ?: 0.0 }, { it.voteCount ?: 0 })
 
-            logos.firstOrNull { it.lang == LANG && !isSvg(it) }?.let { return urlOf(it) }
-            logos.firstOrNull { it.lang == LANG }?.let { return urlOf(it) }
+            logos.firstOrNull { it.lang == lang && !isSvg(it) }?.let { return urlOf(it) }
+            logos.firstOrNull { it.lang == lang }?.let { return urlOf(it) }
             logos.firstOrNull { it.lang == "en" && !isSvg(it) }?.let { return urlOf(it) }
             logos.firstOrNull { it.lang == "en" }?.let { return urlOf(it) }
             logos.filter { voted(it) && !isSvg(it) }.maxWithOrNull(byVote)?.let { return urlOf(it) }
@@ -306,7 +311,7 @@ open class Streamly : MainAPI() {
         val fallbackType = if (request.data.contains("/movie")) "movie" else "tv"
 
         val home = app.get(
-            url = "$TMDB_API${request.data}&language=$LANG&page=$page",
+            url = "$TMDB_API${request.data}&language=$langCode&page=$page",
             timeout = 10000,
         ).parsedSafe<Results>()?.results?.mapNotNull { it.toSearchResponse(fallbackType) } ?: emptyList()
 
@@ -318,7 +323,7 @@ open class Streamly : MainAPI() {
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
         StreamlyRuntime.context = CommonActivity.activity
-        return app.get("$TMDB_API/search/multi?api_key=$apiKey&language=$LANG&query=$query&page=$page&include_adult=false")
+        return app.get("$TMDB_API/search/multi?api_key=$apiKey&language=$langCode&query=$query&page=$page&include_adult=false")
             .parsedSafe<Results>()?.results
             ?.mapNotNull { it.toSearchResponse() }
             ?.toNewSearchResponseList()
@@ -335,16 +340,16 @@ open class Streamly : MainAPI() {
         }
 
         val resUrl = if (type == TvType.Movie) {
-            "$TMDB_API/movie/${data.id}?api_key=$apiKey&language=$LANG&append_to_response=$append"
+            "$TMDB_API/movie/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
         } else {
-            "$TMDB_API/tv/${data.id}?api_key=$apiKey&language=$LANG&append_to_response=$append"
+            "$TMDB_API/tv/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
         }
 
         val res = app.get(resUrl, timeout = 10000).parsedSafe<MediaDetail>()
             ?: throw ErrorLoadingException("Invalid Json Response")
 
         // English detail for the link resolver (TopCinema slugs are Latin-script)
-        val enResUrl = if (LANG != RESOLVER_LANG) {
+        val enResUrl = if (langCode != RESOLVER_LANG) {
             if (type == TvType.Movie) {
                 "$TMDB_API/movie/${data.id}?api_key=$apiKey&language=$RESOLVER_LANG"
             } else {
@@ -393,13 +398,13 @@ open class Streamly : MainAPI() {
             var logoUrl: String? = null
             val episodes: List<Episode> = coroutineScope {
                 val logoDeferred = async {
-                    withTimeoutOrNull(3000L) { fetchLogoUrl(data.id, isMovie = false) }
+                    withTimeoutOrNull(3000L) { fetchLogoUrl(data.id, isMovie = false, langCode.substringBefore("-").lowercase()) }
                 }
                 val eps = res.seasons?.amap { season ->
                     async {
                         try {
                             app.get(
-                                "$TMDB_API/tv/${data.id}/season/${season.seasonNumber}?api_key=$apiKey&language=$LANG",
+                                "$TMDB_API/tv/${data.id}/season/${season.seasonNumber}?api_key=$apiKey&language=$langCode",
                                 timeout = 10000
                             ).parsedSafe<MediaDetailEpisodes>()
                                 ?.episodes
@@ -418,11 +423,8 @@ open class Streamly : MainAPI() {
                                         this.season = eps.seasonNumber
                                         this.episode = eps.episodeNumber
                                         this.posterUrl = getImageUrl(eps.stillPath)
-                                        val showMeta = sharedPref?.getBoolean("show_episode_meta", false) ?: false
-                                        if (showMeta) {
-                                            this.score = Score.from10(eps.voteAverage)
-                                            this.description = eps.overview
-                                        }
+                                        this.score = Score.from10(eps.voteAverage)
+                                        this.description = eps.overview
                                         this.runTime = eps.runTime
                                     }.apply {
                                         addDate(eps.airDate)
@@ -454,7 +456,7 @@ open class Streamly : MainAPI() {
                 addImdbId(res.externalIds?.imdbId)
             }
         } else {
-            val logoUrl = withTimeoutOrNull(3000L) { fetchLogoUrl(data.id, isMovie = true) }
+            val logoUrl = withTimeoutOrNull(3000L) { fetchLogoUrl(data.id, isMovie = true, langCode.substringBefore("-").lowercase()) }
             return newMovieLoadResponse(
                 title,
                 url,
