@@ -51,4 +51,6 @@ dependencies {
     // AppCompatActivity (provider settings host) + Fragment (DialogFragment),
     // pulled in transitively the same way StreamPlay gets them.
     implementation("androidx.appcompat:appcompat:1.7.1")
+    // Language picker list (ported from StreamPlay).
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
 }
