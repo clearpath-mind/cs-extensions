@@ -68,19 +68,32 @@ class StreamlyMainSettingsFragment(
             view.background = res.getDrawable(bgId, null)
         }
 
-        val saveIcon = view.findView<ImageView>("saveIcon")
+        val saveBtn: View = view.findView("saveIcon")
+        saveBtn.makeTvCompatible()
+        val saveIcon = view.findView<ImageView>("saveIconImg")
         saveIcon.setImageDrawable(getDrawable("save_icon"))
-        saveIcon.makeTvCompatible()
+        saveIcon.isFocusable = false
+        saveIcon.isClickable = false
 
         val providersRow: View = view.findView("providersRow")
+        val providersIconBg = view.findView<View>("providersIconBg")
         val providersIcon = view.findView<ImageView>("providersIcon")
+        val chevronProviders = view.findView<ImageView>("chevronProviders")
         providersRow.background = getDrawable("settings_item_background")
-        providersIcon.setImageDrawable(getDrawable("settings_icon"))
+        providersIconBg.background = getDrawable("ic_icon_bg_blue")
+        providersIcon.setImageDrawable(getDrawable("ic_providers"))
+        chevronProviders.setImageDrawable(getDrawable("ic_chevron"))
+        providersRow.nextFocusUpId = saveBtn.id
 
         val languageRow: View = view.findView("languageRow")
+        val languageIconBg = view.findView<View>("languageIconBg")
         val languageIcon = view.findView<ImageView>("languageIcon")
+        val chevronLanguage = view.findView<ImageView>("chevronLanguage")
         languageRow.background = getDrawable("settings_item_background")
-        languageIcon.setImageDrawable(getDrawable("settings_icon"))
+        languageIconBg.background = getDrawable("ic_icon_bg_green")
+        languageIcon.setImageDrawable(getDrawable("ic_language"))
+        chevronLanguage.setImageDrawable(getDrawable("ic_chevron"))
+        languageRow.nextFocusUpId = providersRow.id
 
         val showSubFragment = { fragmentCreator: (() -> Unit) -> DialogFragment, tag: String ->
             val fm = activity?.supportFragmentManager
@@ -102,7 +115,7 @@ class StreamlyMainSettingsFragment(
             showSubFragment({ cb -> StreamlyLanguageFragment(plugin, sharedPref, cb) }, "streamly_language")
         }
 
-        saveIcon.setOnClickListener {
+        saveBtn.setOnClickListener {
             AlertDialog.Builder(requireContext())
                 .setTitle("Restart Required")
                 .setMessage("Settings have been saved. Restart the app to apply them?")

@@ -20,6 +20,7 @@ import androidx.core.content.edit
 import androidx.core.view.isNotEmpty
 import androidx.core.widget.addTextChangedListener
 import androidx.fragment.app.DialogFragment
+import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.streamly.BuildConfig
 import com.streamly.Provider
 import com.streamly.ProvidersList
@@ -35,10 +36,14 @@ class StreamlyProvidersFragment(
     private lateinit var btnSave: ImageButton
     private lateinit var btnSelectAll: Button
     private lateinit var btnDeselectAll: Button
+    private lateinit var btnSaveProfile: Button
+    private lateinit var btnLoadProfile: Button
+    private lateinit var btnDeleteProfile: Button
     private lateinit var adapter: ProviderAdapter
     private lateinit var container: LinearLayout
     private var providers: List<Provider> = emptyList()
     private val PREFS_DISABLED = "disabled_providers"
+    private val PREFS_PROFILE = "provider_profile"
     private lateinit var tvProviderCount: TextView
 
     private fun <T : View> View.findView(name: String): T {
@@ -107,10 +112,9 @@ class StreamlyProvidersFragment(
 
         btnSelectAll = view.findView("btn_select_all")
         btnDeselectAll = view.findView("btn_deselect_all")
-        btnSelectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#1F6FEB"))
-        btnSelectAll.setTextColor(android.graphics.Color.WHITE)
-        btnDeselectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#BB2D3B"))
-        btnDeselectAll.setTextColor(android.graphics.Color.WHITE)
+        btnSaveProfile = view.findView("btn_save_profile")
+        btnLoadProfile = view.findView("btn_load_profile")
+        btnDeleteProfile = view.findView("btn_delete_profile")
         container = view.findView("list_container")
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
@@ -179,6 +183,25 @@ class StreamlyProvidersFragment(
 
         btnSelectAll.setOnClickListener { adapter.setAll(true) }
         btnDeselectAll.setOnClickListener { adapter.setAll(false) }
+        btnSaveProfile.setOnClickListener {
+            val snapshot = providers.filter { adapter.isDisabled(it.id) }.map { it.id }.toSet()
+            sharedPref.edit { putStringSet(PREFS_PROFILE, snapshot) }
+            showToast("Profile saved (${providers.size - snapshot.size} / ${providers.size} enabled)")
+        }
+        btnLoadProfile.setOnClickListener {
+            val profile = sharedPref.getStringSet(PREFS_PROFILE, null)
+            if (profile == null) {
+                showToast("No saved profile")
+            } else {
+                adapter.setAll(true)
+                profile.forEach { adapter.setDisabled(it, true) }
+                showToast("Profile loaded")
+            }
+        }
+        btnDeleteProfile.setOnClickListener {
+            sharedPref.edit { remove(PREFS_PROFILE) }
+            showToast("Profile deleted")
+        }
         btnSave.setOnClickListener { dismissFragment() }
     }
 

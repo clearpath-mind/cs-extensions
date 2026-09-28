@@ -94,7 +94,8 @@
                 android:layout_weight="1"
                 android:text="SELECT ALL"
                 android:textAllCaps="true"
-                android:backgroundTint="#1F6FEB"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_green_selector"
                 android:focusable="true"
                 android:nextFocusRight="@id/btn_deselect_all"/>
 
@@ -109,9 +110,81 @@
                 android:layout_weight="1"
                 android:text="SELECT NONE"
                 android:textAllCaps="true"
-                android:backgroundTint="#BB2D3B"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_red_selector"
                 android:focusable="true"
                 android:nextFocusLeft="@id/btn_select_all"/>
+        </LinearLayout>
+
+        <!-- DIVIDER -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#33FFFFFF"
+            android:layout_marginBottom="14dp"/>
+
+        <!-- SAVE / LOAD / DELETE PROFILE -->
+        <LinearLayout
+            android:id="@+id/profile_buttons"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="14dp">
+
+            <Button
+                android:id="@+id/btn_save_profile"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:text="SAVE PROFILE"
+                android:textAllCaps="true"
+                android:textColor="#FFFFFF"
+                android:maxLines="2"
+                android:lineSpacingExtra="0dp"
+                android:textAlignment="viewStart"
+                android:background="@drawable/btn_blue_selector"
+                android:focusable="true"/>
+
+            <Space
+                android:layout_width="8dp"
+                android:layout_height="wrap_content"/>
+
+            <Button
+                android:id="@+id/btn_load_profile"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:text="LOAD PROFILE"
+                android:textAllCaps="true"
+                android:textColor="#FFFFFF"
+                android:maxLines="2"
+                android:lineSpacingExtra="0dp"
+                android:textAlignment="viewStart"
+                android:background="@drawable/btn_green_selector"
+                android:focusable="true"/>
+
+            <Space
+                android:layout_width="8dp"
+                android:layout_height="wrap_content"/>
+
+            <Button
+                android:id="@+id/btn_delete_profile"
+                android:layout_width="0dp"
+                android:layout_height="56dp"
+                android:layout_weight="1"
+                android:gravity="center"
+                android:text="DELETE PROFILE"
+                android:textAllCaps="true"
+                android:textColor="#FFFFFF"
+                android:maxLines="2"
+                android:lineSpacingExtra="0dp"
+                android:textAlignment="viewStart"
+                android:background="@drawable/btn_red_selector"
+                android:focusable="true"
+                android:nextFocusDown="@id/ext_search"/>
         </LinearLayout>
 
         <!-- DIVIDER -->
@@ -144,7 +217,7 @@
                 android:inputType="text"
                 android:imeOptions="actionSearch|flagNoExtractUi"
                 android:maxLines="1"
-                android:background="?android:attr/editTextBackground"
+                android:background="@drawable/input_text_selector"
                 android:nextFocusUp="@id/btn_select_all"
                 android:nextFocusDown="@id/list_container"/>
         </LinearLayout>
