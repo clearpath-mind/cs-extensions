@@ -95,7 +95,6 @@
                 android:text="SELECT ALL"
                 android:textAllCaps="true"
                 android:textColor="#FFFFFF"
-                android:background="@drawable/btn_green_selector"
                 android:focusable="true"
                 android:nextFocusRight="@id/btn_deselect_all"/>
 
@@ -111,7 +110,6 @@
                 android:text="SELECT NONE"
                 android:textAllCaps="true"
                 android:textColor="#FFFFFF"
-                android:background="@drawable/btn_red_selector"
                 android:focusable="true"
                 android:nextFocusLeft="@id/btn_select_all"/>
         </LinearLayout>
@@ -144,7 +142,6 @@
                 android:maxLines="2"
                 android:lineSpacingExtra="0dp"
                 android:textAlignment="viewStart"
-                android:background="@drawable/btn_blue_selector"
                 android:focusable="true"/>
 
             <Space
@@ -163,7 +160,6 @@
                 android:maxLines="2"
                 android:lineSpacingExtra="0dp"
                 android:textAlignment="viewStart"
-                android:background="@drawable/btn_green_selector"
                 android:focusable="true"/>
 
             <Space
@@ -182,7 +178,6 @@
                 android:maxLines="2"
                 android:lineSpacingExtra="0dp"
                 android:textAlignment="viewStart"
-                android:background="@drawable/btn_red_selector"
                 android:focusable="true"
                 android:nextFocusDown="@id/ext_search"/>
         </LinearLayout>
@@ -217,7 +212,6 @@
                 android:inputType="text"
                 android:imeOptions="actionSearch|flagNoExtractUi"
                 android:maxLines="1"
-                android:background="@drawable/input_text_selector"
                 android:nextFocusUp="@id/btn_select_all"
                 android:nextFocusDown="@id/list_container"/>
         </LinearLayout>
