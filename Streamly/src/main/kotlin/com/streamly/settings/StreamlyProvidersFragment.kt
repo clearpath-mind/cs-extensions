@@ -106,6 +106,8 @@ class StreamlyProvidersFragment(
         btnDeselectAll = view.findView("btn_deselect_all")
         btnSelectAll.background = getDrawable("btn_green_selector")
         btnDeselectAll.background = getDrawable("btn_red_selector")
+        btnSelectAll.backgroundTintList = null
+        btnDeselectAll.backgroundTintList = null
         container = view.findView("list_container")
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }

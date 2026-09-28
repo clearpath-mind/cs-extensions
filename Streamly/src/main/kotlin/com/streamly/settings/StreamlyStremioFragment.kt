@@ -115,6 +115,7 @@ class StreamlyStremioFragment(
 
         val btnAdd = view.findView<Button>("btn_add_addon")
         btnAdd.background = getDrawable("btn_green_selector")
+        btnAdd.backgroundTintList = null
         btnAdd.setOnClickListener { addAddon() }
 
         renderAddons()
@@ -134,6 +135,7 @@ class StreamlyStremioFragment(
                 else -> type == StreamlyStremioAddonType.DEBRID
             }
             btn.background = if (isSelected) selectedBg else unselectedBg
+            btn.backgroundTintList = null
             btn.setTextColor(if (isSelected) selectedText else unselectedText)
         }
     }
