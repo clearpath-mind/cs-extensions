@@ -124,6 +124,8 @@ class StreamlyStremioFragment(
         selectedType = type
         val selectedBg = getDrawable("btn_blue_selector")
         val unselectedBg = getDrawable("settings_item_background")
+        val selectedText = android.graphics.Color.WHITE
+        val unselectedText = android.graphics.Color.parseColor("#888888")
         typeButtons.forEach { btn ->
             val isSelected = when (btn.id) {
                 res.getIdentifier("btn_type_https", "id", BuildConfig.LIBRARY_PACKAGE_NAME) -> type == StreamlyStremioAddonType.HTTPS
@@ -132,6 +134,7 @@ class StreamlyStremioFragment(
                 else -> type == StreamlyStremioAddonType.DEBRID
             }
             btn.background = if (isSelected) selectedBg else unselectedBg
+            btn.setTextColor(if (isSelected) selectedText else unselectedText)
         }
     }
 
@@ -173,36 +176,53 @@ class StreamlyStremioFragment(
             showToast("Enter a manifest URL")
             return
         }
-        if (!url.startsWith("http://") && !url.startsWith("https://") && !url.startsWith("stremio://")) {
-            url = "https://$url"
-        }
+        if (url.startsWith("stremio://")) url = "https://" + url.removePrefix("stremio://")
+        if (!url.startsWith("http://") && !url.startsWith("https://")) url = "https://$url"
         val base = url.trimEnd('/').removeSuffix("/manifest.json")
+        // Some instances (e.g. akwam.driviumapp.com) serve a broken TLS cert:
+        // try https first, then fall back to http and store whichever works.
+        val bases = mutableListOf(base)
+        if (base.startsWith("https://")) bases.add("http://" + base.removePrefix("https://"))
         CoroutineScope(Dispatchers.IO).launch {
-            val manifest = runCatching {
-                app.get("$base/manifest.json", timeout = 15000)
-                    .parsedSafe<StreamlyStremioManifest>()
-            }.getOrNull()
+            var manifest: StreamlyStremioManifest? = null
+            var workingBase: String? = null
+            for (candidate in bases) {
+                manifest = runCatching {
+                    app.get("$candidate/manifest.json", timeout = 15000)
+                        .parsedSafe<StreamlyStremioManifest>()
+                        .takeIf { !it?.id.isNullOrBlank() }
+                }.getOrNull()
+                if (manifest != null) {
+                    workingBase = candidate
+                    break
+                }
+            }
             view?.post {
                 if (!isAdded) return@post
-                if (manifest?.id.isNullOrBlank()) {
+                val addonBase = workingBase
+                if (manifest == null || addonBase == null) {
                     showToast("Invalid addon (no manifest.json)")
                     return@post
                 }
-                val addonName = name.ifBlank { manifest?.name ?: base }
+                val addonName = name.ifBlank { manifest.name ?: addonBase }
                 val current = StreamlyStremioSettings.getStremioAddons(sharedPref).toMutableList()
-                current.removeAll { it.url.trimEnd('/') == base }
+                current.removeAll { it.url.trimEnd('/') == addonBase }
                 current.add(
                     StreamlyStremioAddon(
                         id = System.currentTimeMillis(),
                         name = addonName,
-                        url = base,
+                        url = addonBase,
                         type = selectedType
                     )
                 )
                 StreamlyStremioSettings.saveStremioAddons(sharedPref, current)
                 etName.text.clear()
                 etUrl.text.clear()
-                showToast("Addon added: $addonName")
+                if (addonBase.startsWith("http://")) {
+                    showToast("Addon added via http (https cert failed)")
+                } else {
+                    showToast("Addon added: $addonName")
+                }
                 renderAddons()
             }
         }
