@@ -402,19 +402,19 @@ object MegaMaxExtractor {
     }
 
     private fun tagMegaQuality(link: ExtractorLink, label: String, height: Int): ExtractorLink {
+        // Quality travels in the numeric field only (player badge). Never bake
+        // the page label into the name: labels like "SOURCE" or misparsed
+        // heights ("804p") otherwise duplicate/clash with the badge.
         val mapped = megaQuality(height)
         val wantQuality =
             if (link.quality == Qualities.Unknown.value && mapped != Qualities.Unknown.value) mapped
             else link.quality
-        val wantName =
-            if (label.isBlank() || link.name.contains(label, ignoreCase = true)) link.name
-            else "${link.name} $label"
-        if (wantQuality == link.quality && wantName == link.name) return link
+        if (wantQuality == link.quality) return link
         return runCatching {
             @Suppress("DEPRECATION")
             com.lagradost.cloudstream3.utils.ExtractorLink(
                 source = link.source,
-                name = wantName,
+                name = link.name,
                 url = link.url,
                 referer = link.referer,
                 quality = wantQuality,
@@ -423,6 +423,18 @@ object MegaMaxExtractor {
                 type = link.type,
             )
         }.getOrElse { link }
+    }
+
+    /** Strip trailing quality tokens servers bake into their labels
+     *  ("MixDrop 1080p", "Luluvdo (720p)", "Server 4K") so the row shows
+     *  the server once and quality only via the badge. */
+    private fun cleanServerName(raw: String?): String? {
+        var name = raw?.trim().takeIf { !it.isNullOrBlank() } ?: return raw
+        name = name.replace(Regex("""(?i)\s*[\[(]?\d{3,4}\s*p[\])]?\s*$"""), "")
+            .replace(Regex("""(?i)\s*[\[(]?\d+\s*K[\])]?\s*$"""), "")
+            .replace(Regex("""(?i)\s*[\[(]?(HD|HQ|CAM|HDTC)[\])]?\s*$"""), "")
+            .trim()
+        return name.ifBlank { raw?.trim() }
     }
 
     suspend fun extract(
@@ -2789,7 +2801,7 @@ private suspend fun egDeadWatchServers(
                     // Label with the server name so the player list reads
                     // "EgyDead [StreamHG]" instead of a bare "EgyDead".
                     val serverLabel = if (!name.isNullOrBlank() && name != "?") {
-                        "$providerLabel [$name]"
+                        "$providerLabel [${cleanServerName(name)}]"
                     } else {
                         "$providerLabel [${faselHdHostOf(link)}]"
                     }
