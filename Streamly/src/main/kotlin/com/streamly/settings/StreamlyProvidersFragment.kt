@@ -11,14 +11,11 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.annotation.RequiresApi
 import androidx.core.content.edit
-import androidx.core.view.isNotEmpty
-import androidx.core.widget.addTextChangedListener
 import androidx.fragment.app.DialogFragment
 import com.streamly.BuildConfig
 import com.streamly.Provider
@@ -113,33 +110,6 @@ class StreamlyProvidersFragment(
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
 
-        val etSearch = view.findView<EditText>("ext_search")
-        etSearch.background = getDrawable("input_text_selector")
-        etSearch.addTextChangedListener { text ->
-            val query = text.toString().lowercase().trim()
-            val chkId = res.getIdentifier("chk_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
-            for (i in 0 until container.childCount) {
-                val item = container.getChildAt(i)
-                val chk = item.findViewById<CheckBox>(chkId)
-                item.visibility = if (query.isEmpty() || chk.text.toString().lowercase().contains(query)) {
-                    View.VISIBLE
-                } else {
-                    View.GONE
-                }
-            }
-        }
-
-        etSearch.setOnEditorActionListener { _, _, _ ->
-            for (i in 0 until container.childCount) {
-                val item = container.getChildAt(i)
-                if (item.visibility == View.VISIBLE) {
-                    item.requestFocus()
-                    break
-                }
-            }
-            true
-        }
-
         val savedDisabled = sharedPref.getStringSet(PREFS_DISABLED, emptySet()) ?: emptySet()
 
         adapter = ProviderAdapter(providers, savedDisabled) { disabled ->
@@ -164,14 +134,6 @@ class StreamlyProvidersFragment(
 
             container.addView(item)
             updateProviderCount()
-        }
-        container.post {
-            if (container.isNotEmpty()) {
-                val firstItem = container.getChildAt(0)
-                firstItem.isFocusable = true
-                firstItem.requestFocusFromTouch()
-                firstItem.nextFocusUpId = btnSave.id
-            }
         }
 
         btnSelectAll.setOnClickListener { adapter.setAll(true) }
