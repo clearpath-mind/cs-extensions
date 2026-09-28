@@ -27,8 +27,28 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
  * preserved untouched so the player offers every variant for slow networks.
  */
 fun relabelLink(link: ExtractorLink, providerName: String?): ExtractorLink {
-    val baseName = link.name.trim().ifBlank { link.name.trim() }
-    if (providerName.isNullOrBlank() || baseName.startsWith("$providerName ") || baseName.startsWith("$providerName [")) return link
+    // Drop trailing quality tokens extractors bake into names ("MixDrop 720p")
+    // so quality shows once, via the badge.
+    val cleaned = link.name.trim()
+        .replace(Regex("""(?i)\s*[\[(]?\d{3,4}\s*p[\])]?\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?\d+\s*K[\])]?\s*$"""), "")
+        .trim().ifBlank { link.name.trim() }
+    val baseName = cleaned
+    if (providerName.isNullOrBlank() || baseName.startsWith("$providerName ") || baseName.startsWith("$providerName [")) {
+        return if (cleaned != link.name.trim()) {
+            @Suppress("DEPRECATION")
+            ExtractorLink(
+                source = link.source,
+                name = cleaned,
+                url = link.url,
+                referer = link.referer,
+                quality = link.quality,
+                headers = link.headers,
+                extractorData = link.extractorData,
+                type = link.type,
+            )
+        } else link
+    }
     return runCatching {
         @Suppress("DEPRECATION")
         ExtractorLink(
