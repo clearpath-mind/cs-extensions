@@ -112,14 +112,20 @@ class StreamlyProvidersFragment(
 
         btnSelectAll = view.findView("btn_select_all")
         btnDeselectAll = view.findView("btn_deselect_all")
+        btnSelectAll.background = getDrawable("btn_green_selector")
+        btnDeselectAll.background = getDrawable("btn_red_selector")
         btnSaveProfile = view.findView("btn_save_profile")
         btnLoadProfile = view.findView("btn_load_profile")
         btnDeleteProfile = view.findView("btn_delete_profile")
+        btnSaveProfile.background = getDrawable("btn_blue_selector")
+        btnLoadProfile.background = getDrawable("btn_green_selector")
+        btnDeleteProfile.background = getDrawable("btn_red_selector")
         container = view.findView("list_container")
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
 
         val etSearch = view.findView<EditText>("ext_search")
+        etSearch.background = getDrawable("input_text_selector")
         etSearch.addTextChangedListener { text ->
             val query = text.toString().lowercase().trim()
             val chkId = res.getIdentifier("chk_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
