@@ -35,6 +35,7 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.streamly.settings.StreamlyStremioSettings
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -53,6 +54,7 @@ data class LinkData(
     @JsonProperty("year") val year: Int? = null,
     @JsonProperty("season") val season: Int? = null,
     @JsonProperty("episode") val episode: Int? = null,
+    @JsonProperty("imdbId") val imdbId: String? = null,
 ) {
     val isMovie get() = type == "movie"
 }
@@ -417,6 +419,7 @@ open class Streamly : MainAPI() {
                                             year = year,
                                             season = eps.seasonNumber,
                                             episode = eps.episodeNumber,
+                                            imdbId = res.externalIds?.imdbId,
                                         ).toJson()
                                     ) {
                                         this.name = eps.name
@@ -466,6 +469,7 @@ open class Streamly : MainAPI() {
                     type = data.type,
                     title = searchTitle,
                     year = year,
+                    imdbId = res.externalIds?.imdbId,
                 ).toJson(),
             ) {
                 try { this.logoUrl = logoUrl } catch (_: Throwable) {}
@@ -604,7 +608,19 @@ open class Streamly : MainAPI() {
             }
         }
 
-        StreamlyConcurrency.runLimitedAsync(appContext, *tasks.toTypedArray())
+        // Stremio addons race alongside providers (no-ops when none saved
+        // or when TMDB gave no imdbId).
+        val stremioTasks: List<suspend () -> Unit> =
+            StreamlyStremioSettings.getDynamicStremioMap(
+                sharedPref,
+                res.imdbId,
+                res.season,
+                res.episode,
+                dedupSub,
+                dedupCallback,
+            ).values.toList()
+
+        StreamlyConcurrency.runLimitedAsync(appContext, *(tasks + stremioTasks).toTypedArray())
         sharedPref?.let { StreamlyCache.saveProviderStats(it) }
         if (seenLinks.isNotEmpty()) Log.d(TAG, "[done  ] distinct links=${seenLinks.size}")
         true
