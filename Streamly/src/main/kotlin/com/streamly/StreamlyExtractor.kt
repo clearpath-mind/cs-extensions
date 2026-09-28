@@ -1779,7 +1779,7 @@ private suspend fun faselHdExtractServers(
                 val m3u8 = faselHdResolveWebView(iframe, postUrl)
                 if (!m3u8.isNullOrBlank()) {
                     Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
-                    faselHdEmitResolved(m3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
+                    faselHdEmitResolved(m3u8, iframe, base, callback, "FaselHD [Server ${idx + 1}]")
                     idx
                 } else {
                     // Probe the token page size: a dead/rotated token serves a tiny
@@ -1815,7 +1815,7 @@ private suspend fun faselHdExtractServers(
             Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${faselHdHostOf(iframe)} fast-scan HIT enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
             found = true
             resolved = true
-            faselHdEmitResolved(fastM3u8, iframe, base, callback, "FaselHD - Server ${idx + 1}")
+            faselHdEmitResolved(fastM3u8, iframe, base, callback, "FaselHD [Server ${idx + 1}]")
             continue
         }
         val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
@@ -1824,7 +1824,7 @@ private suspend fun faselHdExtractServers(
             found = true
             resolved = true
             callback(
-                newExtractorLink("FaselHD - Server ${idx + 1} MP4", "FaselHD - Server ${idx + 1} MP4", fastMp4) {
+                newExtractorLink("FaselHD [Server ${idx + 1} MP4]", "FaselHD [Server ${idx + 1} MP4]", fastMp4) {
                     this.referer = iframe
                     this.quality = getQualityFromName(fastMp4)
                     this.type = ExtractorLinkType.VIDEO
@@ -1839,7 +1839,7 @@ private suspend fun faselHdExtractServers(
     for ((idx, iframe) in iframes.withIndex()) {
         if (idx in resolvedIdx) continue
         Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} unresolved, routing via EmbedRouter")
-        EmbedRouter.route(iframe, postUrl, subtitleCallback, callback, "FaselHD - Server ${idx + 1}")
+        EmbedRouter.route(iframe, postUrl, subtitleCallback, callback, "FaselHD [Server ${idx + 1}]")
         found = true
     }
     Log.d(FASELHD_TAG, "[watch  ] resolve done in ${SystemClock.elapsedRealtime() - tWatch}ms resolved=$resolved")
@@ -1874,7 +1874,7 @@ private suspend fun faselHdExtractServers(
                     if (!mp4.isNullOrBlank()) {
                         found = true
                         callback(
-                            newExtractorLink("FaselHD MP4", "FaselHD MP4", mp4) {
+                            newExtractorLink("FaselHD [MP4]", "FaselHD [MP4]", mp4) {
                                 this.referer = iframeSrc
                                 this.quality = getQualityFromName(mp4)
                                 this.type = ExtractorLinkType.VIDEO
@@ -1914,7 +1914,7 @@ private suspend fun faselHdExtractServers(
             if (dlLink.isNotBlank()) {
                 found = true
                 callback(
-                    newExtractorLink("FaselHD - Direct", "FaselHD - Direct", dlLink) {
+                    newExtractorLink("FaselHD [Direct]", "FaselHD [Direct]", dlLink) {
                         this.referer = postUrl
                         this.quality = getQualityFromName(dlLink)
                         this.type = ExtractorLinkType.VIDEO
@@ -2589,12 +2589,12 @@ private suspend fun egDeadResolveMovie(
         return false
     }
     // Include every top qualifying post (cap 3): subtitled + dubbed
-    // versions resolve side by side, tagged "EgyDead" / "EgyDead Dub".
+    // versions resolve side by side, tagged "EgyDead" / "EgyDead • DUB".
     val winners = above.sortedByDescending { it.second }.take(3).map { it.first }
     var ok = false
     winners.forEachIndexed { i, post ->
         Log.d(EGDEAD_TAG, "[match  ] WINNER ${i + 1}/${winners.size} ${post.url} dub=${post.isDub}")
-        val label = if (post.isDub) "EgyDead Dub" else "EgyDead"
+        val label = if (post.isDub) "EgyDead • DUB" else "EgyDead"
         ok = egDeadWatchServers(post.url, subtitleCallback, callback, label) || ok
     }
     return ok
@@ -2787,11 +2787,11 @@ private suspend fun egDeadWatchServers(
                     // The JS loader redirects to rotating player hosts. Use one
                     // bounded WebView attempt, not the shared challenge queue.
                     // Label with the server name so the player list reads
-                    // "EgyDead - StreamHG" instead of a bare "EgyDead".
+                    // "EgyDead [StreamHG]" instead of a bare "EgyDead".
                     val serverLabel = if (!name.isNullOrBlank() && name != "?") {
-                        "$providerLabel - $name"
+                        "$providerLabel [$name]"
                     } else {
-                        "$providerLabel - ${faselHdHostOf(link)}"
+                        "$providerLabel [${faselHdHostOf(link)}]"
                     }
                     // Cheap path first: hgcloud.to is StreamWish-family
                     // (upstream Hgcloudto), so the packed-JWPlayer parse often
