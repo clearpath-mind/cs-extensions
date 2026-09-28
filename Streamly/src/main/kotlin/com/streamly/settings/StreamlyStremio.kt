@@ -239,7 +239,7 @@ suspend fun invokeStremioSubtitles(
     subtitleResponse.subtitles.forEach { emitStremioSubtitle(it, subtitleCallback) }
 }
 
-private fun emitStremioSubtitle(subtitle: StreamlyStremioSubtitle, subtitleCallback: (SubtitleFile) -> Unit) {
+private suspend fun emitStremioSubtitle(subtitle: StreamlyStremioSubtitle, subtitleCallback: (SubtitleFile) -> Unit) {
     val lang = subtitle.lang ?: subtitle.langCode ?: return
     val fileUrl = subtitle.url ?: return
     subtitleCallback.invoke(newSubtitleFile(mapStremioLang(lang), fileUrl))
