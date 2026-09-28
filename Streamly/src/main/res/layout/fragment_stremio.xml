@@ -89,19 +89,12 @@
             android:layout_marginBottom="8dp"/>
 
         <EditText
-            android:id="@+id/et_addon_name"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:hint="Name (e.g. Akwam)"
-            android:inputType="text"
-            android:maxLines="1"
-            android:layout_marginBottom="8dp"/>
-
-        <EditText
             android:id="@+id/et_addon_url"
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:hint="Manifest URL (https://…)"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
             android:inputType="textUri"
             android:maxLines="1"
             android:layout_marginBottom="8dp"/>

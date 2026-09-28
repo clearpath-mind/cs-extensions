@@ -137,7 +137,7 @@ class StreamlyLanguageFragment(
 
         recycler.layoutManager = LinearLayoutManager(requireContext())
 
-        val savedCode = sharedPref.getString("tmdb_language_code", "ar-SA") ?: "ar-SA"
+        val savedCode = sharedPref.getString("tmdb_language_code", "en-US") ?: "en-US"
 
         adapter = LanguageAdapter(
             languages.sortedBy { it.first.lowercase() },

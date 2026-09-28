@@ -32,7 +32,6 @@ class StreamlyStremioFragment(
 
     private val res = plugin.resources ?: throw Exception("Unable to access plugin resources")
     private lateinit var container: LinearLayout
-    private lateinit var etName: EditText
     private lateinit var etUrl: EditText
     private var selectedType: StreamlyStremioAddonType = StreamlyStremioAddonType.HTTPS
     private val typeButtons = mutableListOf<Button>()
@@ -97,9 +96,7 @@ class StreamlyStremioFragment(
         btnSave.makeTvCompatible()
         btnSave.setOnClickListener { dismiss() }
 
-        etName = view.findView("et_addon_name")
         etUrl = view.findView("et_addon_url")
-        etName.background = getDrawable("input_text_selector")
         etUrl.background = getDrawable("input_text_selector")
 
         val btnHttps = view.findView<Button>("btn_type_https")
@@ -170,7 +167,6 @@ class StreamlyStremioFragment(
 
     @SuppressLint("SetTextI18n")
     private fun addAddon() {
-        val name = etName.text.toString().trim()
         var url = etUrl.text.toString().trim()
         if (url.isEmpty()) {
             showToast("Enter a manifest URL")
@@ -204,7 +200,7 @@ class StreamlyStremioFragment(
                     showToast("Invalid addon (no manifest.json)")
                     return@post
                 }
-                val addonName = name.ifBlank { manifest.name ?: addonBase }
+                val addonName = manifest.name ?: addonBase
                 val current = StreamlyStremioSettings.getStremioAddons(sharedPref).toMutableList()
                 current.removeAll { it.url.trimEnd('/') == addonBase }
                 current.add(
@@ -216,7 +212,6 @@ class StreamlyStremioFragment(
                     )
                 )
                 StreamlyStremioSettings.saveStremioAddons(sharedPref, current)
-                etName.text.clear()
                 etUrl.text.clear()
                 if (addonBase.startsWith("http://")) {
                     showToast("Addon added via http (https cert failed)")

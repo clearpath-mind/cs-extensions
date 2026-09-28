@@ -198,7 +198,7 @@ open class Streamly : MainAPI() {
 
     /** Display language for TMDB metadata (titles, plots, episode names). */
     val langCode: String
-        get() = (sharedPref ?: companionSharedPref)?.getString("tmdb_language_code", "ar-SA") ?: "ar-SA"
+        get() = (sharedPref ?: companionSharedPref)?.getString("tmdb_language_code", "en-US") ?: "en-US"
 
     /** Called by the plugin entry point — MainAPI has no context hook here. */
     fun init(context: Context) {

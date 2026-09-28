@@ -18,7 +18,7 @@
         android:id="@+id/searchLanguage"
         android:autofillHints=""
         android:hint="Search language…"
-        android:padding="10dp"
+        android:padding="12dp"
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
 
