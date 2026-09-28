@@ -247,7 +247,7 @@ private suspend fun emitStremioSubtitle(subtitle: StreamlyStremioSubtitle, subti
 
 private fun mapStremioLang(code: String): String {
     return when (code.lowercase(Locale.ROOT).substringBefore("-").substringBefore("_")) {
-        "ar" -> "Arabic"
+        "ar", "ara" -> "Arabic"
         "en" -> "English"
         "fr" -> "French"
         "es" -> "Spanish"
