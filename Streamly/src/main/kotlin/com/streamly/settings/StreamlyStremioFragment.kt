@@ -114,8 +114,7 @@ class StreamlyStremioFragment(
         selectType(selectedType)
 
         val btnAdd = view.findView<Button>("btn_add_addon")
-        btnAdd.background = getDrawable("btn_green_selector")
-        btnAdd.backgroundTintList = null
+        btnAdd.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF2E7D32"))
         btnAdd.setOnClickListener { addAddon() }
 
         renderAddons()
@@ -123,8 +122,8 @@ class StreamlyStremioFragment(
 
     private fun selectType(type: StreamlyStremioAddonType) {
         selectedType = type
-        val selectedBg = getDrawable("btn_blue_selector")
-        val unselectedBg = getDrawable("settings_item_background")
+        val selectedTint = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF1E88E5"))
+        val unselectedTint = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF2D2D2D"))
         val selectedText = android.graphics.Color.WHITE
         val unselectedText = android.graphics.Color.parseColor("#888888")
         typeButtons.forEach { btn ->
@@ -134,8 +133,7 @@ class StreamlyStremioFragment(
                 res.getIdentifier("btn_type_subtitle", "id", BuildConfig.LIBRARY_PACKAGE_NAME) -> type == StreamlyStremioAddonType.SUBTITLE
                 else -> type == StreamlyStremioAddonType.DEBRID
             }
-            btn.background = if (isSelected) selectedBg else unselectedBg
-            btn.backgroundTintList = null
+            btn.backgroundTintList = if (isSelected) selectedTint else unselectedTint
             btn.setTextColor(if (isSelected) selectedText else unselectedText)
         }
     }

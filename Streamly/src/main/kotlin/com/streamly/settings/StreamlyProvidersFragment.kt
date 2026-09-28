@@ -104,10 +104,8 @@ class StreamlyProvidersFragment(
 
         btnSelectAll = view.findView("btn_select_all")
         btnDeselectAll = view.findView("btn_deselect_all")
-        btnSelectAll.background = getDrawable("btn_green_selector")
-        btnDeselectAll.background = getDrawable("btn_red_selector")
-        btnSelectAll.backgroundTintList = null
-        btnDeselectAll.backgroundTintList = null
+        btnSelectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF2E7D32"))
+        btnDeselectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FFBB2D3B"))
         container = view.findView("list_container")
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
