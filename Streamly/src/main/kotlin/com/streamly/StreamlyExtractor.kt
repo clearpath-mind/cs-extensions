@@ -425,18 +425,6 @@ object MegaMaxExtractor {
         }.getOrElse { link }
     }
 
-    /** Strip trailing quality tokens servers bake into their labels
-     *  ("MixDrop 1080p", "Luluvdo (720p)", "Server 4K") so the row shows
-     *  the server once and quality only via the badge. */
-    private fun cleanServerName(raw: String?): String? {
-        var name = raw?.trim().takeIf { !it.isNullOrBlank() } ?: return raw
-        name = name.replace(Regex("""(?i)\s*[\[(]?\d{3,4}\s*p[\])]?\s*$"""), "")
-            .replace(Regex("""(?i)\s*[\[(]?\d+\s*K[\])]?\s*$"""), "")
-            .replace(Regex("""(?i)\s*[\[(]?(HD|HQ|CAM|HDTC)[\])]?\s*$"""), "")
-            .trim()
-        return name.ifBlank { raw?.trim() }
-    }
-
     suspend fun extract(
         pageUrl: String,
         referer: String,
@@ -1657,6 +1645,18 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
 }
 
 /** Host only, no path/query/token — safe for logs. */
+/** Strip trailing quality tokens servers bake into their labels
+ *  ("MixDrop 1080p", "Luluvdo (720p)", "Server 4K") so the row shows
+ *  the server once and quality only via the badge. */
+private fun cleanServerName(raw: String?): String? {
+    var name = raw?.trim().takeIf { !it.isNullOrBlank() } ?: return raw
+    name = name.replace(Regex("""(?i)\s*[\[(]?\d{3,4}\s*p[\])]?\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?\d+\s*K[\])]?\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?(HD|HQ|CAM|HDTC)[\])]?\s*$"""), "")
+        .trim()
+    return name.ifBlank { raw?.trim() }
+}
+
 private fun faselHdHostOf(url: String): String =
     runCatching { URI(url.substringBefore("#")).host ?: url.take(48) }.getOrDefault(url.take(48))
 
