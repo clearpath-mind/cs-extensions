@@ -28,12 +28,12 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
  */
 fun relabelLink(link: ExtractorLink, providerName: String?): ExtractorLink {
     val baseName = link.name.trim().ifBlank { link.name.trim() }
-    if (providerName.isNullOrBlank() || baseName.startsWith("$providerName ")) return link
+    if (providerName.isNullOrBlank() || baseName.startsWith("$providerName ") || baseName.startsWith("$providerName [")) return link
     return runCatching {
         @Suppress("DEPRECATION")
         ExtractorLink(
             source = link.source,
-            name = "$providerName - $baseName",
+            name = "$providerName [$baseName]",
             url = link.url,
             referer = link.referer,
             quality = link.quality,
