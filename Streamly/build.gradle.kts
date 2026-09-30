@@ -2,7 +2,7 @@
 
 import org.jetbrains.kotlin.konan.properties.Properties
 
-version = 102
+version = 103
 
 android {
     namespace = "com.streamly"
