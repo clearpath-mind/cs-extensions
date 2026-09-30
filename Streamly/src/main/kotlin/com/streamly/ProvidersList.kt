@@ -28,6 +28,12 @@ object ProvidersList {
             Provider("egydead", "EgyDead") { res, sub, cb ->
                 invokeEgyDead(res, sub, cb)
             },
+            Provider("mycima", "MyCima") { res, sub, cb ->
+                invokeMyCima(res, sub, cb)
+            },
+            Provider("wecima", "Wecima") { res, sub, cb ->
+                invokeWecima(res, sub, cb)
+            },
         )
     }
 }

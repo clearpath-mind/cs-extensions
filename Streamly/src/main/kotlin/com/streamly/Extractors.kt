@@ -8,6 +8,9 @@ import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.MixDrop
 import com.lagradost.cloudstream3.extractors.StreamTape
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
+import com.lagradost.cloudstream3.extractors.Voe
+import com.lagradost.cloudstream3.extractors.Kwik
+import com.lagradost.cloudstream3.extractors.VidSrc
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -393,6 +396,78 @@ class Uqload : ExtractorApi() {    override val name = "Uqload"
     }
 }
 
+/** Voe (voe.sx and rotations) */
+class VoeExtractor : Voe() {
+    override val name = "Voe"
+    override val mainUrl = "https://voe.sx"
+}
+
+/** Kwik (kwik.si and rotations) — packed JS, m3u8/mp4 */
+class KwikExtractor : ExtractorApi() {
+    override val name = "Kwik"
+    override val mainUrl = "https://kwik.si"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val text = app.get(url, referer = referer).text
+        val unpacked = if (getPacked(text).isNullOrEmpty()) text else getAndUnpack(text)
+        val src = Regex("""source\s*[:=]\s*['"]([^'"]+\.(?:m3u8|mp4)[^'"]*)['"]""")
+            .find(unpacked)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""")
+                .find(unpacked)?.groupValues?.get(1)
+            ?: return
+        if (src.contains(".m3u8")) {
+            emitM3u8Variants(name, src, mainUrl, mapOf("Referer" to mainUrl), callback)
+        } else {
+            callback(
+                newExtractorLink(name, name, url = src) {
+                    this.referer = referer ?: mainUrl
+                    this.quality = getQualityFromName(src)
+                    this.type = ExtractorLinkType.VIDEO
+                }
+            )
+        }
+    }
+}
+
+/** VidSrc (vidsrc.to and rotations) */
+class VidSrcExtractor : ExtractorApi() {
+    override val name = "VidSrc"
+    override val mainUrl = "https://vidsrc.to"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val text = app.get(url, referer = referer).text
+        val unpacked = if (getPacked(text).isNullOrEmpty()) text else getAndUnpack(text)
+        val src = Regex("""source\s*[:=]\s*['"]([^'"]+\.(?:m3u8|mp4)[^'"]*)['"]""")
+            .find(unpacked)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""")
+                .find(unpacked)?.groupValues?.get(1)
+            ?: return
+        if (src.contains(".m3u8")) {
+            emitM3u8Variants(name, src, mainUrl, mapOf("Referer" to mainUrl), callback)
+        } else {
+            callback(
+                newExtractorLink(name, name, url = src) {
+                    this.referer = referer ?: mainUrl
+                    this.quality = getQualityFromName(src)
+                    this.type = ExtractorLinkType.VIDEO
+                }
+            )
+        }
+    }
+}
+
 /** Routes an embed iframe URL found on a TopCinema watch page to the right extractor.
  * Host domains rotate frequently (e.g. d0o0d.com / do0od.com / d000d.com), so we match
  * on stable keywords instead of exact domains. */
@@ -436,6 +511,9 @@ object EmbedRouter {
                 "mixdrop" in host || "mxdrop" in host -> "MixDrop"
                 "uqload" in host -> "Uqload"
                 "streamtape" in host -> "Streamtape"
+                "voe" in host -> "Voe"
+                "kwik" in host -> "Kwik"
+                "vidsrc" in host -> "VidSrc"
                 isDoodHost(host) -> "Dood"
                 else -> "loadExtractor"
             }
@@ -463,6 +541,9 @@ object EmbedRouter {
                 "mixdrop" in host || "mxdrop" in host -> MixDropPs().getUrl(routedLink, referer, subOut, out)
                 "uqload" in host -> Uqload().getUrl(routedLink, referer, subOut, out)
                 "streamtape" in host -> StreamTape().getUrl(routedLink, referer, subOut, out)
+                "voe" in host -> VoeExtractor().getUrl(routedLink, referer, subOut, out)
+                "kwik" in host -> KwikExtractor().getUrl(routedLink, referer, subOut, out)
+                "vidsrc" in host -> VidSrcExtractor().getUrl(routedLink, referer, subOut, out)
                 else -> {
                     loadExtractor(routedLink, referer, subOut, out)
                 }

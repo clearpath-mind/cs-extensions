@@ -30,6 +30,7 @@ import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import okhttp3.Request as OkRequest
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -569,6 +570,9 @@ private fun cfLockFor(url: String): Mutex {
     val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("global")
     return cfHostLocks.getOrPut(host) { Mutex() }
 }
+
+/** CloudflareKiller interceptor: native CF bypass, much faster than WebView solver. */
+private val cloudflareKiller by lazy { CloudflareKiller() }
 internal const val CF_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
@@ -722,7 +726,7 @@ private suspend fun cfGetDoc(
 ): Document {
     val target = applyHostOverride(url)
     val first = runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.document.toString())) {
         return first.document
@@ -730,9 +734,9 @@ private suspend fun cfGetDoc(
     // Stage 2 (re-3arabi smartGet): one silent plain retry before burning a
     // WebView solve — CF sometimes passes the second hit, or a parallel
     // provider cleared the wall while we worked.
-    delay(1500)
+    delay(500)
     runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()?.let { pre ->
         if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.document.toString())) {
             Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
@@ -740,7 +744,7 @@ private suspend fun cfGetDoc(
         }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
-    val solved = cfSolve(target, awaitContent)
+    val solved = cfSolve(target, awaitContent = false)
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
         takeSolverHtml(solved, retryUrl)?.let { html ->
@@ -753,7 +757,7 @@ private suspend fun cfGetDoc(
     val ck = cfCookies(retryUrl)
     var retryErr: String? = null
     val second = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }} err=$retryErr")
     return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
@@ -767,15 +771,15 @@ private suspend fun cfGetText(
 ): String {
     val target = applyHostOverride(url)
     val first = runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.text)) {
         return first.text
     }
     // Stage 2 (re-3arabi smartGet): one silent plain retry before solving.
-    delay(1500)
+    delay(500)
     runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0)
+        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()?.let { pre ->
         if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.text)) {
             Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
@@ -783,7 +787,7 @@ private suspend fun cfGetText(
         }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
-    val solved = cfSolve(target)
+    val solved = cfSolve(target, awaitContent = false)
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
         takeSolverHtml(solved, retryUrl)?.let { html ->
@@ -801,7 +805,7 @@ private suspend fun cfGetText(
     // @Nullable annotation that isn't on the compile classpath.
     var retryErr: String? = null
     val secondResp = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0)
+        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     val second: String? = secondResp?.text
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }} err=$retryErr")
@@ -824,7 +828,7 @@ private suspend fun cfPostText(
     }.getOrNull()
     if (first != null && !isCfChallenge(first)) return first
     // Stage 2 (re-3arabi smartPost): one silent plain retry before solving.
-    delay(1500)
+    delay(500)
     runCatching {
         app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout, cacheTime = 0).text
     }.getOrNull()?.let { pre ->
@@ -835,7 +839,7 @@ private suspend fun cfPostText(
     }
     // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
     Log.d(TAG, "[cfPost ] wall ($target), solving…")
-    val solved = cfSolve(target)
+    val solved = cfSolve(target, awaitContent = false)
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
@@ -2871,5 +2875,430 @@ private suspend fun egDeadWatchServers(
     } catch (e: Exception) {
         Log.e(EGDEAD_TAG, "[watch  ] failed: ${e.message}")
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MyCima (mycima.living) link source.
+//
+// WordPress (Wecima theme). Search via /filtering/?keywords=<query>; movie
+// pages embed the player inline; series pages list per-episode posts. Watch
+// servers come from ul#watch li[data-watch] and download links from
+// ul.List--Download--Wecima--Single. All embed URLs route through EmbedRouter.
+// ---------------------------------------------------------------------------
+
+private const val MYCIMA_MAIN_URL = "https://mycima.living"
+private const val MYCIMA_TAG = "MyCima"
+
+private suspend fun myCimaBase(): String = resolveOrigin(MYCIMA_MAIN_URL)
+
+private fun myCimaIsChallenge(html: String, title: String): Boolean {
+    return (title.contains("Just a moment", ignoreCase = true) ||
+            title.contains("Attention Required", ignoreCase = true) ||
+            html.contains("cf-turnstile") ||
+            html.contains("challenge-platform")) &&
+            !html.contains("Grid--WecimaPosts")
+}
+
+private suspend fun myCimaSmartGet(url: String, referer: String? = null, timeout: Long = 15000): Document {
+    repeat(2) { attempt ->
+        try {
+            val response = app.get(
+                url,
+                referer = referer ?: MYCIMA_MAIN_URL,
+                headers = cfHeaders(url, referer, emptyMap()),
+                timeout = timeout,
+                cacheTime = 0,
+                interceptor = cloudflareKiller
+            )
+            if (response.code == 200 && !myCimaIsChallenge(response.text, response.document.title())) {
+                return response.document
+            }
+            delay(500)
+        } catch (e: Exception) {
+            Log.d(MYCIMA_TAG, "[get    ] attempt $attempt failed: ${e.message}")
+            delay(500)
+        }
+    }
+    // Fallback: try with WebView solver
+    val solved = cfSolve(url, awaitContent = false)
+    if (solved != null) {
+        takeSolverHtml(solved, url)?.let { return Jsoup.parse(it, url) }
+    }
+    return try {
+        app.get(url, referer = referer ?: MYCIMA_MAIN_URL, headers = cfHeaders(url, referer, emptyMap()), timeout = timeout, cacheTime = 0, interceptor = cloudflareKiller).document
+    } catch (e: Exception) {
+        Jsoup.parse("", url)
+    }
+}
+
+private fun myCimaExtractServerName(element: Element): String {
+    return (element.ownText().ifBlank { element.text() }).replace(Regex("\\s+"), " ").trim()
+}
+
+private suspend fun myCimaSearch(query: String, type: String): List<Candidate> {
+    return withContext(Dispatchers.IO) {
+        try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = "${myCimaBase()}/filtering/?keywords=$encoded"
+            val doc = myCimaSmartGet(url)
+            val cards = doc.select("div.Grid--WecimaPosts div.GridItem, div#MainFiltar div.GridItem, div.Slider--Grid div.GridItem")
+            cards.mapNotNull { card ->
+                val a = card.selectFirst("div.Thumb--GridItem a") ?: card.selectFirst("a[href]") ?: return@mapNotNull null
+                val href = a.absUrl("href").ifEmpty { a.attr("href") }
+                if (!href.startsWith("http")) return@mapNotNull null
+                val titleTag = a.selectFirst("strong") ?: a.selectFirst("h2") ?: return@mapNotNull null
+                val title = titleTag.ownText().trim()
+                val year = titleTag.selectFirst("span.year")?.text()?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
+                val isMovie = card.selectFirst("div.Episode--number") == null && !href.contains("/series/")
+                if (isMovie && type == "series") return@mapNotNull null
+                if (!isMovie && type == "movies") return@mapNotNull null
+                val slug = decodeSlug(href)
+                val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(title) }
+                if (latin.isBlank()) return@mapNotNull null
+                Candidate(href, slug, latin, year ?: yearFromSlug(slug))
+            }.distinctBy { it.url }
+        } catch (e: Exception) {
+            Log.e(MYCIMA_TAG, "[search ] failed: ${e.message}")
+            emptyList()
+        }
+    }
+}
+
+private suspend fun myCimaResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = myCimaSearch(title, "movies")
+    Log.d(MYCIMA_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+    val best = candidates.map { it to scoreCandidate(it, title, year) }
+        .maxByOrNull { it.second }
+        ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
+    if (best == null) {
+        Log.d(MYCIMA_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(MYCIMA_TAG, "[match  ] WINNER ${best.url}")
+    return myCimaExtractServers(best.url, subtitleCallback, callback)
+}
+
+private suspend fun myCimaResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = myCimaSearch(title, "series")
+    Log.d(MYCIMA_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(MYCIMA_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(MYCIMA_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("mycima")
+    val doc = myCimaSmartGet(anchor.url)
+    val epUrl = exactEpisodeUrl(doc, season, episode)
+        ?: run {
+            Log.d(MYCIMA_TAG, "[match  ] E$episode not in series episode list")
+            return false
+        }
+    return myCimaExtractServers(epUrl, subtitleCallback, callback)
+}
+
+private suspend fun myCimaExtractServers(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    StreamlyCache.markEpisodeMatched("mycima")
+    try {
+        val doc = myCimaSmartGet(postUrl)
+        val linksToProcess = mutableListOf<Pair<String, String>>()
+        doc.select("ul#watch li[data-watch]").forEach {
+            val url = it.attr("data-watch")
+            val name = myCimaExtractServerName(it)
+            if (url.isNotBlank()) linksToProcess.add(url to name)
+        }
+        doc.select("ul.List--Download--Wecima--Single li a[href]").forEach {
+            val url = it.attr("href")
+            val name = it.selectFirst("quality")?.text()?.trim() ?: "تحميل"
+            if (url.isNotBlank()) linksToProcess.add(url to name)
+        }
+        val distinct = linksToProcess.distinctBy { it.first }
+        Log.d(MYCIMA_TAG, "[watch  ] ${distinct.size} servers on $postUrl")
+        if (distinct.isEmpty()) return@coroutineScope false
+        distinct.amap { (link, serverName) ->
+            async {
+                if (isDeadLocker(link)) return@async
+                var n = 0
+                val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
+                EmbedRouter.route(link, postUrl, subtitleCallback, counting, "MyCima [${serverName}]")
+                Log.d(MYCIMA_TAG, "[watch  ] server $serverName emitted=$n")
+            }
+        }.awaitAll()
+        true
+    } catch (e: Exception) {
+        Log.e(MYCIMA_TAG, "[watch  ] failed: ${e.message}")
+        false
+    }
+}
+
+suspend fun invokeMyCima(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(MYCIMA_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "MyCima: start"
+    if (title.isEmpty()) return false
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+    return try {
+        val ok = if (res.isMovie) {
+            myCimaResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            myCimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(MYCIMA_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "MyCima: ok" else "MyCima: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(MYCIMA_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "MyCima: ${e.message}"
+        emitted > 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wecima (wecima.ac) link source.
+//
+// WordPress (Wecima theme). Search via POST /search with q=<query>; movie
+// pages embed the player inline; series pages list per-episode posts. Watch
+// servers come from ul.WatchServersList li btn[data-url] (base64-encoded);
+// download links from .openLinkDown[data-href]. All embed URLs route through
+// EmbedRouter.
+// ---------------------------------------------------------------------------
+
+private const val WECIMA_MAIN_URL = "https://wecima.ac"
+private const val WECIMA_TAG = "Wecima"
+
+private suspend fun wecimaBase(): String = resolveOrigin(WECIMA_MAIN_URL)
+
+private fun wecimaDecodeUrl(encodedStr: String): String? {
+    return try {
+        if (encodedStr.isBlank()) return null
+        val cleanedStr = encodedStr.replace("+", "").trim()
+        val finalB64Str = if (!cleanedStr.startsWith("aHR0c")) "aHR0c$cleanedStr" else cleanedStr
+        String(android.util.Base64.decode(finalB64Str, android.util.Base64.DEFAULT))
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private suspend fun wecimaSmartGet(url: String, referer: String? = null, timeout: Long = 15000): Document {
+    repeat(2) { attempt ->
+        try {
+            val response = app.get(
+                url,
+                referer = referer ?: WECIMA_MAIN_URL,
+                headers = cfHeaders(url, referer, emptyMap()),
+                timeout = timeout,
+                cacheTime = 0,
+                interceptor = cloudflareKiller
+            )
+            if (response.code == 200 && !isCfChallenge(response.text)) {
+                return response.document
+            }
+            delay(500)
+        } catch (e: Exception) {
+            Log.d(WECIMA_TAG, "[get    ] attempt $attempt failed: ${e.message}")
+            delay(500)
+        }
+    }
+    val solved = cfSolve(url, awaitContent = false)
+    if (solved != null) {
+        takeSolverHtml(solved, url)?.let { return Jsoup.parse(it, url) }
+    }
+    return try {
+        app.get(url, referer = referer ?: WECIMA_MAIN_URL, headers = cfHeaders(url, referer, emptyMap()), timeout = timeout, cacheTime = 0, interceptor = cloudflareKiller).document
+    } catch (e: Exception) {
+        Jsoup.parse("", url)
+    }
+}
+
+private suspend fun wecimaSearch(query: String, type: String): List<Candidate> {
+    return withContext(Dispatchers.IO) {
+        try {
+            val base = wecimaBase()
+            val response = app.post(
+                "$base/search",
+                data = mapOf("q" to query),
+                referer = base,
+                headers = cfHeaders(base, null, mapOf(
+                    "Accept" to "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
+                )),
+                timeout = 15000,
+                cacheTime = 0,
+                interceptor = cloudflareKiller
+            )
+            val text = response.text
+            if (!text.startsWith("{")) return@withContext emptyList()
+            val json = org.json.JSONObject(text)
+            if (!json.optBoolean("status", false)) return@withContext emptyList()
+            val results = json.optJSONArray("results") ?: return@withContext emptyList()
+            val out = ArrayList<Candidate>()
+            for (i in 0 until results.length()) {
+                val item = results.optJSONObject(i) ?: continue
+                val title = item.optString("title").takeIf { it.isNotBlank() } ?: continue
+                val slug = item.optString("slug").takeIf { it.isNotBlank() } ?: continue
+                val istv = item.optInt("istv", -1)
+                if (istv == 2) continue
+                val isMovie = istv == 0
+                if (isMovie && type == "series") continue
+                if (!isMovie && type == "movies") continue
+                val prefix = if (isMovie) "/watch/" else "/series/"
+                val encodedSlug = URLEncoder.encode(slug, "UTF-8").replace("+", "%20")
+                val itemUrl = "$base$prefix$encodedSlug"
+                val year = item.optString("year").takeIf { it.isNotBlank() }?.toIntOrNull()
+                val slug2 = decodeSlug(itemUrl)
+                val latin = latinTitleFromSlug(slug2).ifBlank { latinTitleFromSlug(title) }
+                if (latin.isBlank()) continue
+                out.add(Candidate(itemUrl, slug2, latin, year ?: yearFromSlug(slug2)))
+            }
+            out.distinctBy { it.url }
+        } catch (e: Exception) {
+            Log.e(WECIMA_TAG, "[search ] failed: ${e.message}")
+            emptyList()
+        }
+    }
+}
+
+private suspend fun wecimaResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = wecimaSearch(title, "movies")
+    Log.d(WECIMA_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+    val best = candidates.map { it to scoreCandidate(it, title, year) }
+        .maxByOrNull { it.second }
+        ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
+    if (best == null) {
+        Log.d(WECIMA_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(WECIMA_TAG, "[match  ] WINNER ${best.url}")
+    return wecimaExtractServers(best.url, subtitleCallback, callback)
+}
+
+private suspend fun wecimaResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = wecimaSearch(title, "series")
+    Log.d(WECIMA_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(WECIMA_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(WECIMA_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("wecima")
+    val doc = wecimaSmartGet(anchor.url)
+    val epUrl = exactEpisodeUrl(doc, season, episode)
+        ?: run {
+            Log.d(WECIMA_TAG, "[match  ] E$episode not in series episode list")
+            return false
+        }
+    return wecimaExtractServers(epUrl, subtitleCallback, callback)
+}
+
+private suspend fun wecimaExtractServers(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    StreamlyCache.markEpisodeMatched("wecima")
+    try {
+        val doc = wecimaSmartGet(postUrl)
+        val linksToProcess = mutableListOf<Pair<String, String>>()
+        doc.select("ul.WatchServersList li btn").forEach { serverBtn ->
+            val encodedUrl = serverBtn.attr("data-url")
+            val decoded = wecimaDecodeUrl(encodedUrl)
+            if (decoded != null && decoded.startsWith("http")) {
+                linksToProcess.add(decoded to "Wecima")
+            }
+        }
+        doc.select(".openLinkDown").forEach { downloadBtn ->
+            val encodedUrl = downloadBtn.attr("data-href")
+            val decoded = wecimaDecodeUrl(encodedUrl)
+            if (decoded != null && decoded.startsWith("http")) {
+                val qualityText = downloadBtn.selectFirst("resolution")?.text()?.trim() ?: ""
+                val typeText = downloadBtn.selectFirst("quality")?.text()?.trim() ?: "Download"
+                linksToProcess.add(decoded to "Wecima $typeText")
+            }
+        }
+        val distinct = linksToProcess.distinctBy { it.first }
+        Log.d(WECIMA_TAG, "[watch  ] ${distinct.size} servers on $postUrl")
+        if (distinct.isEmpty()) return@coroutineScope false
+        distinct.amap { (link, serverName) ->
+            async {
+                if (isDeadLocker(link)) return@async
+                var n = 0
+                val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
+                EmbedRouter.route(link, postUrl, subtitleCallback, counting, serverName)
+                Log.d(WECIMA_TAG, "[watch  ] server $serverName emitted=$n")
+            }
+        }.awaitAll()
+        true
+    } catch (e: Exception) {
+        Log.e(WECIMA_TAG, "[watch  ] failed: ${e.message}")
+        false
+    }
+}
+
+suspend fun invokeWecima(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(WECIMA_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "Wecima: start"
+    if (title.isEmpty()) return false
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+    return try {
+        val ok = if (res.isMovie) {
+            wecimaResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            wecimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(WECIMA_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "Wecima: ok" else "Wecima: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(WECIMA_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "Wecima: ${e.message}"
+        emitted > 0
     }
 }

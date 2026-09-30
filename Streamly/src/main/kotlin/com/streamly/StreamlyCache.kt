@@ -8,10 +8,39 @@ import java.util.concurrent.ConcurrentHashMap
  * Per-provider performance tracking for Streamly link sources.
  * Mirrors StreamPlay's cache: success/failure stats with a circuit breaker,
  * priority scoring used to order providers in loadLinks, and persistence.
+ * Also caches TMDB metadata (30-min TTL) to avoid redundant API calls.
  */
 object StreamlyCache {
 
     private const val TAG = "StreamlyCache"
+
+    // ==================== Metadata Cache ====================
+
+    private val metadataCache = ConcurrentHashMap<String, Pair<Long, String>>()
+    private const val METADATA_TTL_MS = 30 * 60 * 1000L // 30 minutes
+    private const val MAX_METADATA_ENTRIES = 100
+
+    fun getCachedMetadata(key: String): String? {
+        val entry = metadataCache[key] ?: return null
+        if (System.currentTimeMillis() - entry.first > METADATA_TTL_MS) {
+            metadataCache.remove(key)
+            return null
+        }
+        return entry.second
+    }
+
+    fun cacheMetadata(key: String, json: String) {
+        // Simple LRU: evict oldest if at capacity
+        if (metadataCache.size >= MAX_METADATA_ENTRIES) {
+            val oldest = metadataCache.minByOrNull { it.value.first }
+            if (oldest != null) metadataCache.remove(oldest.key)
+        }
+        metadataCache[key] = System.currentTimeMillis() to json
+    }
+
+    fun clearMetadataCache() {
+        metadataCache.clear()
+    }
 
     data class ProviderStats(
         val successCount: Int = 0,
@@ -61,7 +90,14 @@ object StreamlyCache {
     }
 
     /** Sensible cold-start order before any stats exist. */
-    private val BASE_PRIORITY = mapOf("topcinema" to 3f, "faselhd" to 1f, "shoof" to 1f, "egydead" to 1f)
+    private val BASE_PRIORITY = mapOf(
+        "topcinema" to 3f,
+        "faselhd" to 1f,
+        "shoof" to 1f,
+        "egydead" to 1f,
+        "mycima" to 1f,
+        "wecima" to 1f,
+    )
 
     /** Higher score runs earlier; broken providers sink to the end. */
     fun getProviderPriorityScore(providerId: String): Float {

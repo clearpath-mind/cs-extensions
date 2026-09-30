@@ -207,8 +207,8 @@ object CloudflareSolver {
                 }
 
                 pollingHandler.postDelayed({
-                    finishSuccess(webView.url ?: initialUrl, "Timeout - 60s")
-                }, 60000)
+                    finishSuccess(webView.url ?: initialUrl, "Timeout - 15s")
+                }, 15000)
 
                 fun simulateRealTouch(view: WebView, cssX: Float, cssY: Float) {
                     val density = activity.resources.displayMetrics.density
