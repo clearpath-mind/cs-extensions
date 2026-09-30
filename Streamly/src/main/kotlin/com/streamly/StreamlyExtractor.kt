@@ -3055,7 +3055,8 @@ private suspend fun akwamExtractLinks(
             return false
         }
         // Movies link the player directly; series go episode -> watch page.
-        val watchHref = page.selectFirst("a.link-show")?.let {
+        val linkShow: Element? = page.selectFirst("a.link-show")
+        val watchHref: String = linkShow?.let {
             fixUrl(it.attr("href").ifBlank { it.absUrl("href") }, postUrl)
         }?.takeIf { it.startsWith("http") } ?: postUrl
         val watch = if (watchHref == postUrl) page else try {
