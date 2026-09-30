@@ -95,7 +95,6 @@ object StreamlyCache {
         "faselhd" to 1f,
         "shoof" to 1f,
         "egydead" to 1f,
-        "mycima" to 1f,
         "wecima" to 1f,
     )
 
