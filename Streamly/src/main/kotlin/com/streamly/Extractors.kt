@@ -9,8 +9,6 @@ import com.lagradost.cloudstream3.extractors.MixDrop
 import com.lagradost.cloudstream3.extractors.StreamTape
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.extractors.Voe
-import com.lagradost.cloudstream3.extractors.Kwik
-import com.lagradost.cloudstream3.extractors.VidSrc
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -435,7 +433,7 @@ class KwikExtractor : ExtractorApi() {
     }
 }
 
-/** VidSrc (vidsrc.to and rotations) */
+/** VidSrc (vidsrc.to and rotations) — packed JS, m3u8/mp4 */
 class VidSrcExtractor : ExtractorApi() {
     override val name = "VidSrc"
     override val mainUrl = "https://vidsrc.to"

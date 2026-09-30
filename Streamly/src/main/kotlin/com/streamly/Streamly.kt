@@ -257,7 +257,7 @@ open class Streamly : MainAPI() {
                 val result = working ?: official
                 cachedApiBase = result
                 Log.d(TAG, "TMDB API base: $result")
-                result
+                return result
             }
         }
 
@@ -399,7 +399,7 @@ open class Streamly : MainAPI() {
         // Check metadata cache first (30-min TTL)
         val cacheKey = "metadata_${data.id}_${data.type}_$langCode"
         val cachedJson = StreamlyCache.getCachedMetadata(cacheKey)
-        val res = if (cachedJson != null) {
+        val cachedRes = if (cachedJson != null) {
             runCatching { parseJson<MediaDetail>(cachedJson) }.getOrNull()
         } else null
 
@@ -409,15 +409,12 @@ open class Streamly : MainAPI() {
             "$apiBase/tv/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
         }
 
-        val finalRes = res ?: run {
+        val res = cachedRes ?: run {
             val fetched = app.get(resUrl, timeout = 10000).parsedSafe<MediaDetail>()
                 ?: throw ErrorLoadingException("Invalid Json Response")
             // Cache the raw JSON for next time
-            runCatching {
-                app.get(resUrl, timeout = 10000).text
-            }.let { rawText ->
-                if (rawText != null) StreamlyCache.cacheMetadata(cacheKey, rawText)
-            }
+            val rawText = runCatching { app.get(resUrl, timeout = 10000).text }.getOrNull()
+            if (rawText != null) StreamlyCache.cacheMetadata(cacheKey, rawText)
             fetched
         }
 
