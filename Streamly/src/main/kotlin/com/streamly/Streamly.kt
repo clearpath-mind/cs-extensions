@@ -39,6 +39,8 @@ import com.streamly.settings.StreamlyStremioSettings
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 
@@ -218,6 +220,55 @@ open class Streamly : MainAPI() {
         // English is required for link resolution: TopCinema slugs are Latin-script
         private const val RESOLVER_LANG = "en-US"
 
+        // TMDB proxy fallback: if official API is slow/blocked, try proxies
+        private const val PROXY_LIST_URL =
+            "https://raw.githubusercontent.com/phisher98/TVVVV/Proxylist.txt"
+        @Volatile
+        private var cachedApiBase: String? = null
+        private val apiBaseLock = kotlinx.coroutines.sync.Mutex()
+
+        /**
+         * Returns a working TMDB API base URL. Tests official TMDB first (2s timeout),
+         * then falls back to a proxy list. Cached for 10 minutes.
+         */
+        suspend fun getApiBase(): String {
+            cachedApiBase?.let { return it }
+            apiBaseLock.withLock {
+                cachedApiBase?.let { return it }
+                val official = TMDB_API
+                val officialWorks = withTimeoutOrNull(2000) {
+                    runCatching {
+                        app.get("$official/movie/550?api_key=$apiKey").code == 200
+                    }.getOrDefault(false)
+                } == true
+                if (officialWorks) {
+                    cachedApiBase = official
+                    return official
+                }
+                Log.w(TAG, "Official TMDB unreachable, trying proxies…")
+                val proxies = fetchProxyList()
+                val working = proxies.firstOrNull { proxy ->
+                    withTimeoutOrNull(3000) {
+                        runCatching {
+                            app.get("$proxy/movie/550?api_key=$apiKey").code == 200
+                        }.getOrDefault(false)
+                    } == true
+                }
+                val result = working ?: official
+                cachedApiBase = result
+                Log.d(TAG, "TMDB API base: $result")
+                result
+            }
+        }
+
+        private suspend fun fetchProxyList(): List<String> = runCatching {
+            app.get(PROXY_LIST_URL, timeout = 5000).text.lines()
+                .map { it.trim() }
+                .filter { it.startsWith("http") }
+                .distinct()
+                .take(10)
+        }.getOrDefault(emptyList())
+
         private fun getImageUrl(link: String?): String? {
             if (link == null) return null
             return if (link.startsWith("/")) "https://image.tmdb.org/t/p/original/$link" else link
@@ -248,8 +299,9 @@ open class Streamly : MainAPI() {
         suspend fun fetchLogoUrl(tmdbId: Int?, isMovie: Boolean, lang: String = "ar"): String? {
             if (tmdbId == null) return null
             val kind = if (isMovie) "movie" else "tv"
+            val apiBase = getApiBase()
             val images = runCatching {
-                app.get("$TMDB_API/$kind/$tmdbId/images?api_key=$apiKey", timeout = 8000)
+                app.get("$apiBase/$kind/$tmdbId/images?api_key=$apiKey", timeout = 8000)
                     .parsedSafe<LogoImages>()
             }.getOrNull() ?: return null
 
@@ -309,11 +361,12 @@ open class Streamly : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         StreamlyRuntime.context = CommonActivity.activity
+        val apiBase = getApiBase()
         // Non-trending TMDB endpoints (/movie/*, /discover/movie) omit media_type in results
         val fallbackType = if (request.data.contains("/movie")) "movie" else "tv"
 
         val home = app.get(
-            url = "$TMDB_API${request.data}&language=$langCode&page=$page",
+            url = "$apiBase${request.data}&language=$langCode&page=$page",
             timeout = 10000,
         ).parsedSafe<Results>()?.results?.mapNotNull { it.toSearchResponse(fallbackType) } ?: emptyList()
 
@@ -325,7 +378,8 @@ open class Streamly : MainAPI() {
 
     override suspend fun search(query: String, page: Int): SearchResponseList? {
         StreamlyRuntime.context = CommonActivity.activity
-        return app.get("$TMDB_API/search/multi?api_key=$apiKey&language=$langCode&query=$query&page=$page&include_adult=false")
+        val apiBase = getApiBase()
+        return app.get("$apiBase/search/multi?api_key=$apiKey&language=$langCode&query=$query&page=$page&include_adult=false")
             .parsedSafe<Results>()?.results
             ?.mapNotNull { it.toSearchResponse() }
             ?.toNewSearchResponseList()
@@ -335,27 +389,44 @@ open class Streamly : MainAPI() {
         StreamlyRuntime.context = CommonActivity.activity
         val data = parseJson<Data>(url)
         val type = getType(data.type)
+        val apiBase = getApiBase()
         val append = if (type == TvType.Movie) {
             "external_ids,videos,credits,recommendations,release_dates"
         } else {
             "external_ids,videos,credits,recommendations,content_ratings"
         }
 
+        // Check metadata cache first (30-min TTL)
+        val cacheKey = "metadata_${data.id}_${data.type}_$langCode"
+        val cachedJson = StreamlyCache.getCachedMetadata(cacheKey)
+        val res = if (cachedJson != null) {
+            runCatching { parseJson<MediaDetail>(cachedJson) }.getOrNull()
+        } else null
+
         val resUrl = if (type == TvType.Movie) {
-            "$TMDB_API/movie/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
+            "$apiBase/movie/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
         } else {
-            "$TMDB_API/tv/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
+            "$apiBase/tv/${data.id}?api_key=$apiKey&language=$langCode&append_to_response=$append"
         }
 
-        val res = app.get(resUrl, timeout = 10000).parsedSafe<MediaDetail>()
-            ?: throw ErrorLoadingException("Invalid Json Response")
+        val finalRes = res ?: run {
+            val fetched = app.get(resUrl, timeout = 10000).parsedSafe<MediaDetail>()
+                ?: throw ErrorLoadingException("Invalid Json Response")
+            // Cache the raw JSON for next time
+            runCatching {
+                app.get(resUrl, timeout = 10000).text
+            }.let { rawText ->
+                if (rawText != null) StreamlyCache.cacheMetadata(cacheKey, rawText)
+            }
+            fetched
+        }
 
         // English detail for the link resolver (TopCinema slugs are Latin-script)
         val enResUrl = if (langCode != RESOLVER_LANG) {
             if (type == TvType.Movie) {
-                "$TMDB_API/movie/${data.id}?api_key=$apiKey&language=$RESOLVER_LANG"
+                "$apiBase/movie/${data.id}?api_key=$apiKey&language=$RESOLVER_LANG"
             } else {
-                "$TMDB_API/tv/${data.id}?api_key=$apiKey&language=$RESOLVER_LANG"
+                "$apiBase/tv/${data.id}?api_key=$apiKey&language=$RESOLVER_LANG"
             }
         } else null
 
@@ -406,7 +477,7 @@ open class Streamly : MainAPI() {
                     async {
                         try {
                             app.get(
-                                "$TMDB_API/tv/${data.id}/season/${season.seasonNumber}?api_key=$apiKey&language=$langCode",
+                                "$apiBase/tv/${data.id}/season/${season.seasonNumber}?api_key=$apiKey&language=$langCode",
                                 timeout = 10000
                             ).parsedSafe<MediaDetailEpisodes>()
                                 ?.episodes
