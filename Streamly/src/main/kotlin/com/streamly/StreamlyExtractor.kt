@@ -67,7 +67,7 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, FaselHD, Shoof, EgyDead. Every master m3u8
+// Currently: TopCinema, FaselHD, Shoof, EgyDead, Akwam. Every master m3u8
 // is expanded into per-quality variants so slow networks can pick manually.
 /// ---------------------------------------------------------------------------
 
@@ -2904,132 +2904,82 @@ private suspend fun egDeadWatchServers(
 }
 
 // ---------------------------------------------------------------------------
-// Wecima (wecima.ac) link source.
+// Akwam (ak.sv) link source.
 //
-// WordPress (Wecima theme). Search via POST /search with q=<query>; movie
-// pages embed the player inline; series pages list per-episode posts. Watch
-// servers come from ul.WatchServersList li btn[data-url] (base64-encoded);
-// download links from .openLinkDown[data-href]. All embed URLs route through
-// EmbedRouter.
+// Custom (non-WordPress) theme. Search is GET /search?q=<query>; result
+// cards are div.col-lg-auto.col-md-4.col-6 with h3.entry-title a. Detail
+// pages carry seasons as div.widget-body > a.btn[href*='/series/'] and
+// episodes under div#series-episodes (a[href*='/episode/']). The detail /
+// episode page links the watch player via a.link-show; the watch page
+// serves direct <source src> video URLs (Arabic subs hardcoded), emitted
+// as VIDEO/M3U8 links with the episode page as referer.
 // ---------------------------------------------------------------------------
 
-private const val WECIMA_MAIN_URL = "https://wecima.ac"
-private const val WECIMA_TAG = "Wecima"
+private const val AKWAM_SEED_URL = "https://ak.sv"
+private const val AKWAM_TAG = "Akwam"
 
-private suspend fun wecimaBase(): String = resolveOrigin(WECIMA_MAIN_URL)
+/** Akwam rotates domains; resolve the live origin once and reuse it. */
+private suspend fun akwamBase(): String = resolveOrigin(AKWAM_SEED_URL)
 
-private fun wecimaDecodeUrl(encodedStr: String): String? {
-    return try {
-        if (encodedStr.isBlank()) return null
-        val cleanedStr = encodedStr.replace("+", "").trim()
-        val finalB64Str = if (!cleanedStr.startsWith("aHR0c")) "aHR0c$cleanedStr" else cleanedStr
-        String(android.util.Base64.decode(finalB64Str, android.util.Base64.DEFAULT))
-    } catch (e: Exception) {
-        null
-    }
-}
-
-private suspend fun wecimaSmartGet(url: String, referer: String? = null, timeout: Long = 15000): Document {
-    repeat(2) { attempt ->
-        try {
-            val response = app.get(
-                url,
-                referer = referer ?: WECIMA_MAIN_URL,
-                headers = cfHeaders(url, referer, emptyMap()),
-                timeout = timeout,
-                cacheTime = 0,
-                interceptor = cloudflareKiller
-            )
-            if (response.code == 200 && !isCfChallenge(response.text)) {
-                return response.document
-            }
-            delay(500)
-        } catch (e: Exception) {
-            Log.d(WECIMA_TAG, "[get    ] attempt $attempt failed: ${e.message}")
-            delay(500)
-        }
-    }
-    val solved = cfSolve(url, awaitContent = false, timeoutMs = cfSolverTimeoutFor(url))
-    if (solved != null) {
-        takeSolverHtml(solved, url)?.let { return Jsoup.parse(it, url) }
-    }
-    return try {
-        app.get(url, referer = referer ?: WECIMA_MAIN_URL, headers = cfHeaders(url, referer, emptyMap()), timeout = timeout, cacheTime = 0, interceptor = cloudflareKiller).document
-    } catch (e: Exception) {
-        Jsoup.parse("", url)
-    }
-}
-
-private suspend fun wecimaSearch(query: String, type: String): List<Candidate> {
+private suspend fun akwamSearch(query: String, type: String): List<Candidate> {
     return withContext(Dispatchers.IO) {
         try {
-            val base = wecimaBase()
-            val response = app.post(
-                "$base/search",
-                data = mapOf("q" to query),
-                referer = base,
-                headers = cfHeaders(base, null, mapOf(
-                    "Accept" to "application/json, text/javascript, */*; q=0.01",
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
-                )),
-                timeout = 15000,
-                cacheTime = 0,
-                interceptor = cloudflareKiller
-            )
-            val text = response.text
-            if (!text.startsWith("{")) return@withContext emptyList()
-            val json = org.json.JSONObject(text)
-            if (!json.optBoolean("status", false)) return@withContext emptyList()
-            val results = json.optJSONArray("results") ?: return@withContext emptyList()
-            val out = ArrayList<Candidate>()
-            for (i in 0 until results.length()) {
-                val item = results.optJSONObject(i) ?: continue
-                val title = item.optString("title").takeIf { it.isNotBlank() } ?: continue
-                val slug = item.optString("slug").takeIf { it.isNotBlank() } ?: continue
-                val istv = item.optInt("istv", -1)
-                if (istv == 2) continue
-                val isMovie = istv == 0
-                if (isMovie && type == "series") continue
-                if (!isMovie && type == "movies") continue
-                val prefix = if (isMovie) "/watch/" else "/series/"
-                val encodedSlug = URLEncoder.encode(slug, "UTF-8").replace("+", "%20")
-                val itemUrl = "$base$prefix$encodedSlug"
-                val year = item.optString("year").takeIf { it.isNotBlank() }?.toIntOrNull()
-                val slug2 = decodeSlug(itemUrl)
-                val latin = latinTitleFromSlug(slug2).ifBlank { latinTitleFromSlug(title) }
-                if (latin.isBlank()) continue
-                out.add(Candidate(itemUrl, slug2, latin, year ?: yearFromSlug(slug2)))
-            }
-            out.distinctBy { it.url }
+            val base = akwamBase()
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val doc = cfGetDoc("$base/search?q=$encoded", referer = base, timeout = 15000)
+            doc.select("div.col-lg-auto.col-md-4.col-6").mapNotNull { card ->
+                val a = card.selectFirst("h3.entry-title a") ?: return@mapNotNull null
+                val rawHref = card.selectFirst("a")?.attr("href").orEmpty()
+                if (rawHref.isBlank()) return@mapNotNull null
+                val href = fixUrl(rawHref, base).takeIf { it.startsWith("http") } ?: return@mapNotNull null
+                if (type == "movies" && ("/series/" in href || "/episode/" in href)) return@mapNotNull null
+                if (type == "series" && "/movie" in href) return@mapNotNull null
+                val titleText = a.text().trim()
+                val slug = decodeSlug(href)
+                val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
+                if (latin.isBlank()) return@mapNotNull null
+                Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
+            }.distinctBy { it.url }
         } catch (e: Exception) {
-            Log.e(WECIMA_TAG, "[search ] failed: ${e.message}")
+            Log.e(AKWAM_TAG, "[search ] failed: ${e.message}")
             emptyList()
         }
     }
 }
 
-private suspend fun wecimaResolveMovie(
+/** Season number from href + link text: digits first, then Arabic ordinals. */
+private fun akwamSeasonNum(href: String, text: String): Int? {
+    val decoded = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
+    egDeadNum(EGDEAD_SEASON_REGEX, "$decoded $text")?.let { return it }
+    return arabicOrdinalNum("$decoded $text")
+}
+
+private fun akwamEpisodeNum(href: String, text: String): Int? {
+    val decoded = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
+    return Regex("""\d+""").findAll("$decoded $text").lastOrNull()?.value?.toIntOrNull()
+}
+
+private suspend fun akwamResolveMovie(
     title: String,
     year: Int?,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val candidates = wecimaSearch(title, "movies")
-    Log.d(WECIMA_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    val candidates = akwamSearch(title, "movies")
+    Log.d(AKWAM_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
     if (candidates.isEmpty()) return false
     val best = candidates.map { it to scoreCandidate(it, title, year) }
         .maxByOrNull { it.second }
         ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
     if (best == null) {
-        Log.d(WECIMA_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        Log.d(AKWAM_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
         return false
     }
-    Log.d(WECIMA_TAG, "[match  ] WINNER ${best.url}")
-    return wecimaExtractServers(best.url, subtitleCallback, callback)
+    Log.d(AKWAM_TAG, "[match  ] WINNER ${best.url}")
+    return akwamExtractLinks(best.url, subtitleCallback, callback)
 }
 
-private suspend fun wecimaResolveEpisode(
+private suspend fun akwamResolveEpisode(
     title: String,
     season: Int,
     episode: Int,
@@ -3037,93 +2987,130 @@ private suspend fun wecimaResolveEpisode(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
-    val candidates = wecimaSearch(title, "series")
-    Log.d(WECIMA_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val candidates = akwamSearch(title, "series")
+    Log.d(AKWAM_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
     val anchor = candidates.map { it to scoreCandidate(it, title, year) }
         .filter { it.second >= MIN_SCORE_SERIES }
         .maxByOrNull { it.second }?.first
     if (anchor == null) {
-        Log.d(WECIMA_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        Log.d(AKWAM_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
         return false
     }
-    Log.d(WECIMA_TAG, "[match  ] anchor ${anchor.url}")
-    StreamlyCache.markEpisodeMatched("wecima")
-    val doc = wecimaSmartGet(anchor.url)
-    val epUrl = exactEpisodeUrl(doc, season, episode)
-        ?: run {
-            Log.d(WECIMA_TAG, "[match  ] E$episode not in series episode list")
-            return false
-        }
-    return wecimaExtractServers(epUrl, subtitleCallback, callback)
+    Log.d(AKWAM_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("akwam")
+    // A direct episode hit still wins outright.
+    if ("/episode/" in anchor.url) {
+        Log.d(AKWAM_TAG, "[match  ] anchor is a direct episode")
+        return akwamExtractLinks(anchor.url, subtitleCallback, callback)
+    }
+    val hub = try {
+        cfGetDoc(anchor.url, timeout = 15000)
+    } catch (e: Exception) {
+        Log.e(AKWAM_TAG, "[anchor ] failed: ${e.message}")
+        return false
+    }
+    // Seasons, including the current page itself (single-season shows list no tabs).
+    val seasonLinks = LinkedHashMap<String, Int>()
+    seasonLinks[anchor.url] =
+        akwamSeasonNum(anchor.url, hub.selectFirst("h1.entry-title")?.text().orEmpty()) ?: 1
+    hub.select("div.widget-body > a.btn[href*='/series/']").forEach { a ->
+        val href = fixUrl(a.attr("href"), anchor.url).takeIf { it.startsWith("http") } ?: return@forEach
+        val num = akwamSeasonNum(href, a.text()) ?: return@forEach
+        seasonLinks.putIfAbsent(href, num)
+    }
+    val seasonUrl = seasonLinks.entries.firstOrNull { it.value == season }?.key
+    if (seasonUrl == null) {
+        Log.d(AKWAM_TAG, "[match  ] S$season not in seasons list (${seasonLinks.values})")
+        return false
+    }
+    val seasonDoc = if (seasonUrl == anchor.url) hub else try {
+        cfGetDoc(seasonUrl, timeout = 15000)
+    } catch (e: Exception) {
+        Log.e(AKWAM_TAG, "[season ] failed: ${e.message}")
+        return false
+    }
+    val epUrl = seasonDoc.select("div#series-episodes a[href*='/episode/']").mapNotNull { a ->
+        val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") } ?: return@mapNotNull null
+        href to (akwamEpisodeNum(href, a.text()) ?: 9999)
+    }.firstOrNull { it.second == episode }?.first
+    if (epUrl == null) {
+        Log.d(AKWAM_TAG, "[match  ] E$episode not in season episode list")
+        return false
+    }
+    Log.d(AKWAM_TAG, "[match  ] E$episode -> $epUrl")
+    return akwamExtractLinks(epUrl, subtitleCallback, callback)
 }
 
-private suspend fun wecimaExtractServers(
+private suspend fun akwamExtractLinks(
     postUrl: String,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
-): Boolean = coroutineScope {
-    StreamlyCache.markEpisodeMatched("wecima")
-    try {
-        val doc = wecimaSmartGet(postUrl)
-        val linksToProcess = mutableListOf<Pair<String, String>>()
-        doc.select("ul.WatchServersList li btn").forEach { serverBtn ->
-            val encodedUrl = serverBtn.attr("data-url")
-            val decoded = wecimaDecodeUrl(encodedUrl)
-            if (decoded != null && decoded.startsWith("http")) {
-                linksToProcess.add(decoded to "Wecima")
-            }
+): Boolean {
+    StreamlyCache.markEpisodeMatched("akwam")
+    return try {
+        val page = try {
+            cfGetDoc(postUrl, timeout = 15000)
+        } catch (e: Exception) {
+            Log.e(AKWAM_TAG, "[watch  ] page failed: ${e.message}")
+            return false
         }
-        doc.select(".openLinkDown").forEach { downloadBtn ->
-            val encodedUrl = downloadBtn.attr("data-href")
-            val decoded = wecimaDecodeUrl(encodedUrl)
-            if (decoded != null && decoded.startsWith("http")) {
-                val qualityText = downloadBtn.selectFirst("resolution")?.text()?.trim() ?: ""
-                val typeText = downloadBtn.selectFirst("quality")?.text()?.trim() ?: "Download"
-                linksToProcess.add(decoded to "Wecima $typeText")
-            }
+        // Movies link the player directly; series go episode -> watch page.
+        val watchHref = page.selectFirst("a.link-show")?.let {
+            fixUrl(it.attr("href").ifBlank { it.absUrl("href") }, postUrl)
+        }?.takeIf { it.startsWith("http") } ?: postUrl
+        val watch = if (watchHref == postUrl) page else try {
+            cfGetDoc(watchHref, referer = postUrl, timeout = 15000)
+        } catch (e: Exception) {
+            Log.e(AKWAM_TAG, "[watch  ] player page failed: ${e.message}")
+            return false
         }
-        val distinct = linksToProcess.distinctBy { it.first }
-        Log.d(WECIMA_TAG, "[watch  ] ${distinct.size} servers on $postUrl")
-        if (distinct.isEmpty()) return@coroutineScope false
-        distinct.amap { (link, serverName) ->
-            async {
-                if (isDeadLocker(link)) return@async
-                var n = 0
-                val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
-                EmbedRouter.route(link, postUrl, subtitleCallback, counting, serverName)
-                Log.d(WECIMA_TAG, "[watch  ] server $serverName emitted=$n")
-            }
-        }.awaitAll()
+        val sources = watch.select("source[src]").mapNotNull { src ->
+            val raw = src.attr("abs:src").ifBlank { src.attr("src") }.trim().replace(" ", "%20")
+            if (raw.isBlank() || !raw.startsWith("http")) return@mapNotNull null
+            val label = src.attr("size").ifBlank { src.attr("label") }.ifBlank { "Akwam" }
+            Triple(raw, label, raw.contains(".m3u8", ignoreCase = true))
+        }.distinctBy { it.first }
+        Log.d(AKWAM_TAG, "[watch  ] ${sources.size} sources on $watchHref")
+        if (sources.isEmpty()) return false
+        sources.forEach { (raw, label, hls) ->
+            callback(
+                newExtractorLink("Akwam", "Akwam", url = raw) {
+                    this.referer = postUrl
+                    this.quality = getQualityFromName(label)
+                    this.type = if (hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                },
+            )
+        }
         true
     } catch (e: Exception) {
-        Log.e(WECIMA_TAG, "[watch  ] failed: ${e.message}")
+        Log.e(AKWAM_TAG, "[watch  ] failed: ${e.message}")
         false
     }
 }
 
-suspend fun invokeWecima(
+suspend fun invokeAkwam(
     res: LinkData,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit,
 ): Boolean {
     val title = res.title?.trim().orEmpty()
-    Log.d(WECIMA_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
-    StreamlyDiag.lastStage = "Wecima: start"
+    Log.d(AKWAM_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "Akwam: start"
     if (title.isEmpty()) return false
     var emitted = 0
     val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
     return try {
         val ok = if (res.isMovie) {
-            wecimaResolveMovie(title, res.year, subtitleCallback, counting)
+            akwamResolveMovie(title, res.year, subtitleCallback, counting)
         } else {
-            wecimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+            akwamResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
         }
-        Log.d(WECIMA_TAG, "[done  ] emitted=$emitted ok=$ok")
-        StreamlyDiag.lastStage = if (emitted > 0) "Wecima: ok" else "Wecima: no links"
+        Log.d(AKWAM_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "Akwam: ok" else "Akwam: no links"
         ok || emitted > 0
     } catch (e: Exception) {
-        Log.e(WECIMA_TAG, "[invoke] failed: ${e.message}")
-        StreamlyDiag.lastStage = "Wecima: ${e.message}"
+        Log.e(AKWAM_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "Akwam: ${e.message}"
         emitted > 0
     }
 }
