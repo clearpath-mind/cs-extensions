@@ -107,8 +107,9 @@ object CloudflareSolver {
     /** @param awaitContent when false, deliver cookies as soon as clearance
      *  is captured without waiting for rendered DOM (episode-post fetches
      *  only need cookies for the OkHttp retry; the 30s content wait is pure
-     *  waste when the challenge platform can't load). */
-    suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String, awaitContent: Boolean = true): SolverResult? {
+     *  waste when the challenge platform can't load).
+     *  @param timeoutMs overall solver timeout (default 15s). */
+    suspend fun solve(activity: Activity?, initialUrl: String, userAgent: String, awaitContent: Boolean = true, timeoutMs: Long = 15000): SolverResult? {
         return suspendCoroutine { continuation ->
             if (activity == null || activity.isFinishing) {
                 continuation.resume(null)
@@ -207,8 +208,8 @@ object CloudflareSolver {
                 }
 
                 pollingHandler.postDelayed({
-                    finishSuccess(webView.url ?: initialUrl, "Timeout - 15s")
-                }, 15000)
+                    finishSuccess(webView.url ?: initialUrl, "Timeout - ${timeoutMs}ms")
+                }, timeoutMs)
 
                 fun simulateRealTouch(view: WebView, cssX: Float, cssY: Float) {
                     val density = activity.resources.displayMetrics.density

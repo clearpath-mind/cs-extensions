@@ -576,7 +576,7 @@ private val cloudflareKiller by lazy { CloudflareKiller() }
 
 /** Per-provider CF timeout overrides: heavily CF-protected sites need more room. */
 private fun cfSolverTimeoutFor(url: String): Long {
-    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("")
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("") ?: ""
     return when {
         "egydead" in host -> 30000L // EgyDead aggressively 403s datacenter traffic
         "fasel" in host -> 20000L   // FaselHD can be slow on complex challenges
@@ -586,7 +586,7 @@ private fun cfSolverTimeoutFor(url: String): Long {
 
 /** Per-provider retry delay: rate-limited sites need more time between attempts. */
 private fun cfRetryDelayFor(url: String): Long {
-    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("")
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("") ?: ""
     return when {
         "egydead" in host -> 1000L // EgyDead rate-limits aggressively
         "fasel" in host -> 750L    // FaselHD moderate rate-limiting
@@ -766,7 +766,7 @@ private suspend fun cfGetDoc(
         }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
-    val solved = cfSolve(target, awaitContent = false)
+    val solved = cfSolve(target, awaitContent = false, timeoutMs = solverTimeout)
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
         takeSolverHtml(solved, retryUrl)?.let { html ->
@@ -810,7 +810,7 @@ private suspend fun cfGetText(
         }
     }
     Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
-    val solved = cfSolve(target, awaitContent = false)
+    val solved = cfSolve(target, awaitContent = false, timeoutMs = cfSolverTimeoutFor(target))
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     if (solved != null) {
         takeSolverHtml(solved, retryUrl)?.let { html ->
@@ -863,7 +863,7 @@ private suspend fun cfPostText(
     }
     // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
     Log.d(TAG, "[cfPost ] wall ($target), solving…")
-    val solved = cfSolve(target, awaitContent = false)
+    val solved = cfSolve(target, awaitContent = false, timeoutMs = cfSolverTimeoutFor(target))
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
@@ -1513,7 +1513,7 @@ private suspend fun faselHdAjaxPost(
     // solved DOM there (re-3arabi smartPost solves mainUrl for the same
     // reason). Clearance cookies are site-wide.
     // awaitContent = false: we only need cookies, not rendered DOM (fastSolve pattern).
-    cfSolve(base, awaitContent = false)
+    cfSolve(base, awaitContent = false, timeoutMs = cfSolverTimeoutFor(base))
     return try {
         faselHdAjaxAttempt(ajaxUrl, base, formBody, cfCookies(base))
     } catch (e: IllegalStateException) {
@@ -2949,7 +2949,7 @@ private suspend fun wecimaSmartGet(url: String, referer: String? = null, timeout
             delay(500)
         }
     }
-    val solved = cfSolve(url, awaitContent = false)
+    val solved = cfSolve(url, awaitContent = false, timeoutMs = cfSolverTimeoutFor(url))
     if (solved != null) {
         takeSolverHtml(solved, url)?.let { return Jsoup.parse(it, url) }
     }
