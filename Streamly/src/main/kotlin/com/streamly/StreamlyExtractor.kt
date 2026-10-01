@@ -2923,6 +2923,13 @@ private suspend fun akwamExtractLinks(
                     this.referer = postUrl
                     this.quality = getQualityFromName(label)
                     this.type = if (hls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    // MMR/preview + head requests only see the headers map
+                    // (referer field alone arrives as lowercase `referer`);
+                    // send standards-cased Referer (ASCII-safe) + UA.
+                    this.headers = mapOf(
+                        "Referer" to (safeReferer(postUrl) ?: postUrl),
+                        "User-Agent" to effectiveUa(),
+                    )
                 },
             )
         }
