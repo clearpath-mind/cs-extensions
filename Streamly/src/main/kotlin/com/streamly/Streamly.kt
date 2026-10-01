@@ -35,7 +35,6 @@ import com.lagradost.cloudstream3.toNewSearchResponseList
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.streamly.settings.StreamlyStremioSettings
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -676,19 +675,7 @@ open class Streamly : MainAPI() {
             }
         }
 
-        // Stremio addons race alongside providers (no-ops when none saved
-        // or when TMDB gave no imdbId).
-        val stremioTasks: List<suspend () -> Unit> =
-            StreamlyStremioSettings.getDynamicStremioMap(
-                sharedPref,
-                res.imdbId,
-                res.season,
-                res.episode,
-                dedupSub,
-                dedupCallback,
-            ).values.toList()
-
-        StreamlyConcurrency.runLimitedAsync(appContext, *(tasks + stremioTasks).toTypedArray())
+        StreamlyConcurrency.runLimitedAsync(appContext, *tasks.toTypedArray())
         sharedPref?.let { StreamlyCache.saveProviderStats(it) }
         if (seenLinks.isNotEmpty()) Log.d(TAG, "[done  ] distinct links=${seenLinks.size}")
         true

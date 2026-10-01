@@ -22,9 +22,6 @@ object ProvidersList {
             Provider("faselhd", "FaselHD") { res, sub, cb ->
                 invokeFaselHd(res, sub, cb)
             },
-            Provider("shoof", "Shoof") { res, sub, cb ->
-                invokeShoof(res, sub, cb)
-            },
             Provider("egydead", "EgyDead") { res, sub, cb ->
                 invokeEgyDead(res, sub, cb)
             },
