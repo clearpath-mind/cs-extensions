@@ -93,7 +93,6 @@ object StreamlyCache {
     private val BASE_PRIORITY = mapOf(
         "topcinema" to 3f,
         "faselhd" to 1f,
-        "shoof" to 1f,
         "egydead" to 1f,
         "akwam" to 1f,
     )
@@ -119,13 +118,13 @@ object StreamlyCache {
      * actually matched something (series anchor or episode/post URL, signalled
      * via [markEpisodeMatched]) may keep running up to [EXTRACTION_BUDGET_MS]
      * total — see loadLinks. Providers that never matched stay at the 30s
-     * probe so dead ends (Shoof no-anchor) fail fast.
+     * probe so dead ends (no-anchor) fail fast.
      */
     fun getAdaptiveTimeout(providerId: String, baseTimeoutMs: Long = 90000): Long {
         val stats = getProviderStats(providerId)
         if (stats.successCount == 0) {
             // Broken without history gets 30s, not 20s: dead ends return in
-            // seconds anyway (Shoof fails at ~5s), while a walled
+            // seconds anyway (dead ends fail at ~5s), while a walled
             // search needs ~25s just to anchor (FaselHD ?s= 24s on S1E13).
             return if (stats.isCircuitBroken) 30000L else baseTimeoutMs
         }

@@ -95,16 +95,6 @@ class StreamlyMainSettingsFragment(
         chevronLanguage.setImageDrawable(getDrawable("ic_chevron"))
         languageRow.nextFocusUpId = providersRow.id
 
-        val stremioRow: View = view.findView("stremioRow")
-        val stremioIconBg = view.findView<View>("stremioIconBg")
-        val stremioIcon = view.findView<ImageView>("stremioIcon")
-        val chevronStremio = view.findView<ImageView>("chevronStremio")
-        stremioRow.background = getDrawable("settings_item_background")
-        stremioIconBg.background = getDrawable("ic_icon_bg_purple")
-        stremioIcon.setImageDrawable(getDrawable("ic_addon"))
-        chevronStremio.setImageDrawable(getDrawable("ic_chevron"))
-        stremioRow.nextFocusUpId = languageRow.id
-
         val showSubFragment = { fragmentCreator: (() -> Unit) -> DialogFragment, tag: String ->
             val fm = activity?.supportFragmentManager
             if (fm != null) {
@@ -123,10 +113,6 @@ class StreamlyMainSettingsFragment(
 
         languageRow.setOnClickListener {
             showSubFragment({ cb -> StreamlyLanguageFragment(plugin, sharedPref, cb) }, "streamly_language")
-        }
-
-        stremioRow.setOnClickListener {
-            showSubFragment({ cb -> StreamlyStremioFragment(plugin, sharedPref, cb) }, "streamly_stremio")
         }
 
         saveBtn.setOnClickListener {
