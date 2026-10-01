@@ -2954,7 +2954,8 @@ private suspend fun egDeadWatchServers(
 // Custom (non-WordPress) theme. Search is GET /search?q=<query>; result
 // cards are div.col-lg-auto.col-md-4.col-6 with h3.entry-title a. Detail
 // pages carry seasons as div.widget-body > a.btn[href*='/series/'] and
-// episodes under div#series-episodes (a[href*='/episode/']). The detail /
+// episodes under [id=series-episodes] (attribute form: the id is reused
+// twice on the page, so div#... only sees the first block). The detail /
 // episode page links the watch player via a.link-show; the watch page
 // serves direct <source src> video URLs (Arabic subs hardcoded), emitted
 // as VIDEO/M3U8 links with the episode page as referer.
@@ -3026,7 +3027,12 @@ private fun akwamSeasonNum(href: String, text: String): Int? {
 
 private fun akwamEpisodeNum(href: String, text: String): Int? {
     val decoded = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
-    return Regex("""\d+""").findAll("$decoded $text").lastOrNull()?.value?.toIntOrNull()
+    // Authoritative: trailing /الحلقة-<n> in the href. Never take the last
+    // bare digit of "$href $text": episode IDs (9131), thumb sizes
+    // (320x190) and digits inside English titles would win instead.
+    Regex("""الحلقة-(\d+)""").find(decoded)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
+    return egDeadNum(EGDEAD_EPISODE_REGEX, text)
+        ?: Regex("""\d+""").findAll(decoded).lastOrNull()?.value?.toIntOrNull()
 }
 
 private suspend fun akwamResolveMovie(
@@ -3102,7 +3108,13 @@ private suspend fun akwamResolveEpisode(
         Log.e(AKWAM_TAG, "[season ] failed: ${e.message}")
         return false
     }
-    val epUrl = seasonDoc.select("div#series-episodes a[href*='/episode/']").mapNotNull { a ->
+    // NOTE: the page reuses id="series-episodes" twice (season tabs +
+    // episode list), so a div#series-episodes selector only matches the
+    // FIRST block via getElementById and finds zero episodes. The
+    // [id=...] attribute form matches both blocks.
+    val epLinks = seasonDoc.select("[id=series-episodes] a[href*='/episode/']")
+    Log.d(AKWAM_TAG, "[eps    ] ${epLinks.size} episode links on $seasonUrl")
+    val epUrl = epLinks.mapNotNull { a ->
         val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") } ?: return@mapNotNull null
         href to (akwamEpisodeNum(href, a.text()) ?: 9999)
     }.firstOrNull { it.second == episode }?.first
