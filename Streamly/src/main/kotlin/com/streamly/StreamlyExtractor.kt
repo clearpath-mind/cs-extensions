@@ -3126,6 +3126,21 @@ private suspend fun akwamResolveEpisode(
     return akwamExtractLinks(epUrl, subtitleCallback, callback)
 }
 
+// downet.net CDN sends a leaf-only chain (no intermediate -> VERIFY 21 on
+// openssl, ERR_CERT_AUTHORITY_INVALID on Android Cronet). HTTPS can never
+// play on device, but plain HTTP serves the same bytes (401 on / for both
+// schemes, no redirect). Downgrade so ExoPlayer avoids TLS entirely.
+private fun akwamPlayableUrl(raw: String): String {
+    if (!raw.startsWith("https://", ignoreCase = true)) return raw
+    val host = runCatching { URI(raw).host.orEmpty() }.getOrDefault("")
+    if (host.endsWith("downet.net", ignoreCase = true)) {
+        val downgraded = "http://" + raw.substringAfter("://")
+        Log.d(AKWAM_TAG, "[tls-fix] downet leaf-only chain, downgrade to $downgraded")
+        return downgraded
+    }
+    return raw
+}
+
 private suspend fun akwamExtractLinks(
     postUrl: String,
     subtitleCallback: (SubtitleFile) -> Unit,
@@ -3153,8 +3168,10 @@ private suspend fun akwamExtractLinks(
         val sources = watch.select("source[src]").mapNotNull { src ->
             val raw = src.attr("abs:src").ifBlank { src.attr("src") }.trim().replace(" ", "%20")
             if (raw.isBlank() || !raw.startsWith("http")) return@mapNotNull null
+            val playable = akwamPlayableUrl(raw)
+            if (!playable.startsWith("http")) return@mapNotNull null
             val label = src.attr("size").ifBlank { src.attr("label") }.ifBlank { "Akwam" }
-            Triple(raw, label, raw.contains(".m3u8", ignoreCase = true))
+            Triple(playable, label, playable.contains(".m3u8", ignoreCase = true))
         }.distinctBy { it.first }
         Log.d(AKWAM_TAG, "[watch  ] ${sources.size} sources on $watchHref")
         if (sources.isEmpty()) return false
