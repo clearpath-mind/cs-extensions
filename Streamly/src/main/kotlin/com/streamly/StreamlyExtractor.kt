@@ -1427,10 +1427,25 @@ internal suspend fun faselHdBase(): String {
                 // Explicit String? type: app response accessors carry a jspecify
                 // @Nullable annotation that isn't on the compile classpath.
                 val tProbe = SystemClock.elapsedRealtime()
-                val probe: String? = try {
-                    app.get("$origin/main", timeout = 15000).text
-                } catch (_: Exception) {
-                    null
+                // The origin flaps with 502s (Cloudflare serves "Bad gateway"
+                // while the backend restarts): retry a dead probe once before
+                // giving up on the mirror so a transient outage doesn't fail
+                // the whole base detection.
+                var probe: String? = null
+                for (attempt in 0..1) {
+                    probe = try {
+                        val resp = app.get("$origin/main", timeout = 15000)
+                        if (resp.code in 500..599) {
+                            Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin HTTP ${resp.code} (attempt ${attempt + 1}/2)")
+                            null
+                        } else {
+                            resp.text
+                        }
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (isFaselHdPage(probe)) break
+                    if (attempt == 0) delay(2000)
                 }
                 if (isFaselHdPage(probe)) {
                     Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin in ${SystemClock.elapsedRealtime() - tProbe}ms")
@@ -1572,6 +1587,18 @@ private suspend fun faselHdAjaxAttempt(
                     }
                 }
                 200 -> return res.body?.string() ?: ""
+                502, 503, 504 -> {
+                    // Transient origin errors (the backend 502s under load):
+                    // back off and retry like a 429 instead of failing empty.
+                    if (rateRetries >= 3) {
+                        Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code} x3, giving up")
+                        StreamlyDiag.lastStage = "FaselHD: origin error"
+                        return ""
+                    }
+                    rateRetries++
+                    Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code}, retry $rateRetries/3")
+                    backoffMs = 1000L * rateRetries
+                }
                 else -> {
                     Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code}")
                     StreamlyDiag.lastStage = "FaselHD: ajax HTTP ${res.code}"
@@ -1649,10 +1676,28 @@ private suspend fun faselHdSearch(query: String): List<Candidate> {
     try {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val searchUrl = "$base/?s=$encoded"
-        val finalUrl = try {
-            app.get(searchUrl, timeout = 15000).url
-        } catch (_: Exception) {
-            searchUrl
+        // The origin 502s under load: retry the single-hit redirect check
+        // once so a transient error doesn't read as "no redirect".
+        var finalUrl = searchUrl
+        for (attempt in 0..1) {
+            try {
+                val resp = app.get(searchUrl, timeout = 15000)
+                if (resp.code in 500..599) {
+                    Log.w(FASELHD_TAG, "[search ] ?s= HTTP ${resp.code} (attempt ${attempt + 1}/2)")
+                    if (attempt == 0) {
+                        delay(2000)
+                        continue
+                    }
+                }
+                finalUrl = resp.url
+                break
+            } catch (_: Exception) {
+                if (attempt == 0) {
+                    delay(2000)
+                    continue
+                }
+                break
+            }
         }
         if (!finalUrl.contains("?s=", ignoreCase = true) &&
             finalUrl.trimEnd('/') != base.trimEnd('/')
@@ -2936,8 +2981,13 @@ private suspend fun akwamSearch(query: String, type: String): List<Candidate> {
                 if (type == "series" && "/movie" in href) return@mapNotNull null
                 val titleText = a.text().trim()
                 val slug = decodeSlug(href)
+                // Arabic-only cards (dubbed movies, Arabic series) carry no
+                // Latin tokens: keep them with the display title so the
+                // server-order fallback in the resolvers can still pick the
+                // server's top hit instead of failing the search as empty.
+                // Blank-latin candidates are excluded from fuzzy scoring and
+                // only ever win via that fallback.
                 val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
-                if (latin.isBlank()) return@mapNotNull null
                 Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText))
             }.distinctBy { it.url }
         } catch (e: Exception) {
@@ -2945,6 +2995,26 @@ private suspend fun akwamSearch(query: String, type: String): List<Candidate> {
             emptyList()
         }
     }
+}
+
+/** Server-order fallback for result sets with no Latin match (Arabic-only
+ *  cards: dubs, Arabic series). Akwam's own index already ranked these
+ *  against the query, so the top hit wins — guarded by year when both sides
+ *  know it, to avoid linking a same-name wrong-year remake. */
+private fun serverOrderFallback(
+    candidates: List<Candidate>,
+    title: String,
+    year: Int?,
+    kind: String,
+): Candidate? {
+    if (candidates.isEmpty()) return null
+    val top = candidates.first()
+    if (year != null && top.year != null && Math.abs(top.year - year) > 2) {
+        Log.d(AKWAM_TAG, "[match  ] server top ${top.url} year ${top.year} vs $year, rejecting")
+        return null
+    }
+    Log.d(AKWAM_TAG, "[match  ] SERVER-PICK $kind '$title' -> ${top.url} (no Latin candidate above threshold)")
+    return top
 }
 
 /** Season number from href + link text: digits first, then Arabic ordinals. */
@@ -2969,8 +3039,10 @@ private suspend fun akwamResolveMovie(
     Log.d(AKWAM_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
     if (candidates.isEmpty()) return false
     val best = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.first.latinTitle.isNotBlank() }
         .maxByOrNull { it.second }
         ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
+        ?: serverOrderFallback(candidates, title, year, "movies")
     if (best == null) {
         Log.d(AKWAM_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
         return false
@@ -2990,8 +3062,9 @@ private suspend fun akwamResolveEpisode(
     val candidates = akwamSearch(title, "series")
     Log.d(AKWAM_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
     val anchor = candidates.map { it to scoreCandidate(it, title, year) }
-        .filter { it.second >= MIN_SCORE_SERIES }
+        .filter { it.first.latinTitle.isNotBlank() && it.second >= MIN_SCORE_SERIES }
         .maxByOrNull { it.second }?.first
+        ?: serverOrderFallback(candidates, title, year, "series")
     if (anchor == null) {
         Log.d(AKWAM_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
         return false
