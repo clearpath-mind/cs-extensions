@@ -648,6 +648,36 @@ private suspend fun cfSolve(url: String, awaitContent: Boolean = true, timeoutMs
     return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, effectiveUa(), awaitContent, timeoutMs) }
 }
 
+/** OkHttp rejects non-ASCII header values: Arabic slugs (Akwam episode
+ *  URLs like /episode/9131/.../الحلقة-1) crash as Referer with
+ *  `IllegalArgumentException: Unexpected char 0x627`. Percent-encode
+ *  non-ASCII/control/space chars as UTF-8, preserving existing %XX. */
+private fun safeReferer(referer: String?): String? {
+    if (referer == null) return null
+    val sb = StringBuilder(referer.length)
+    var i = 0
+    while (i < referer.length) {
+        val c = referer[i]
+        val code = c.code
+        if (code in 0x21..0x7E) {
+            sb.append(c)
+        } else if (c == ' ' || c == '\t') {
+            sb.append("%20")
+        } else {
+            // Non-ASCII: encode the full code point (handles surrogate pairs).
+            val cp = referer.codePointAt(i)
+            if (Character.isSupplementaryCodePoint(cp)) i++
+            for (b in String(Character.toChars(cp)).toByteArray(Charsets.UTF_8)) {
+                sb.append('%')
+                sb.append("0123456789ABCDEF"[(b.toInt() shr 4) and 0xF])
+                sb.append("0123456789ABCDEF"[b.toInt() and 0xF])
+            }
+        }
+        i++
+    }
+    return sb.toString()
+}
+
 private fun cfHeaders(
     url: String,
     referer: String?,
@@ -675,7 +705,7 @@ private fun cfHeaders(
     putIfAbsent("Pragma", "no-cache")
     val c = cfCookies(url)
     if (c.isNotBlank()) putIfAbsent("Cookie", c)
-    if (referer != null) put("Referer", referer)
+    if (referer != null) put("Referer", safeReferer(referer) ?: referer)
 }
 
 /** Post-solve retry bound: with fresh clearance a healthy origin answers
@@ -745,10 +775,11 @@ private suspend fun cfGetDoc(
     awaitContent: Boolean = true,
 ): Document {
     val target = applyHostOverride(url)
+    val ref = safeReferer(referer)
     val solverTimeout = cfSolverTimeoutFor(target)
     val retryDelay = cfRetryDelayFor(target)
     val first = runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.document.toString())) {
         return first.document
@@ -758,7 +789,7 @@ private suspend fun cfGetDoc(
     // provider cleared the wall while we worked.
     delay(retryDelay)
     runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()?.let { pre ->
         if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.document.toString())) {
             Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
@@ -779,7 +810,7 @@ private suspend fun cfGetDoc(
     val ck = cfCookies(retryUrl)
     var retryErr: String? = null
     val second = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+        app.get(retryUrl, referer = ref, headers = cfHeaders(retryUrl, ref, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }} err=$retryErr")
     return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
@@ -792,9 +823,10 @@ private suspend fun cfGetText(
     timeout: Long = 15000,
 ): String {
     val target = applyHostOverride(url)
+    val ref = safeReferer(referer)
     val retryDelay = cfRetryDelayFor(target)
     val first = runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()
     if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.text)) {
         return first.text
@@ -802,7 +834,7 @@ private suspend fun cfGetText(
     // Stage 2 (re-3arabi smartGet): one silent plain retry before solving.
     delay(retryDelay)
     runCatching {
-        app.get(target, referer = referer, headers = cfHeaders(target, referer, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.getOrNull()?.let { pre ->
         if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.text)) {
             Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
@@ -828,7 +860,7 @@ private suspend fun cfGetText(
     // @Nullable annotation that isn't on the compile classpath.
     var retryErr: String? = null
     val secondResp = runCatching {
-        app.get(retryUrl, referer = referer, headers = cfHeaders(retryUrl, referer, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+        app.get(retryUrl, referer = ref, headers = cfHeaders(retryUrl, ref, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
     }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     val second: String? = secondResp?.text
     Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }} err=$retryErr")
@@ -846,15 +878,16 @@ private suspend fun cfPostText(
         putIfAbsent("X-Requested-With", "XMLHttpRequest")
     }
     val target = applyHostOverride(url)
+    val ref = safeReferer(referer)
     val retryDelay = cfRetryDelayFor(target)
     val first = runCatching {
-        app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout, cacheTime = 0).text
+        app.post(target, data = data, referer = ref, headers = cfHeaders(target, ref, baseHeaders), timeout = timeout, cacheTime = 0).text
     }.getOrNull()
     if (first != null && !isCfChallenge(first)) return first
     // Stage 2 (re-3arabi smartPost): one silent plain retry before solving.
     delay(retryDelay)
     runCatching {
-        app.post(target, data = data, referer = referer, headers = cfHeaders(target, referer, baseHeaders), timeout = timeout, cacheTime = 0).text
+        app.post(target, data = data, referer = ref, headers = cfHeaders(target, ref, baseHeaders), timeout = timeout, cacheTime = 0).text
     }.getOrNull()?.let { pre ->
         if (!isCfChallenge(pre)) {
             Log.d(TAG, "[cfPost ] wall cleared on silent retry for $target")
@@ -870,7 +903,7 @@ private suspend fun cfPostText(
     // @Nullable annotation that isn't on the compile classpath.
     var postErr: String? = null
     val secondResp = runCatching {
-        app.post(retryUrl, data = data, referer = referer, headers = cfHeaders(retryUrl, referer, baseHeaders), timeout = cfRetryTimeout(timeout), cacheTime = 0)
+        app.post(retryUrl, data = data, referer = ref, headers = cfHeaders(retryUrl, ref, baseHeaders), timeout = cfRetryTimeout(timeout), cacheTime = 0)
     }.onFailure { postErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
     val retry: String? = secondResp?.text
     Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }} err=$postErr")
