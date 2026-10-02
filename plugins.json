@@ -2,20 +2,20 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/FreeSidePlus.cs3",
         "status": 1,
-        "version": 5,
+        "version": 6,
         "name": "FreeSidePlus",
         "internalName": "FreeSidePlus",
         "authors": [
             "clearpath-mind"
         ],
-        "fileSize": 27308,
+        "fileSize": 25771,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "en",
         "tvTypes": [
             "Movie"
         ],
         "apiVersion": 1,
-        "fileHash": "sha256-b404dd8719333fc3b9d1b2a8f76c609d874cabde70d3ad3d3e4d85382680ae29"
+        "fileHash": "sha256-a4b9944508dd97d9c911d0820fa48525a292727673af3ba1d2072924c8ff4618"
     },
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
