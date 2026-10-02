@@ -8,5 +8,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class FreeSidePlusPlugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(FreeSidePlusProvider())
+        registerExtractorAPI(DoodDsvplay())
+        registerExtractorAPI(ByseFsp())
     }
 }

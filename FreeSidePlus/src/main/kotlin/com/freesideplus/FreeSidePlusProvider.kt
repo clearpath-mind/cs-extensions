@@ -79,8 +79,13 @@ class FreeSidePlusProvider : MainAPI() {
     private val postFields = "_fields=id,link,date,title,content,categories,featured_media"
     private val yearRegex = Regex("""\b(19|20)\d{2}\b""")
     private val durationRegex = Regex("""\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b""")
+    private val qualitySuffixRegex = Regex("""\s*\(?\d{3,4}p\)?\s*$""", RegexOption.IGNORE_CASE)
 
     private fun unescape(s: String): String = Parser.unescapeEntities(s, false).trim()
+
+    /** Drops trailing quality tokens sites bake into titles ("… (1080p)"). */
+    private fun cleanTitle(raw: String): String =
+        unescape(raw).replace(qualitySuffixRegex, "").trim()
 
     /** Landscape thumbnail for horizontal cards (390x220 crop, else full). */
     private fun landscapeUrl(media: WpMedia): String? {
@@ -105,7 +110,7 @@ class FreeSidePlusProvider : MainAPI() {
 
     private fun toSearchResponse(post: WpPost, posters: Map<Int, String>): SearchResponse? {
         if (post.id <= 0) return null
-        val title = post.title?.rendered?.let(::unescape)?.takeIf { it.isNotBlank() } ?: return null
+        val title = post.title?.rendered?.let(::cleanTitle)?.takeIf { it.isNotBlank() } ?: return null
         return newMovieSearchResponse(title, LinkData(post.id).toJson(), TvType.Movie) {
             this.posterUrl = posters[post.featuredMedia]
         }
@@ -160,21 +165,22 @@ class FreeSidePlusProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val id = runCatching { parseJson<LinkData>(url).id }.getOrNull() ?: 0
         val post = fetchPost(id) ?: throw IllegalStateException("Post not found")
-        val title = post.title?.rendered?.let(::unescape)?.takeIf { it.isNotBlank() } ?: "Episode"
+        val title = post.title?.rendered?.let(::cleanTitle)?.takeIf { it.isNotBlank() } ?: "Episode"
         val frag = post.content?.rendered?.let { Jsoup.parseBodyFragment(it) }
         val plot = frag?.selectFirst(".fsp-desc")?.text()?.trim()?.takeIf { it.isNotBlank() }
+        // LoadResponse.duration is in minutes.
         val duration = frag?.select(".fsp-tag, .fsp-item-value")
             ?.firstNotNullOfOrNull { durationRegex.find(it.text()) }
             ?.let { match ->
-                val hms = match.groupValues
-                val hours = hms[3].toIntOrNull()
-                if (hours != null) {
-                    hms[1].toIntOrNull()?.times(3600)?.plus(
-                        (hms[2].toIntOrNull() ?: 0) * 60 + hours
-                    )
+                val parts = match.groupValues
+                val totalSeconds = if (parts[3].isNotEmpty()) {
+                    (parts[1].toIntOrNull() ?: 0) * 3600 +
+                        (parts[2].toIntOrNull() ?: 0) * 60 +
+                        (parts[3].toIntOrNull() ?: 0)
                 } else {
-                    (hms[1].toIntOrNull() ?: 0) * 60 + (hms[2].toIntOrNull() ?: 0)
+                    (parts[1].toIntOrNull() ?: 0) * 60 + (parts[2].toIntOrNull() ?: 0)
                 }
+                (totalSeconds + 30) / 60
             }
         val year = yearRegex.find(post.date.orEmpty())?.value?.toIntOrNull()
             ?: yearRegex.find(title)?.value?.toIntOrNull()
