@@ -117,10 +117,13 @@ class FreeSidePlusProvider : MainAPI() {
     private fun cleanTitle(raw: String): String =
         unescape(raw).replace(qualitySuffixRegex, "").trim()
 
-    /** Landscape thumbnail for horizontal cards (390x220 crop, else full). */
+    /** Landscape thumbnail for horizontal cards (780x470 crop, else fallbacks). */
     private fun landscapeUrl(media: WpMedia): String? {
-        val crop = media.mediaDetails?.sizes?.get("jannah-image-large")?.sourceUrl
+        val sizes = media.mediaDetails?.sizes
+        val crop = sizes?.get("jannah-image-post")?.sourceUrl
             ?.takeIf { it.startsWith("http") }
+            ?: sizes?.get("jannah-image-large")?.sourceUrl
+                ?.takeIf { it.startsWith("http") }
         if (crop != null) return crop
         return media.sourceUrl?.takeIf { it.startsWith("http") }
     }
