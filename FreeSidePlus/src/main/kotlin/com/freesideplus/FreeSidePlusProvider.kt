@@ -132,9 +132,9 @@ class FreeSidePlusProvider : MainAPI() {
     private suspend fun fetchPosts(url: String): Pair<List<WpPost>, Boolean> {
         val res = app.get(url)
         val posts = runCatching { parseJson<List<WpPost>>(res.text) }.getOrNull().orEmpty()
-        val totalPages = res.headers.entries
-            .firstOrNull { it.key.equals("X-WP-TotalPages", ignoreCase = true) }
-            ?.value?.toIntOrNull()
+        val totalPages = (0 until res.headers.size)
+            .firstOrNull { res.headers.name(it).equals("X-WP-TotalPages", ignoreCase = true) }
+            ?.let { res.headers.value(it).toIntOrNull() }
         val page = Regex("[?&]page=(\\d+)").find(url)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
         return posts to (totalPages == null || page < totalPages)
     }
