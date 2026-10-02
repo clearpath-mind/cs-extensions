@@ -50,6 +50,11 @@ data class WpMedia(
     @JsonProperty("media_details") val mediaDetails: WpMediaDetails? = null,
 )
 
+data class WpCategory(
+    @JsonProperty("id") val id: Int = 0,
+    @JsonProperty("name") val name: String? = null,
+)
+
 data class LinkData(
     @JsonProperty("id") val id: Int = 0,
 )
@@ -82,6 +87,31 @@ class FreeSidePlusProvider : MainAPI() {
     private val qualitySuffixRegex = Regex("""\s*\(?\d{3,4}p\)?\s*$""", RegexOption.IGNORE_CASE)
 
     private fun unescape(s: String): String = Parser.unescapeEntities(s, false).trim()
+
+    private var categoryNames: Map<Int, String>? = null
+
+    private suspend fun getCategoryNames(): Map<Int, String> {
+        categoryNames?.let { return it }
+        val map = runCatching {
+            parseJson<List<WpCategory>>(
+                app.get("$apiBase/categories?per_page=100&_fields=id,name").text
+            ).mapNotNull { cat ->
+                val n = cat.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                cat.id to Parser.unescapeEntities(n, false)
+            }.toMap()
+        }.getOrNull().orEmpty()
+        categoryNames = map
+        return map
+    }
+
+    /** "2026-09-25T20:37:01" -> "25 Sep 2026". */
+    private fun formatDate(iso: String): String? {
+        return try {
+            val parsed = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+                .parse(iso.substring(0, 10)) ?: return null
+            java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.US).format(parsed)
+        } catch (_: Exception) { null }
+    }
 
     /** Drops trailing quality tokens sites bake into titles ("… (1080p)"). */
     private fun cleanTitle(raw: String): String =
@@ -188,6 +218,11 @@ class FreeSidePlusProvider : MainAPI() {
             fetchPosters(listOf(post.featuredMedia))[post.featuredMedia]
         } else null
         val pageUrl = post.link?.takeIf { it.startsWith("http") } ?: "$mainUrl/?p=${post.id}"
+        val names = getCategoryNames()
+        val tags = buildList {
+            post.categories?.mapNotNullTo(this) { names[it] }
+            post.date?.let(::formatDate)?.let(::add)
+        }.distinct().takeIf { it.isNotEmpty() }
         val recommendations = post.categories?.firstOrNull()?.let { catId ->
             runCatching {
                 val (related, _) = fetchPosts(
@@ -200,6 +235,7 @@ class FreeSidePlusProvider : MainAPI() {
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.plot = plot
+            this.tags = tags
             this.year = year
             this.duration = duration
             this.recommendations = recommendations.takeIf { it.isNotEmpty() }
