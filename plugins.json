@@ -2,13 +2,13 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/FreeSidePlus.cs3",
         "status": 1,
-        "version": 10,
+        "version": 11,
         "name": "FreeSidePlus",
         "internalName": "FreeSidePlus",
         "authors": [
             "clearpath-mind"
         ],
-        "fileSize": 29595,
+        "fileSize": 29688,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "en",
         "tvTypes": [
@@ -16,7 +16,7 @@
         ],
         "iconUrl": "https://freesideplus.plus/wp-content/uploads/2026/06/FSP-LOGO.png",
         "apiVersion": 1,
-        "fileHash": "sha256-3cc95490a602953be5a0d565baeb445ee75882ee0354546007d6851591b167eb"
+        "fileHash": "sha256-682fbd619439fd26f17bfa7de5e5a6dfda40df48864c1e216f8969991603f44a"
     },
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
