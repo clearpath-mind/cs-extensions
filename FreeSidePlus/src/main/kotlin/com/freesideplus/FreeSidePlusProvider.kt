@@ -73,12 +73,7 @@ class FreeSidePlusProvider : MainAPI() {
         "37" to "Side+ Saturdays",
         "34" to "Sidecast",
         "36" to "BTS",
-        "35" to "Sidemen Sunday",
-        "31" to "Game Shows",
-        "32" to "Debate Club",
-        "38" to "Sideless Mondays",
-        "44" to "Ask the Sidemen",
-        "57" to "Fine or Fucked",
+        "35" to "Sidemen Sundays",
     )
 
     private val postFields = "_fields=id,link,date,title,content,categories,featured_media"
