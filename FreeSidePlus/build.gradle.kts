@@ -1,4 +1,4 @@
-version = 2
+version = 3
 
 android {
     namespace = "com.freesideplus"
@@ -7,7 +7,6 @@ android {
 cloudstream {
     authors = listOf("clearpath-mind")
     language = "en"
-    description = "FreeSidePlus - Sidemen Side+ archive episodes"
 
     status = 1
 
