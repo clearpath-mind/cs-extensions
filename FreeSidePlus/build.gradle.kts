@@ -1,4 +1,4 @@
-version = 9
+version = 10
 
 android {
     namespace = "com.freesideplus"
@@ -13,6 +13,8 @@ cloudstream {
     tvTypes = listOf(
         "Movie"
     )
+
+    iconUrl = "https://freesideplus.plus/wp-content/uploads/2026/06/FSP-LOGO.png"
 }
 
 dependencies {
