@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 android {
     namespace = "com.freesideplus"
@@ -14,4 +14,10 @@ cloudstream {
     tvTypes = listOf(
         "Movie"
     )
+}
+
+dependencies {
+    // jsoup 1.22.2 annotates nullable returns with jspecify; it is not
+    // transitively on the compile classpath, so declare it explicitly.
+    implementation("org.jspecify:jspecify:1.0.0")
 }
