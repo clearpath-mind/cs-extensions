@@ -50,11 +50,6 @@ data class WpMedia(
     @JsonProperty("media_details") val mediaDetails: WpMediaDetails? = null,
 )
 
-data class WpCategory(
-    @JsonProperty("id") val id: Int = 0,
-    @JsonProperty("name") val name: String? = null,
-)
-
 data class LinkData(
     @JsonProperty("id") val id: Int = 0,
 )
@@ -67,36 +62,23 @@ class FreeSidePlusProvider : MainAPI() {
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Movie)
 
-    // Top categories by post count (verified via /categories?orderby=count).
+    // Editorial order: Latest, then the main shows.
     override val mainPage = mainPageOf(
         "0" to "Latest Episodes",
-        "36" to "BTS",
-        "34" to "Sidecast",
-        "44" to "Ask the Sidemen",
-        "35" to "Sidemen Sunday",
-        "57" to "Fine or Fucked",
-        "31" to "Game Shows",
         "37" to "Side+ Saturdays",
+        "34" to "Sidecast",
+        "36" to "BTS",
+        "35" to "Sidemen Sunday",
+        "31" to "Game Shows",
+        "32" to "Debate Club",
+        "38" to "Sideless Mondays",
+        "44" to "Ask the Sidemen",
+        "57" to "Fine or Fucked",
     )
 
     private val postFields = "_fields=id,link,date,title,content,categories,featured_media"
     private val yearRegex = Regex("""\b(19|20)\d{2}\b""")
-
-    private var categoryNames: Map<Int, String>? = null
-
-    private suspend fun getCategoryNames(): Map<Int, String> {
-        categoryNames?.let { return it }
-        val map = runCatching {
-            parseJson<List<WpCategory>>(
-                app.get("$apiBase/categories?per_page=100&_fields=id,name").text
-            ).mapNotNull { cat ->
-                val n = cat.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                cat.id to Parser.unescapeEntities(n, false)
-            }.toMap()
-        }.getOrNull().orEmpty()
-        categoryNames = map
-        return map
-    }
+    private val durationRegex = Regex("""\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b""")
 
     private fun unescape(s: String): String = Parser.unescapeEntities(s, false).trim()
 
@@ -181,22 +163,40 @@ class FreeSidePlusProvider : MainAPI() {
         val title = post.title?.rendered?.let(::unescape)?.takeIf { it.isNotBlank() } ?: "Episode"
         val frag = post.content?.rendered?.let { Jsoup.parseBodyFragment(it) }
         val plot = frag?.selectFirst(".fsp-desc")?.text()?.trim()?.takeIf { it.isNotBlank() }
-        val tags = frag?.select(".fsp-tag")?.map { it.text().trim() }
-            ?.filter { it.isNotBlank() }?.distinct()?.takeIf { it.isNotEmpty() }
-        val names = getCategoryNames()
-        val cats = post.categories?.mapNotNull { names[it] }.orEmpty()
-        val year = tags?.firstNotNullOfOrNull { yearRegex.find(it)?.value?.toIntOrNull() }
+        val duration = frag?.select(".fsp-tag, .fsp-item-value")
+            ?.firstNotNullOfOrNull { durationRegex.find(it.text()) }
+            ?.let { match ->
+                val hms = match.groupValues
+                val hours = hms[3].toIntOrNull()
+                if (hours != null) {
+                    hms[1].toIntOrNull()?.times(3600)?.plus(
+                        (hms[2].toIntOrNull() ?: 0) * 60 + hours
+                    )
+                } else {
+                    (hms[1].toIntOrNull() ?: 0) * 60 + (hms[2].toIntOrNull() ?: 0)
+                }
+            }
+        val year = yearRegex.find(post.date.orEmpty())?.value?.toIntOrNull()
             ?: yearRegex.find(title)?.value?.toIntOrNull()
-            ?: yearRegex.find(post.date.orEmpty())?.value?.toIntOrNull()
         val poster = if (post.featuredMedia > 0) {
             fetchPosters(listOf(post.featuredMedia))[post.featuredMedia]
         } else null
         val pageUrl = post.link?.takeIf { it.startsWith("http") } ?: "$mainUrl/?p=${post.id}"
+        val recommendations = post.categories?.firstOrNull()?.let { catId ->
+            runCatching {
+                val (related, _) = fetchPosts(
+                    "$apiBase/posts?categories=$catId&exclude=${post.id}" +
+                        "&per_page=12&$postFields&orderby=date&order=desc"
+                )
+                postsToCards(related)
+            }.getOrNull()
+        }.orEmpty()
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.plot = plot
-            this.tags = (tags.orEmpty() + cats).distinct().takeIf { it.isNotEmpty() }
             this.year = year
+            this.duration = duration
+            this.recommendations = recommendations.takeIf { it.isNotEmpty() }
         }
     }
 
