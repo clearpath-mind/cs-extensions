@@ -18,9 +18,12 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.Jsoup
 import org.jsoup.parser.Parser
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 data class WpRendered(
     @JsonProperty("rendered") val rendered: String? = null,
@@ -66,6 +69,7 @@ class FreeSidePlusProvider : MainAPI() {
     override val hasMainPage = true
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Movie)
+    override val getMainPageTimeoutMs = 60_000L
 
     // Editorial order: Latest, then the main shows.
     override val mainPage = mainPageOf(
@@ -76,12 +80,30 @@ class FreeSidePlusProvider : MainAPI() {
         "35" to "Sidemen Sundays",
     )
 
+    // Full fields (with content HTML) — only for single-post load()/loadLinks().
     private val postFields = "_fields=id,link,date,title,content,categories,featured_media"
+    // List fields (no content): the full post HTML is ~50x the payload
+    // (122KB/12.8s vs 2.4KB/3.2s for 12 posts) and cards never use it.
+    private val listFields = "_fields=id,link,date,title,categories,featured_media"
     private val yearRegex = Regex("""\b(19|20)\d{2}\b""")
     private val durationRegex = Regex("""\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b""")
     private val qualitySuffixRegex = Regex("""\s*\(?\d{3,4}p\)?\s*$""", RegexOption.IGNORE_CASE)
 
     private fun unescape(s: String): String = Parser.unescapeEntities(s, false).trim()
+
+    // Media IDs repeat across Latest/category rows and paginations — cache hits
+    // skip the /media round-trip entirely (server takes ~2-8s per call).
+    private val posterCache = ConcurrentHashMap<Int, String>()
+
+    private data class CachedRow(
+        val timestamp: Long,
+        val items: List<SearchResponse>,
+        val hasNext: Boolean,
+    )
+    // Homepage has no app-level cache; a short TTL makes back-nav/initial
+    // revisit instant without noticeably delaying new episodes.
+    private val rowCache = ConcurrentHashMap<String, CachedRow>()
+    private val rowTtlMs = 3 * 60 * 1000L
 
     private var categoryNames: Map<Int, String>? = null
 
@@ -124,16 +146,21 @@ class FreeSidePlusProvider : MainAPI() {
     }
 
     private suspend fun fetchPosters(ids: List<Int>): Map<Int, String> {
-        val distinct = ids.filter { it > 0 }.distinct()
-        if (distinct.isEmpty()) return emptyMap()
-        return runCatching {
-            val url = "$apiBase/media?include=${distinct.joinToString(",")}" +
+        val wanted = ids.filter { it > 0 }.distinct()
+        if (wanted.isEmpty()) return emptyMap()
+        val cached = wanted.mapNotNull { id -> posterCache[id]?.let { id to it } }.toMap()
+        val missing = wanted.filter { !posterCache.containsKey(it) }
+        if (missing.isEmpty()) return cached
+        val fetched = runCatching {
+            val url = "$apiBase/media?include=${missing.joinToString(",")}" +
                 "&per_page=100&_fields=id,source_url,media_details"
             parseJson<List<WpMedia>>(app.get(url).text).mapNotNull { media ->
                 val thumb = landscapeUrl(media) ?: return@mapNotNull null
                 media.id to thumb
             }.toMap()
         }.getOrNull().orEmpty()
+        fetched.forEach { (id, url) -> posterCache[id] = url }
+        return cached + fetched
     }
 
     private fun toSearchResponse(post: WpPost, posters: Map<Int, String>): SearchResponse? {
@@ -162,13 +189,21 @@ class FreeSidePlusProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val catId = request.data.toIntOrNull() ?: 0
+        val key = "$catId:$page"
+        rowCache[key]?.takeIf { System.currentTimeMillis() - it.timestamp < rowTtlMs }?.let {
+            return newHomePageResponse(
+                listOf(HomePageList(request.name, it.items, isHorizontalImages = true)),
+                it.hasNext,
+            )
+        }
         val url = buildString {
-            append("$apiBase/posts?per_page=12&page=$page&$postFields")
+            append("$apiBase/posts?per_page=12&page=$page&$listFields")
             append("&orderby=date&order=desc")
             if (catId > 0) append("&categories=$catId")
         }
         val (posts, hasNext) = fetchPosts(url)
         val items = postsToCards(posts)
+        rowCache[key] = CachedRow(System.currentTimeMillis(), items, hasNext)
         return newHomePageResponse(
             listOf(HomePageList(request.name, items, isHorizontalImages = true)),
             hasNext,
@@ -178,7 +213,7 @@ class FreeSidePlusProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val url = "$apiBase/posts?search=${URLEncoder.encode(query.trim(), "UTF-8")}" +
-            "&per_page=20&$postFields&orderby=relevance"
+            "&per_page=20&$listFields&orderby=relevance"
         val (posts, _) = fetchPosts(url)
         return postsToCards(posts)
     }
@@ -212,24 +247,32 @@ class FreeSidePlusProvider : MainAPI() {
             }
         val year = yearRegex.find(post.date.orEmpty())?.value?.toIntOrNull()
             ?: yearRegex.find(title)?.value?.toIntOrNull()
-        val poster = if (post.featuredMedia > 0) {
-            fetchPosters(listOf(post.featuredMedia))[post.featuredMedia]
-        } else null
+        // Poster, categories, and recommendations are independent — fetch them
+        // concurrently instead of sequentially (server takes seconds per call).
+        val (poster, names, recommendations) = coroutineScope {
+            val posterDeferred = async {
+                if (post.featuredMedia > 0) fetchPosters(listOf(post.featuredMedia))[post.featuredMedia]
+                else null
+            }
+            val namesDeferred = async { getCategoryNames() }
+            val recsDeferred = async {
+                post.categories?.firstOrNull()?.let { catId ->
+                    runCatching {
+                        val (related, _) = fetchPosts(
+                            "$apiBase/posts?categories=$catId&exclude=${post.id}" +
+                                "&per_page=12&$listFields&orderby=date&order=desc"
+                        )
+                        postsToCards(related)
+                    }.getOrNull()
+                }.orEmpty()
+            }
+            Triple(posterDeferred.await(), namesDeferred.await(), recsDeferred.await())
+        }
         val pageUrl = post.link?.takeIf { it.startsWith("http") } ?: "$mainUrl/?p=${post.id}"
-        val names = getCategoryNames()
         val tags = buildList {
             post.categories?.mapNotNullTo(this) { names[it] }
             post.date?.let(::formatDate)?.let(::add)
         }.distinct().takeIf { it.isNotEmpty() }
-        val recommendations = post.categories?.firstOrNull()?.let { catId ->
-            runCatching {
-                val (related, _) = fetchPosts(
-                    "$apiBase/posts?categories=$catId&exclude=${post.id}" +
-                        "&per_page=12&$postFields&orderby=date&order=desc"
-                )
-                postsToCards(related)
-            }.getOrNull()
-        }.orEmpty()
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.plot = plot
