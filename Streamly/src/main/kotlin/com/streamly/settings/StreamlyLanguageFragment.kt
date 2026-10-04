@@ -6,7 +6,6 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.EditText
 import android.widget.RadioButton
 import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -15,7 +14,6 @@ import androidx.fragment.app.DialogFragment
 import com.streamly.BuildConfig
 import com.streamly.StreamlyPlugin
 import androidx.core.content.edit
-import androidx.core.widget.addTextChangedListener
 
 class StreamlyLanguageFragment(
     plugin: StreamlyPlugin,
@@ -76,9 +74,7 @@ class StreamlyLanguageFragment(
         }
 
         val recycler: RecyclerView = root.findView("languageRecycler")
-        val search: EditText = root.findView("searchLanguage")
         recycler.makeTvCompatible()
-        search.makeTvCompatible()
 
         recycler.layoutManager = LinearLayoutManager(requireContext())
 
@@ -96,10 +92,6 @@ class StreamlyLanguageFragment(
 
         recycler.adapter = adapter
 
-        search.addTextChangedListener { text ->
-            adapter.filter(text.toString())
-        }
-
         return root
     }
 
@@ -112,8 +104,6 @@ class StreamlyLanguageFragment(
         private val onClick: (String) -> Unit
     ) : RecyclerView.Adapter<LanguageAdapter.VH>() {
 
-        private var filteredList = originalList.toMutableList()
-
         inner class VH(val v: View) : RecyclerView.ViewHolder(v) {
             val radio: RadioButton = v.findView("radio_language")
         }
@@ -124,7 +114,7 @@ class StreamlyLanguageFragment(
         }
 
         override fun onBindViewHolder(holder: VH, position: Int) {
-            val (name, code) = filteredList[position]
+            val (name, code) = originalList[position]
 
             holder.radio.text = name
             holder.radio.isChecked = code == selectedCode
@@ -134,16 +124,7 @@ class StreamlyLanguageFragment(
             }
         }
 
-        override fun getItemCount() = filteredList.size
-        @SuppressLint("NotifyDataSetChanged")
-        fun filter(query: String) {
-            filteredList = if (query.isBlank()) {
-                originalList.toMutableList()
-            } else {
-                originalList.filter { it.first.contains(query, ignoreCase = true) }.toMutableList()
-            }
-            notifyDataSetChanged()
-        }
+        override fun getItemCount() = originalList.size
     }
 
     override fun onDismiss(dialog: android.content.DialogInterface) {

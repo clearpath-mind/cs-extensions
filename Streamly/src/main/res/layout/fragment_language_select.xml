@@ -14,14 +14,6 @@
         android:textStyle="bold"
         android:padding="8dp" />
 
-    <EditText
-        android:id="@+id/searchLanguage"
-        android:autofillHints=""
-        android:hint="Search language…"
-        android:padding="12dp"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
-
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/languageRecycler"
         android:layout_width="match_parent"
