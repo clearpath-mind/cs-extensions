@@ -77,7 +77,6 @@ class FreeSidePlusProvider : MainAPI() {
         "37" to "Side+ Saturdays",
         "34" to "Sidecast",
         "36" to "BTS",
-        "35" to "Sidemen Sundays",
     )
 
     // Full fields (with content HTML) — only for single-post load()/loadLinks().
