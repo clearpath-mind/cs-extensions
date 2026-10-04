@@ -262,14 +262,13 @@ class YacineTvProvider : MainAPI() {
         logo2: String?,
         kickoffSec: Long?,
         endSec: Long?,
+        channel: String? = null,
+        commentary: String? = null,
         nowSec: Long = System.currentTimeMillis() / 1000,
     ): String {
         fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
         val time = if (kickoffSec != null && kickoffSec > 0) {
-            try {
-                val fmt = java.text.SimpleDateFormat("MMM dd, yyyy hh:mm a", java.util.Locale.US)
-                enc(fmt.format(java.util.Date(kickoffSec * 1000)))
-            } catch (_: Exception) { "" }
+            enc(formatCardTime(kickoffSec))
         } else ""
         val isLive = kickoffSec != null && kickoffSec > 0 && nowSec >= kickoffSec &&
             (endSec == null || endSec <= 0 || nowSec <= endSec)
@@ -282,6 +281,8 @@ class YacineTvProvider : MainAPI() {
             logo1?.takeIf { it.isNotBlank() }?.let { append("&teamAImg=${enc(it)}") }
             logo2?.takeIf { it.isNotBlank() }?.let { append("&teamBImg=${enc(it)}") }
             if (time.isNotBlank()) append("&time=$time")
+            channel?.takeIf { it.isNotBlank() }?.let { append("&channel=${enc(it)}") }
+            commentary?.takeIf { it.isNotBlank() }?.let { append("&commentary=${enc(it)}") }
             append("&isLive=$isLive")
             append("&isEnded=$isEnded")
         }
@@ -324,6 +325,8 @@ class YacineTvProvider : MainAPI() {
                         e.team2?.logo?.takeIf { it.isNotBlank() },
                         e.startTime?.takeIf { it > 0 },
                         e.endTime?.takeIf { it > 0 },
+                        e.channel?.trim()?.takeIf { it.isNotBlank() },
+                        e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         nowSec,
                     )
                 } else null
@@ -399,6 +402,8 @@ class YacineTvProvider : MainAPI() {
                         e.team2?.logo?.takeIf { it.isNotBlank() },
                         e.startTime?.takeIf { it > 0 },
                         e.endTime?.takeIf { it > 0 },
+                        e.channel?.trim()?.takeIf { it.isNotBlank() },
+                        e.commentary?.trim()?.takeIf { it.isNotBlank() },
                         nowSec,
                     )
                 } else null
@@ -434,7 +439,7 @@ class YacineTvProvider : MainAPI() {
             data.commentary?.takeIf { it.isNotBlank() }?.let { append("🎙️ $it") }
         }.trim().takeIf { it.isNotBlank() }
         val banner = if (!data.team1.isNullOrBlank() && !data.team2.isNullOrBlank()) {
-            generateCardUrl(data.team1, data.team2, data.competition, data.logo1, data.logo2, data.kickoff, data.end)
+            generateCardUrl(data.team1, data.team2, data.competition, data.logo1, data.logo2, data.kickoff, data.end, data.channel, data.commentary)
         } else null
         return newLiveStreamLoadResponse(name = data.name, url = url, dataUrl = url) {
             banner?.let {
@@ -445,11 +450,37 @@ class YacineTvProvider : MainAPI() {
             data.related?.takeIf { it.isNotEmpty() }?.let { related ->
                 this.recommendations = related.map { rel ->
                     newLiveSearchResponse(rel.name, rel.toJson(), TvType.Live) {
-                        this.posterUrl = generateCardUrl(rel.team1, rel.team2, rel.competition, rel.logo1, rel.logo2, rel.kickoff, rel.end)
+                        this.posterUrl = generateCardUrl(rel.team1, rel.team2, rel.competition, rel.logo1, rel.logo2, rel.kickoff, rel.end, rel.channel, rel.commentary)
                     }
                 }
             }
         }
+    }
+
+    /** Card kickoff in Arabic (device timezone): "اليوم 18:00",
+     * "غدا 20:00", else "4 أكتوبر، 18:45". Western digits, 24h clock. */
+    private fun formatCardTime(epochSec: Long): String {
+        return try {
+            val tz = java.util.TimeZone.getDefault()
+            val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply { timeZone = tz }
+            val timeFmt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).apply { timeZone = tz }
+            val at = java.util.Date(epochSec * 1000)
+            val time = timeFmt.format(at)
+            val kickDate = dateFmt.format(at)
+            val nowSec = System.currentTimeMillis() / 1000
+            if (kickDate == dateFmt.format(java.util.Date(nowSec * 1000))) return "اليوم $time"
+            val cal = java.util.Calendar.getInstance(tz).apply {
+                timeInMillis = nowSec * 1000
+                add(java.util.Calendar.DAY_OF_YEAR, 1)
+            }
+            if (kickDate == dateFmt.format(cal.time)) return "غدا $time"
+            val kc = java.util.Calendar.getInstance(tz).apply { timeInMillis = epochSec * 1000 }
+            val months = arrayOf(
+                "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+                "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+            )
+            "${kc.get(java.util.Calendar.DAY_OF_MONTH)} ${months[kc.get(java.util.Calendar.MONTH)]}، $time"
+        } catch (_: Exception) { "" }
     }
 
     /** Device-local kickoff: "Today 19:45", "Tomorrow 20:00" or
