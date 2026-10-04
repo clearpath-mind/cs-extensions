@@ -248,11 +248,18 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
+    /** yacine-card worker base (Cloudflare). Set to the exact URL printed by
+     * `npx wrangler deploy` inside yacine-card/ (e.g.
+     * https://yacine-card.<your-sub>.workers.dev). */
+    private val cardBase = "https://yacine-card.CHANGEME.workers.dev"
+
     /** Cricify-style generated match card (480x280 PNG): team logos +
-     * kickoff + live/ended badge. Title hardcoded to "football": the worker
-     * font has no Arabic glyphs (renders as boxes), and Yacine champions
-     * names are Arabic. Baked per card. */
+     * kickoff + live/ended badge. Arabic team/competition names render via
+     * the yacine-card worker (Cairo + resvg shaping). Baked per card. */
     private fun generateCardUrl(
+        team1: String?,
+        team2: String?,
+        title: String?,
         logo1: String?,
         logo2: String?,
         kickoffSec: Long?,
@@ -270,10 +277,10 @@ class YacineTvProvider : MainAPI() {
             (endSec == null || endSec <= 0 || nowSec <= endSec)
         val isEnded = endSec != null && endSec > 0 && nowSec > endSec
         return buildString {
-            append("https://live-card-png.cricify.workers.dev/?")
-            append("title=${enc("Football")}")
-            append("&teamA=")
-            append("&teamB=")
+            append("$cardBase/?")
+            append("title=${enc(title?.takeIf { it.isNotBlank() } ?: "Football")}")
+            append("&teamA=${enc(team1.orEmpty())}")
+            append("&teamB=${enc(team2.orEmpty())}")
             logo1?.takeIf { it.isNotBlank() }?.let { append("&teamAImg=${enc(it)}") }
             logo2?.takeIf { it.isNotBlank() }?.let { append("&teamBImg=${enc(it)}") }
             if (time.isNotBlank()) append("&time=$time")
@@ -312,6 +319,9 @@ class YacineTvProvider : MainAPI() {
                 val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
                 val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
                     generateCardUrl(
+                        t1,
+                        t2,
+                        e.champions?.trim()?.takeIf { it.isNotBlank() },
                         e.team1?.logo?.takeIf { it.isNotBlank() },
                         e.team2?.logo?.takeIf { it.isNotBlank() },
                         e.startTime?.takeIf { it > 0 },
@@ -384,6 +394,9 @@ class YacineTvProvider : MainAPI() {
                 val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
                 val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
                     generateCardUrl(
+                        t1,
+                        t2,
+                        e.champions?.trim()?.takeIf { it.isNotBlank() },
                         e.team1?.logo?.takeIf { it.isNotBlank() },
                         e.team2?.logo?.takeIf { it.isNotBlank() },
                         e.startTime?.takeIf { it > 0 },
@@ -423,7 +436,7 @@ class YacineTvProvider : MainAPI() {
             data.commentary?.takeIf { it.isNotBlank() }?.let { append("🎙️ $it") }
         }.trim().takeIf { it.isNotBlank() }
         val banner = if (!data.team1.isNullOrBlank() && !data.team2.isNullOrBlank()) {
-            generateCardUrl(data.logo1, data.logo2, data.kickoff, data.end)
+            generateCardUrl(data.team1, data.team2, data.competition, data.logo1, data.logo2, data.kickoff, data.end)
         } else null
         return newLiveStreamLoadResponse(name = data.name, url = url, dataUrl = url) {
             banner?.let {
@@ -434,7 +447,7 @@ class YacineTvProvider : MainAPI() {
             data.related?.takeIf { it.isNotEmpty() }?.let { related ->
                 this.recommendations = related.map { rel ->
                     newLiveSearchResponse(rel.name, rel.toJson(), TvType.Live) {
-                        this.posterUrl = generateCardUrl(rel.logo1, rel.logo2, rel.kickoff, rel.end)
+                        this.posterUrl = generateCardUrl(rel.team1, rel.team2, rel.competition, rel.logo1, rel.logo2, rel.kickoff, rel.end)
                     }
                 }
             }
