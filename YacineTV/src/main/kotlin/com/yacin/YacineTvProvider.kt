@@ -248,10 +248,8 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** yacine-card worker base (Cloudflare). Set to the exact URL printed by
-     * `npx wrangler deploy` inside yacine-card/ (e.g.
-     * https://yacine-card.<your-sub>.workers.dev). */
-    private val cardBase = "https://yacine-card.CHANGEME.workers.dev"
+    /** yacine-card worker base (Cloudflare Workers, 480x280 Arabic cards). */
+    private val cardBase = "https://yacine-card.yacine-card.workers.dev"
 
     /** Cricify-style generated match card (480x280 PNG): team logos +
      * kickoff + live/ended badge. Arabic team/competition names render via
