@@ -60,64 +60,9 @@ class StreamlyLanguageFragment(
 
     // Language Display List
     private val languages = listOf(
-        "South Africa (Afrikaans)" to "af-ZA",
-        "United Arab Emirates (Arabic)" to "ar-AE",
-        "Saudi Arabia (Arabic)" to "ar-SA",
-        "Azerbaijan (Azerbaijani)" to "az-AZ",
-        "Bulgaria (Bulgarian)" to "bg-BG",
-        "India (Bengali)" to "bn-IN",
-        "Spain (Catalan)" to "ca-ES",
-        "Czech Republic (Czech)" to "cs-CZ",
-        "United Kingdom (Welsh)" to "cy-GB",
-        "Denmark (Danish)" to "da-DK",
-        "Germany (German)" to "de-DE",
-        "Greece (Greek)" to "el-GR",
-        "United States (English)" to "en-US",
-        "United Kingdom (English)" to "en-GB",
-        "Spain (Spanish)" to "es-ES",
-        "Latin America (Spanish)" to "es-419",
-        "Estonia (Estonian)" to "et-EE",
-        "Spain (Basque)" to "eu-ES",
-        "Iran (Persian)" to "fa-IR",
-        "Finland (Finnish)" to "fi-FI",
-        "Philippines (Filipino)" to "fil-PH",
-        "France (French)" to "fr-FR",
-        "Spain (Galician)" to "gl-ES",
-        "India (Gujarati)" to "gu-IN",
-        "Israel (Hebrew)" to "he-IL",
-        "India (Hindi)" to "hi-IN",
-        "Croatia (Croatian)" to "hr-HR",
-        "Hungary (Hungarian)" to "hu-HU",
-        "Indonesia (Indonesian)" to "id-ID",
-        "Iceland (Icelandic)" to "is-IS",
-        "Italy (Italian)" to "it-IT",
-        "Japan (Japanese)" to "ja-JP",
-        "India (Kannada)" to "kn-IN",
-        "South Korea (Korean)" to "ko-KR",
-        "Lithuania (Lithuanian)" to "lt-LT",
-        "Latvia (Latvian)" to "lv-LV",
-        "India (Malayalam)" to "ml-IN",
-        "Malaysia (Malay)" to "ms-MY",
-        "Norway (Norwegian)" to "no-NO",
-        "Netherlands (Dutch)" to "nl-NL",
-        "Poland (Polish)" to "pl-PL",
-        "Brazil (Portuguese)" to "pt-BR",
-        "Portugal (Portuguese)" to "pt-PT",
-        "Romania (Romanian)" to "ro-RO",
-        "Russia (Russian)" to "ru-RU",
-        "Slovakia (Slovak)" to "sk-SK",
-        "Slovenia (Slovenian)" to "sl-SI",
-        "Serbia (Serbian)" to "sr-RS",
-        "Sweden (Swedish)" to "sv-SE",
-        "India (Tamil)" to "ta-IN",
-        "India (Telugu)" to "te-IN",
-        "Thailand (Thai)" to "th-TH",
-        "Turkey (Turkish)" to "tr-TR",
-        "Ukraine (Ukrainian)" to "uk-UA",
-        "Vietnam (Vietnamese)" to "vi-VN",
-        "China (Chinese Simplified)" to "zh-CN",
-        "Taiwan (Chinese Traditional)" to "zh-TW"
-    ).sortedBy { it.first.lowercase() }
+        "English" to "en-US",
+        "Arabic (العربية)" to "ar-SA"
+    )
 
 
     private lateinit var adapter: LanguageAdapter
@@ -140,7 +85,7 @@ class StreamlyLanguageFragment(
         val savedCode = sharedPref.getString("tmdb_language_code", "en-US") ?: "en-US"
 
         adapter = LanguageAdapter(
-            languages.sortedBy { it.first.lowercase() },
+            languages,
             savedCode
         ) { code ->
             sharedPref.edit { putString("tmdb_language_code", code) }

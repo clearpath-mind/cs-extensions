@@ -355,7 +355,6 @@ open class Streamly : MainAPI() {
         "/discover/tv?api_key=$apiKey&with_networks=3353" to "Peacock",
         "/movie/top_rated?api_key=$apiKey&region=US" to "Top Rated Movies",
         "/tv/top_rated?api_key=$apiKey&region=US" to "Top Rated TV Shows",
-        "/discover/tv?api_key=$apiKey&with_genres=99" to "Documentary",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
