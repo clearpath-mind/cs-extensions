@@ -587,7 +587,7 @@ class YacineTvProvider : MainAPI() {
         headers: Map<String, String>,
         referer: String,
         callback: (ExtractorLink) -> Unit,
-    ): Boolean {
+    ): Pair<Boolean, String?> {
         return try {
             var found = false
             suspend fun collect(html: String, base: String) {
@@ -603,31 +603,34 @@ class YacineTvProvider : MainAPI() {
                     found = true
                 }
             }
+            fun absolutize(src: String): String = when {
+                src.startsWith("http") -> src
+                src.startsWith("//") -> "https:$src"
+                src.startsWith("/") -> "https://" + pageUrl.substringAfter("://").substringBefore("/") + src
+                else -> join(pageUrl.substringBeforeLast("/"), src)
+            }
             val doc = app.get(pageUrl, headers = headers, timeout = 12).text
             collect(doc, pageUrl)
-            if (!found) {
-                // One iframe level (snrtlive.ma -> easybroadcast player).
-                pageIframeRegex.findAll(doc).mapNotNull {
-                    it.groupValues.getOrNull(1)?.takeIf { src -> src.isNotBlank() }
-                }.distinct().take(3).forEach { src ->
-                    val abs = when {
-                        src.startsWith("http") -> src
-                        src.startsWith("//") -> "https:$src"
-                        src.startsWith("/") -> "https://" + pageUrl.substringAfter("://").substringBefore("/") + src
-                        else -> join(pageUrl.substringBeforeLast("/"), src)
-                    }
-                    runCatching {
-                        collect(app.get(abs, headers = headers, timeout = 12).text, abs)
-                    }
+            // First iframe (snrtlive.ma -> easybroadcast player): the
+            // WebView stage loads it directly, skipping the wrapper.
+            val iframe = pageIframeRegex.findAll(doc)
+                .mapNotNull { it.groupValues.getOrNull(1)?.takeIf { src -> src.isNotBlank() } }
+                .distinct().firstOrNull()?.let(::absolutize)
+            if (!found && iframe != null) {
+                runCatching {
+                    collect(app.get(iframe, headers = headers, timeout = 12).text, iframe)
                 }
             }
-            found
-        } catch (_: Exception) { false }
+            found to iframe
+        } catch (_: Exception) { false to null }
     }
 
     /** Last resort for embed pages: real device WebView sniff for .m3u8
-     * subrequests (upstream StreamWish pattern: resolver as app.get
-     * interceptor, useOkhttp=false, 15s). */
+     * subrequests. JS players (easybroadcast) only fetch the stream
+     * after play is pressed, so an autoplay script runs on every
+     * subrequest and the video element's resolved src is harvested via
+     * scriptCallback as well. resolveUsingWebView (not the interceptor
+     * form) so additional matches are collected too. */
     private suspend fun sniffM3u8ViaWebView(
         channelName: String,
         serverName: String,
@@ -637,29 +640,54 @@ class YacineTvProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         return try {
+            val scriptSrc = java.util.concurrent.atomic.AtomicReference<String?>(null)
+            suspend fun emitUrl(u: String, base: String): Boolean {
+                if (".m3u8" !in u || !u.startsWith("http")) return false
+                callback.invoke(
+                    newExtractorLink(this.name, "$channelName • $serverName", u) {
+                        this.headers = headers
+                        this.referer = base
+                        this.quality = qualityFor("$channelName $serverName", u)
+                        this.type = ExtractorLinkType.M3U8
+                    }
+                )
+                return true
+            }
+            val autoplayJs = "(function(){try{" +
+                "var v=document.querySelector('video');if(v){v.muted=true;try{" +
+                "var p=v.play();if(p&&p.catch)p.catch(function(){})}catch(e){}}" +
+                "var b=document.querySelector('button[class*=play],div[class*=play],[class*=vjs-big-play]');" +
+                "if(b&&b.click)try{b.click()}catch(e){}" +
+                "return (v&&(v.currentSrc||v.src))||'';}catch(e){return '';}})()"
             val resolver = WebViewResolver(
                 interceptUrl = Regex("""\.m3u8(\?.*)?"""),
-                additionalUrls = listOf(Regex("""\.m3u8(\?.*)?""")),
+                additionalUrls = listOf(
+                    Regex("""\.m3u8(\?.*)?"""),
+                    Regex("""\.mpd(\?.*)?"""),
+                ),
                 useOkhttp = false,
-                timeout = 15_000L,
+                script = autoplayJs,
+                scriptCallback = { result ->
+                    // Plain callback (no suspend): just record, emit below.
+                    val u = result.trim().trim('"').replace("\\/", "/")
+                    if (".m3u8" in u && u.startsWith("http")) {
+                        scriptSrc.compareAndSet(null, u)
+                    }
+                },
+                timeout = 30_000L,
             )
-            val finalUrl = app.get(
-                pageUrl,
-                headers = headers,
-                referer = referer,
-                timeout = 15,
-                interceptor = resolver,
-            ).url
-            if (finalUrl.isBlank() || finalUrl == pageUrl || ".m3u8" !in finalUrl) return false
-            callback.invoke(
-                newExtractorLink(this.name, "$channelName • $serverName", finalUrl) {
-                    this.headers = headers
-                    this.referer = referer
-                    this.quality = qualityFor("$channelName $serverName", finalUrl)
-                    this.type = ExtractorLinkType.M3U8
+            val (fixed, extra) = resolver.resolveUsingWebView(pageUrl, referer, headers)
+            var found = false
+            // Dedupe: video-element src, intercepted request, extras.
+            (listOfNotNull(scriptSrc.get()) +
+                listOf(fixed?.url?.toString().orEmpty()) +
+                extra.map { it.url.toString() })
+                .distinct()
+                .filter { it.isNotBlank() && it != pageUrl }
+                .forEach { u ->
+                    if (emitUrl(u, referer)) found = true
                 }
-            )
-            true
+            found
         } catch (_: Exception) { false }
     }
 
@@ -763,8 +791,10 @@ class YacineTvProvider : MainAPI() {
             if (!isDirect) {
                 // Embed pages (url_type=5): arab-stream.live, snrtlive.ma,
                 // ... No stock extractor handles them, so sniff the page
-                // for an m3u8 first, then loadExtractor, then WebView.
-                if (sniffM3u8FromPage(channelName, serverName, raw, headers, referer, callback)) {
+                // for an m3u8 first, then loadExtractor, then WebView
+                // (which loads the inner iframe directly + autoplays).
+                val (pageFound, iframe) = sniffM3u8FromPage(channelName, serverName, raw, headers, referer, callback)
+                if (pageFound) {
                     found = true
                     return true
                 }
@@ -776,7 +806,7 @@ class YacineTvProvider : MainAPI() {
                     found = true
                     return true
                 }
-                if (sniffM3u8ViaWebView(channelName, serverName, raw, headers, referer, callback)) {
+                if (sniffM3u8ViaWebView(channelName, serverName, iframe ?: raw, headers, referer, callback)) {
                     found = true
                     return true
                 }
