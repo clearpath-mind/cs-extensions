@@ -21,6 +21,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -82,6 +83,7 @@ class YacineTvProvider : MainAPI() {
     data class YacineCategory(
         @JsonProperty("id") val id: String = "",
         @JsonProperty("name") val name: String? = null,
+        @JsonProperty("child_count") val childCount: Int? = null,
     )
 
     data class YacineChannelResponse(
@@ -194,9 +196,6 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
-    private val beinQualityRegex =
-        Regex("""be\s*in\s*sports\s*\(?\s*(\d+\s*p)\s*\)?""", RegexOption.IGNORE_CASE)
-
     private fun norm(s: String) = s.trim().lowercase().replace(Regex("""\s+"""), " ")
 
     /** Card channel label -> live channel ids (every quality group). The
@@ -204,24 +203,54 @@ class YacineTvProvider : MainAPI() {
     private suspend fun resolveChannelIds(label: String): List<String> {
         val want = norm(label)
         if (want.isBlank()) return emptyList()
+        fun matchIds(channels: List<YacineChannel>): List<String> {
+            val exact = channels
+                .filter { norm(it.name ?: "") == want }
+                .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
+                .distinct()
+            if (exact.isNotEmpty()) return exact
+            // Fuzzy fallback: labels vary ("SSC1" vs "SSC 1",
+            // "ON Time Sports 1" vs card "ON Time Sports").
+            return channels
+                .filter {
+                    val n = norm(it.name ?: "")
+                    n.isNotBlank() && (n.contains(want) || want.contains(n))
+                }
+                .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
+                .distinct()
+        }
         runCatching {
             val json = getDecrypted("search?query=${URLEncoder.encode(label.trim(), "UTF-8")}")
                 ?: return@runCatching null
             if (json.isBlank()) return@runCatching null
-            parseJson<YacineChannelResponse>(json).data.orEmpty()
-                .filter { norm(it.name ?: "") == want }
-                .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
-                .distinct()
+            matchIds(parseJson<YacineChannelResponse>(json).data.orEmpty())
         }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
+        // Full category walk (not just beIN quality groups): ARABIC
+        // CHANNELS nests by country (ALGERIA/MOROCCO/...) — /channels on
+        // the parent is empty, the country subcategories hold channels.
+        // Arryadia TV / ON Time Sports live there, so beIN-only scan
+        // could never resolve them.
         return runCatching {
             coroutineScope {
-                getCategories().filter { beinQualityRegex.containsMatchIn(it.name ?: "") }
-                    .map { cat -> async { getChannels(cat.id) } }
+                val top = getCategories()
+                val topChannels = top.map { cat -> async { getChannels(cat.id) } }
+                val subs = top
+                    .filter { it.childCount == null || it.childCount != 0 }
+                    .map { cat -> async { getSubcategories(cat.id) } }
                     .awaitAll().flatten()
-                    .filter { norm(it.name ?: "") == want }
-                    .mapNotNull { it.id?.takeIf { id -> id.isNotBlank() } }
-                    .distinct()
+                val subChannels = subs.map { sub -> async { getChannels(sub.id) } }
+                matchIds(
+                    (topChannels.awaitAll() + subChannels.awaitAll()).flatten()
+                )
             }
+        }.getOrNull() ?: emptyList()
+    }
+
+    private suspend fun getSubcategories(categoryId: String): List<YacineCategory> {
+        val json = getDecrypted("categories/$categoryId") ?: return emptyList()
+        if (json.isBlank()) return emptyList()
+        return runCatching {
+            parseJson<YacineCategoryEnvelope>(json).data ?: emptyList()
         }.getOrNull() ?: emptyList()
     }
 
@@ -544,6 +573,96 @@ class YacineTvProvider : MainAPI() {
         return out
     }
 
+    /** Plain-HTTP m3u8 sniff for url_type=5 embed pages (no extractor
+     * handles them): arab-stream.live embeds a brightcove playlist,
+     * snrtlive.ma embeds an easybroadcast iframe. Fast pass before
+     * loadExtractor / WebView. */
+    private val pageM3u8Regex = Regex("""https?://[^\s"'\\<>]+\.m3u8[^\s"'\\<>]*""")
+    private val pageIframeRegex = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+
+    private suspend fun sniffM3u8FromPage(
+        channelName: String,
+        serverName: String,
+        pageUrl: String,
+        headers: Map<String, String>,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
+            var found = false
+            fun collect(html: String, base: String) {
+                pageM3u8Regex.findAll(html).map { it.value }.distinct().forEach { u ->
+                    callback.invoke(
+                        newExtractorLink(this.name, "$channelName • $serverName", u) {
+                            this.headers = headers
+                            this.referer = base
+                            this.quality = qualityFor("$channelName $serverName", u)
+                            this.type = ExtractorLinkType.M3U8
+                        }
+                    )
+                    found = true
+                }
+            }
+            val doc = app.get(pageUrl, headers = headers, timeout = 12).text
+            collect(doc, pageUrl)
+            if (!found) {
+                // One iframe level (snrtlive.ma -> easybroadcast player).
+                pageIframeRegex.findAll(doc).mapNotNull {
+                    it.groupValues.getOrNull(1)?.takeIf { src -> src.isNotBlank() }
+                }.distinct().take(3).forEach { src ->
+                    val abs = when {
+                        src.startsWith("http") -> src
+                        src.startsWith("//") -> "https:$src"
+                        src.startsWith("/") -> "https://" + pageUrl.substringAfter("://").substringBefore("/") + src
+                        else -> join(pageUrl.substringBeforeLast("/"), src)
+                    }
+                    runCatching {
+                        collect(app.get(abs, headers = headers, timeout = 12).text, abs)
+                    }
+                }
+            }
+            found
+        } catch (_: Exception) { false }
+    }
+
+    /** Last resort for embed pages: real device WebView sniff for .m3u8
+     * subrequests (upstream StreamWish pattern: resolver as app.get
+     * interceptor, useOkhttp=false, 15s). */
+    private suspend fun sniffM3u8ViaWebView(
+        channelName: String,
+        serverName: String,
+        pageUrl: String,
+        headers: Map<String, String>,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        return try {
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""\.m3u8(\?.*)?"""),
+                additionalUrls = listOf(Regex("""\.m3u8(\?.*)?""")),
+                useOkhttp = false,
+                timeout = 15_000L,
+            )
+            val finalUrl = app.get(
+                pageUrl,
+                headers = headers,
+                referer = referer,
+                timeout = 15,
+                interceptor = resolver,
+            ).url
+            if (finalUrl.isBlank() || finalUrl == pageUrl || ".m3u8" !in finalUrl) return false
+            callback.invoke(
+                newExtractorLink(this.name, "$channelName • $serverName", finalUrl) {
+                    this.headers = headers
+                    this.referer = referer
+                    this.quality = qualityFor("$channelName $serverName", finalUrl)
+                    this.type = ExtractorLinkType.M3U8
+                }
+            )
+            true
+        } catch (_: Exception) { false }
+    }
+
     /** Tokenized masters (?t=&e=) resolve to the best variant up-front:
      * players drop the query on relative refs, so the raw master URL
      * alone yields dead subrequests. */
@@ -619,12 +738,26 @@ class YacineTvProvider : MainAPI() {
             val isDirect = ".m3u8" in lower || s.urlType == 1 || s.urlType == 3 ||
                 lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".ts")
             if (!isDirect) {
+                // Embed pages (url_type=5): arab-stream.live, snrtlive.ma,
+                // ... No stock extractor handles them, so sniff the page
+                // for an m3u8 first, then loadExtractor, then WebView.
+                if (sniffM3u8FromPage(channelName, serverName, raw, headers, referer, callback)) {
+                    found = true
+                    return true
+                }
                 var resolved = false
                 runCatching {
                     loadExtractor(raw, referer, subtitleCallback) { resolved = true; callback(it) }
                 }
-                if (resolved) found = true
-                return resolved
+                if (resolved) {
+                    found = true
+                    return true
+                }
+                if (sniffM3u8ViaWebView(channelName, serverName, raw, headers, referer, callback)) {
+                    found = true
+                    return true
+                }
+                return false
             }
             if (".m3u8" in lower && "?" in raw) {
                 if (emitBestVariant(channelName, serverName, raw, headers, referer, callback)) {
@@ -647,11 +780,13 @@ class YacineTvProvider : MainAPI() {
         // Event servers first: labeled per match (HD/SD/Low). The channel
         // endpoints all return name "1" for every quality group, so
         // channel-first produced "beIN SPORTS 4 • 1" xN with no quality.
+        // No early return: event Multi links are often dead (403) while
+        // the channel fallback holds a working stream (ON Time Sports
+        // today), so both sources are always aggregated.
         val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
         val eid = info.eventId?.takeIf { it.isNotBlank() }
         if (eid != null) {
             getEventStreams(eid).forEach { if (emit(tag ?: info.name, it)) found = true }
-            if (found) return true
         }
         // Fallback: the card's channel label across quality groups.
         if (tag != null) {
