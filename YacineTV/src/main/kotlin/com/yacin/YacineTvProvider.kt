@@ -663,6 +663,29 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { false }
     }
 
+    /** Liveness probe for direct m3u8 candidates (ranged GET, playlists
+     * are small): true = alive, false = definitively dead (4xx),
+     * null = unknown (timeout/5xx → fail-open, keep order). The player
+     * auto-plays the first link, so dead-first ordering (event Multi
+     * 403 while the channel stream works) reads as "not working". */
+    private suspend fun probePlaylist(url: String, headers: Map<String, String>): Boolean? {
+        return try {
+            val res = app.get(
+                url,
+                headers = headers + ("Range" to "bytes=0-4095"),
+                timeout = 6,
+            )
+            when {
+                res.code in 200..299 &&
+                    ("#EXTM3U" in res.text ||
+                        "mpegurl" in (res.headers["Content-Type"] ?: "") ||
+                        "mpegurl" in (res.headers["content-type"] ?: "")) -> true
+                res.code in 400..499 -> false
+                else -> null
+            }
+        } catch (_: Exception) { null }
+    }
+
     /** Tokenized masters (?t=&e=) resolve to the best variant up-front:
      * players drop the query on relative refs, so the raw master URL
      * alone yields dead subrequests. */
@@ -782,11 +805,15 @@ class YacineTvProvider : MainAPI() {
         // channel-first produced "beIN SPORTS 4 • 1" xN with no quality.
         // No early return: event Multi links are often dead (403) while
         // the channel fallback holds a working stream (ON Time Sports
-        // today), so both sources are always aggregated.
+        // today), so both sources are always aggregated. Direct m3u8
+        // candidates are liveness-probed concurrently and the
+        // definitively-dead ones sink to the end: the player auto-plays
+        // the first link, so dead-first ordering reads as "not working".
         val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
         val eid = info.eventId?.takeIf { it.isNotBlank() }
+        val candidates = mutableListOf<Pair<String, YacineStream>>()
         if (eid != null) {
-            getEventStreams(eid).forEach { if (emit(tag ?: info.name, it)) found = true }
+            getEventStreams(eid).forEach { candidates.add((tag ?: info.name) to it) }
         }
         // Fallback: the card's channel label across quality groups.
         if (tag != null) {
@@ -795,10 +822,33 @@ class YacineTvProvider : MainAPI() {
                 coroutineScope {
                     ids.map { cid -> async { getChannelStreams(cid) } }
                         .awaitAll().flatten()
-                        .forEach { if (emit(tag, it)) found = true }
+                        .forEach { candidates.add(tag to it) }
                 }
-                if (found) return true
             }
+        }
+        val distinct = candidates.filter { (_, s) ->
+            !s.url?.trim().isNullOrBlank()
+        }.distinctBy { (_, s) -> s.url!!.trim() }
+        val (m3u8s, rest) = distinct.partition { (_, s) ->
+            ".m3u8" in s.url!!.lowercase()
+        }
+        val probe = coroutineScope {
+            m3u8s.map { c ->
+                async {
+                    val headers = streamHeaders(c.second)
+                    c to probePlaylist(c.second.url!!.trim(), headers)
+                }
+            }.awaitAll()
+        }
+        // Stable: alive + unknown keep original relative order, dead sink.
+        val orderedDirects = probe.sortedWith(
+            compareBy(
+                { (_, alive) -> if (alive == false) 1 else 0 },
+                { (c, _) -> m3u8s.indexOf(c) },
+            )
+        ).map { it.first }
+        (orderedDirects + rest).forEach { (label, s) ->
+            if (emit(label, s)) found = true
         }
         return found
     }
