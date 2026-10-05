@@ -198,6 +198,23 @@ class YacineTvProvider : MainAPI() {
 
     private fun norm(s: String) = s.trim().lowercase().replace(Regex("""\s+"""), " ")
 
+    /** Dedup key for stream URLs: tokenized masters (?t=&e=) refresh
+     * every fetch, so exact-string compare treats the same stream as
+     * N sources (N previews, slow Binder, ANRs). Strip query/fragment
+     * + lowercase scheme/host for the key; full URL still plays. */
+    private fun dedupKey(url: String): String {
+        val noFrag = url.trim().substringBefore("#")
+        val noQuery = noFrag.substringBefore("?")
+        val schemeIdx = noQuery.indexOf("://")
+        if (schemeIdx < 0) return noQuery.lowercase().trimEnd('/')
+        val afterScheme = noQuery.substring(schemeIdx + 3)
+        val slashIdx = afterScheme.indexOf("/")
+        if (slashIdx < 0) return noQuery.lowercase()
+        val hostEnd = schemeIdx + 3 + slashIdx
+        return noQuery.substring(0, hostEnd).lowercase() +
+            noQuery.substring(hostEnd).trimEnd('/')
+    }
+
     /** Card channel label -> live channel ids (every quality group). The
      * label on the card is what must play; event servers are fallback. */
     private suspend fun resolveChannelIds(label: String): List<String> {
@@ -776,10 +793,21 @@ class YacineTvProvider : MainAPI() {
         val info = parseJson<LinkData>(data)
         var found = false
         val seenUrls = mutableSetOf<String>()
+        val seenEmitted = mutableSetOf<String>()
+
+        /** Single choke point for every emitted link: token refreshes
+         * (?t=&e=) and event-vs-channel copies collapse to one source,
+         * so the player only generates one preview per stream. */
+        fun tryEmit(link: ExtractorLink): Boolean {
+            if (!seenEmitted.add(dedupKey(link.url))) return false
+            callback(link)
+            found = true
+            return true
+        }
 
         suspend fun emit(channelName: String, s: YacineStream): Boolean {
             val raw = s.url?.trim()?.takeIf { it.isNotBlank() } ?: return false
-            if (!seenUrls.add(raw)) return false
+            if (!seenUrls.add(dedupKey(raw))) return false
             val headers = streamHeaders(s)
             val referer = headers["Referer"]?.takeIf { it.isNotBlank() }
                 ?: s.referer?.takeIf { it.isNotBlank() }
@@ -793,32 +821,28 @@ class YacineTvProvider : MainAPI() {
                 // ... No stock extractor handles them, so sniff the page
                 // for an m3u8 first, then loadExtractor, then WebView
                 // (which loads the inner iframe directly + autoplays).
-                val (pageFound, iframe) = sniffM3u8FromPage(channelName, serverName, raw, headers, referer, callback)
+                val (pageFound, iframe) = sniffM3u8FromPage(channelName, serverName, raw, headers, referer, { tryEmit(it) })
                 if (pageFound) {
-                    found = true
                     return true
                 }
                 var resolved = false
                 runCatching {
-                    loadExtractor(raw, referer, subtitleCallback) { resolved = true; callback(it) }
+                    loadExtractor(raw, referer, subtitleCallback) { if (tryEmit(it)) resolved = true }
                 }
                 if (resolved) {
-                    found = true
                     return true
                 }
-                if (sniffM3u8ViaWebView(channelName, serverName, iframe ?: raw, headers, referer, callback)) {
-                    found = true
+                if (sniffM3u8ViaWebView(channelName, serverName, iframe ?: raw, headers, referer, { tryEmit(it) })) {
                     return true
                 }
                 return false
             }
             if (".m3u8" in lower && "?" in raw) {
-                if (emitBestVariant(channelName, serverName, raw, headers, referer, callback)) {
-                    found = true
+                if (emitBestVariant(channelName, serverName, raw, headers, referer, { tryEmit(it) })) {
                     return true
                 }
             }
-            callback.invoke(
+            return tryEmit(
                 newExtractorLink(this.name, "$channelName • $serverName", raw) {
                     this.headers = headers
                     this.referer = headers["Referer"] ?: ""
@@ -826,8 +850,6 @@ class YacineTvProvider : MainAPI() {
                     this.type = if (".m3u8" in raw) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 }
             )
-            found = true
-            return true
         }
 
         // Event servers first: labeled per match (HD/SD/Low). The channel
@@ -858,7 +880,7 @@ class YacineTvProvider : MainAPI() {
         }
         val distinct = candidates.filter { (_, s) ->
             !s.url?.trim().isNullOrBlank()
-        }.distinctBy { (_, s) -> s.url!!.trim() }
+        }.distinctBy { (_, s) -> dedupKey(s.url!!.trim()) }
         val (m3u8s, rest) = distinct.partition { (_, s) ->
             ".m3u8" in s.url!!.lowercase()
         }
