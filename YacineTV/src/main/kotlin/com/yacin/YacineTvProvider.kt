@@ -503,8 +503,9 @@ class YacineTvProvider : MainAPI() {
         }
     }
 
-    /** Card kickoff in Arabic (device timezone): "اليوم 18:00",
-     * "غدا 20:00", else "4 أكتوبر، 18:45". Western digits, 24h clock. */
+    /** Card kickoff in Arabic (device timezone): "18:00" today
+     * (homepage shows today's matches), "غدا 20:00", else
+     * "4 أكتوبر، 18:45". Western digits, 24h clock. */
     private fun formatCardTime(epochSec: Long): String {
         return try {
             val tz = java.util.TimeZone.getDefault()
@@ -514,7 +515,7 @@ class YacineTvProvider : MainAPI() {
             val time = timeFmt.format(at)
             val kickDate = dateFmt.format(at)
             val nowSec = System.currentTimeMillis() / 1000
-            if (kickDate == dateFmt.format(java.util.Date(nowSec * 1000))) return "اليوم $time"
+            if (kickDate == dateFmt.format(java.util.Date(nowSec * 1000))) return time
             val cal = java.util.Calendar.getInstance(tz).apply {
                 timeInMillis = nowSec * 1000
                 add(java.util.Calendar.DAY_OF_YEAR, 1)
@@ -529,7 +530,7 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { "" }
     }
 
-    /** Device-local kickoff: "Today 19:45", "Tomorrow 20:00" or
+    /** Device-local kickoff: "19:45" today, "Tomorrow 20:00" or
      * "22 Sep, 18:45". Blank when already started or unknown. */
     private fun formatKickoff(epochSec: Long?): String {
         if (epochSec == null || epochSec <= 0) return ""
@@ -543,7 +544,7 @@ class YacineTvProvider : MainAPI() {
             val kickDate = dateFmt.format(java.util.Date(epochSec * 1000))
             val nowDate = dateFmt.format(java.util.Date(nowSec * 1000))
             if (kickDate == nowDate) {
-                "Today $time"
+                time
             } else {
                 val cal = java.util.Calendar.getInstance(tz).apply {
                     timeInMillis = nowSec * 1000
