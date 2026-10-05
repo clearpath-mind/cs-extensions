@@ -590,7 +590,7 @@ class YacineTvProvider : MainAPI() {
     ): Boolean {
         return try {
             var found = false
-            fun collect(html: String, base: String) {
+            suspend fun collect(html: String, base: String) {
                 pageM3u8Regex.findAll(html).map { it.value }.distinct().forEach { u ->
                     callback.invoke(
                         newExtractorLink(this.name, "$channelName • $serverName", u) {
