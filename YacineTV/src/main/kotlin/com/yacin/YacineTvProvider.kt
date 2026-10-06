@@ -574,6 +574,11 @@ class YacineTvProvider : MainAPI() {
     }
 
     private fun streamHeaders(s: YacineStream): Map<String, String> {
+        // Working API entries (beIN, Alkass channel) all carry this
+        // browser UA; the event "Local" entry carries none. Default to
+        // it instead of okhttp: GCS-fronted hosts gate on UA, and the
+        // player (Cronet) sends a browser UA anyway.
+        val browserUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
         val out = mutableMapOf<String, String>()
         s.headers?.forEach { (k, v) ->
             val vs = when (v) {
@@ -585,7 +590,7 @@ class YacineTvProvider : MainAPI() {
         }
         out["User-Agent"] = s.userAgent?.takeIf { it.isNotBlank() }
             ?: out["User-Agent"]?.takeIf { it.isNotBlank() }
-            ?: "okhttp/4.12.0"
+            ?: browserUa
         (s.referer?.takeIf { it.isNotBlank() } ?: out["Referer"])
             ?.takeIf { it.isNotBlank() }?.let { out["Referer"] = it }
         return out
@@ -856,12 +861,13 @@ class YacineTvProvider : MainAPI() {
         // Event servers first: labeled per match (HD/SD/Low). The channel
         // endpoints all return name "1" for every quality group, so
         // channel-first produced "beIN SPORTS 4 • 1" xN with no quality.
-        // No early return: event Multi links are often dead (403) while
-        // the channel fallback holds a working stream (ON Time Sports
-        // today), so both sources are always aggregated. Direct m3u8
-        // candidates are liveness-probed concurrently and the
-        // definitively-dead ones sink to the end: the player auto-plays
-        // the first link, so dead-first ordering reads as "not working".
+        // No early return: event links are sometimes dead (403) while
+        // the channel fallback holds a working stream, so both sources
+        // are always aggregated. Direct m3u8 candidates are
+        // liveness-probed concurrently and definitively-dead ones (HTTP
+        // 4xx) are skipped: the player auto-plays the first link, so a
+        // dead-first emission reads as "not working". Unknown
+        // (timeout/5xx) stays fail-open.
         val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
         val eid = info.eventId?.takeIf { it.isNotBlank() }
         val candidates = mutableListOf<Pair<String, YacineStream>>()
@@ -893,13 +899,14 @@ class YacineTvProvider : MainAPI() {
                 }
             }.awaitAll()
         }
-        // Stable: alive + unknown keep original relative order, dead sink.
-        val orderedDirects = probe.sortedWith(
-            compareBy(
-                { (_, alive) -> if (alive == false) 1 else 0 },
-                { (c, _) -> m3u8s.indexOf(c) },
-            )
-        ).map { it.first }
+        // Stable: alive + unknown keep original relative order, dead
+        // (HTTP 4xx, e.g. Alkass GCS 403) are skipped, not emitted: the
+        // player auto-plays the first link, so emitting a known-dead
+        // link spins Cronet into a 403 (ANRs in logcat) before the same
+        // "No Links Found" toast. Unknown (timeout/5xx) stays fail-open.
+        val orderedDirects = probe.filter { (_, alive) -> alive != false }
+            .sortedBy { (c, _) -> m3u8s.indexOf(c) }
+            .map { it.first }
         (orderedDirects + rest).forEach { (label, s) ->
             if (emit(label, s)) found = true
         }
