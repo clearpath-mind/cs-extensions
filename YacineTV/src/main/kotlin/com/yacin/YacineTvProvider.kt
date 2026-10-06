@@ -215,6 +215,21 @@ class YacineTvProvider : MainAPI() {
             noQuery.substring(hostEnd).trimEnd('/')
     }
 
+    /** Distinguishing URL fragment for colliding source labels: the
+     * path segment owning the playlist (ycncdn /live/005/index.m3u8 ->
+     * "005", alkass1-p/main.m3u8 -> "alkass1-p"). Pure function so every
+     * emit site suffixes repeats identically. */
+    private fun urlLabelFragment(url: String): String {
+        val segs = url.substringBefore("?").substringBefore("#")
+            .substringAfter("://").substringAfter("/").split("/")
+            .filter { it.isNotBlank() }
+        val last = segs.lastOrNull().orEmpty()
+        val frag = if (last.endsWith(".m3u8", ignoreCase = true) ||
+            last.endsWith(".mpd", ignoreCase = true)
+        ) segs.getOrNull(segs.size - 2) else last
+        return frag?.takeIf { it.isNotBlank() }?.take(24) ?: "alt"
+    }
+
     /** Card channel label -> live channel ids (every quality group). The
      * label on the card is what must play; event servers are fallback. */
     private suspend fun resolveChannelIds(label: String): List<String> {
@@ -609,6 +624,7 @@ class YacineTvProvider : MainAPI() {
         pageUrl: String,
         headers: Map<String, String>,
         referer: String,
+        uniqueLabel: (String, String) -> String,
         callback: (ExtractorLink) -> Unit,
     ): Pair<Boolean, String?> {
         return try {
@@ -616,7 +632,7 @@ class YacineTvProvider : MainAPI() {
             suspend fun collect(html: String, base: String) {
                 pageM3u8Regex.findAll(html).map { it.value }.distinct().forEach { u ->
                     callback.invoke(
-                        newExtractorLink(this.name, "$channelName • $serverName", u) {
+                        newExtractorLink(this.name, uniqueLabel("$channelName • $serverName", u), u) {
                             this.headers = headers
                             this.referer = base
                             this.quality = qualityFor("$channelName $serverName", u)
@@ -660,6 +676,7 @@ class YacineTvProvider : MainAPI() {
         pageUrl: String,
         headers: Map<String, String>,
         referer: String,
+        uniqueLabel: (String, String) -> String,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         return try {
@@ -667,7 +684,7 @@ class YacineTvProvider : MainAPI() {
             suspend fun emitUrl(u: String, base: String): Boolean {
                 if (".m3u8" !in u || !u.startsWith("http")) return false
                 callback.invoke(
-                    newExtractorLink(this.name, "$channelName • $serverName", u) {
+                    newExtractorLink(this.name, uniqueLabel("$channelName • $serverName", u), u) {
                         this.headers = headers
                         this.referer = base
                         this.quality = qualityFor("$channelName $serverName", u)
@@ -746,6 +763,7 @@ class YacineTvProvider : MainAPI() {
         masterUrl: String,
         headers: Map<String, String>,
         referer: String,
+        uniqueLabel: (String, String) -> String,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         return try {
@@ -779,7 +797,7 @@ class YacineTvProvider : MainAPI() {
             val check = app.get(variantUrl, headers = headers, timeout = 8)
             if (check.code != 200 || "#EXTM3U" !in check.text) return false
             callback.invoke(
-                newExtractorLink(this.name, "$channelName • $serverName", variantUrl) {
+                newExtractorLink(this.name, uniqueLabel("$channelName • $serverName", variantUrl), variantUrl) {
                     this.headers = headers
                     this.referer = referer
                     this.quality = qualityFor("$channelName $serverName", variantUrl)
@@ -800,6 +818,21 @@ class YacineTvProvider : MainAPI() {
         var found = false
         val seenUrls = mutableSetOf<String>()
         val seenEmitted = mutableSetOf<String>()
+        val usedLabels = mutableSetOf<String>()
+
+        /** First emission keeps the plain "$channel • $server" label;
+         * repeats with different URLs (backend names every quality
+         * group "1") get a URL-fragment suffix: "ENTV • 1 (005)". */
+        fun uniqueLabel(base: String, url: String): String {
+            if (usedLabels.add(base)) return base
+            var candidate = "$base (${urlLabelFragment(url)})"
+            var i = 2
+            while (!usedLabels.add(candidate)) {
+                candidate = "$base (${urlLabelFragment(url)} $i)"
+                i++
+            }
+            return candidate
+        }
 
         /** Single choke point for every emitted link: token refreshes
          * (?t=&e=) and event-vs-channel copies collapse to one source,
@@ -827,7 +860,7 @@ class YacineTvProvider : MainAPI() {
                 // ... No stock extractor handles them, so sniff the page
                 // for an m3u8 first, then loadExtractor, then WebView
                 // (which loads the inner iframe directly + autoplays).
-                val (pageFound, iframe) = sniffM3u8FromPage(channelName, serverName, raw, headers, referer, { tryEmit(it) })
+                val (pageFound, iframe) = sniffM3u8FromPage(channelName, serverName, raw, headers, referer, ::uniqueLabel, { tryEmit(it) })
                 if (pageFound) {
                     return true
                 }
@@ -838,18 +871,18 @@ class YacineTvProvider : MainAPI() {
                 if (resolved) {
                     return true
                 }
-                if (sniffM3u8ViaWebView(channelName, serverName, iframe ?: raw, headers, referer, { tryEmit(it) })) {
+                if (sniffM3u8ViaWebView(channelName, serverName, iframe ?: raw, headers, referer, ::uniqueLabel, { tryEmit(it) })) {
                     return true
                 }
                 return false
             }
             if (".m3u8" in lower && "?" in raw) {
-                if (emitBestVariant(channelName, serverName, raw, headers, referer, { tryEmit(it) })) {
+                if (emitBestVariant(channelName, serverName, raw, headers, referer, ::uniqueLabel, { tryEmit(it) })) {
                     return true
                 }
             }
             return tryEmit(
-                newExtractorLink(this.name, "$channelName • $serverName", raw) {
+                newExtractorLink(this.name, uniqueLabel("$channelName • $serverName", raw), raw) {
                     this.headers = headers
                     this.referer = headers["Referer"] ?: ""
                     this.quality = qualityFor("$channelName $serverName", raw)
