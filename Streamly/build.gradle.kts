@@ -2,7 +2,7 @@
 
 import org.jetbrains.kotlin.konan.properties.Properties
 
-version = 113
+version = 114
 
 android {
     namespace = "com.streamly"
@@ -21,7 +21,6 @@ android {
 
 cloudstream {
     language = "ar"
-    description = "Streamly - Watch movies and series with Arabic subtitles"
     authors = listOf("clearpath-mind")
 
     /**
