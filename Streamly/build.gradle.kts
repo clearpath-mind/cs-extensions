@@ -2,7 +2,7 @@
 
 import org.jetbrains.kotlin.konan.properties.Properties
 
-version = 114
+version = 115
 
 android {
     namespace = "com.streamly"
@@ -36,6 +36,8 @@ cloudstream {
         "Movie",
         "TvSeries"
     )
+
+    iconUrl = "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/Streamly/icon.png"
 
     isCrossPlatform = false
 
