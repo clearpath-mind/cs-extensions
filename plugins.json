@@ -1,0 +1,60 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/FreeSidePlus.cs3",
+        "status": 1,
+        "version": 14,
+        "name": "FreeSidePlus",
+        "internalName": "FreeSidePlus",
+        "authors": [
+            "clearpath-mind"
+        ],
+        "fileSize": 33079,
+        "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
+        "language": "en",
+        "tvTypes": [
+            "Movie"
+        ],
+        "iconUrl": "https://freesideplus.plus/wp-content/uploads/2026/06/FSP-LOGO.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-f32793505d0ddca6b0fce726129a2020f55434475d5486482a1b12d1fc429b37"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
+        "status": 1,
+        "version": 115,
+        "name": "Streamly",
+        "internalName": "Streamly",
+        "authors": [
+            "clearpath-mind"
+        ],
+        "fileSize": 277023,
+        "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
+        "language": "ar",
+        "tvTypes": [
+            "Movie",
+            "TvSeries"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/Streamly/icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-63a5ac73a7cd48218b9539a41dcf608299a29057bb74040d4186811fba0dafbc"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
+        "status": 1,
+        "version": 20,
+        "name": "YacineTV",
+        "internalName": "YacineTV",
+        "authors": [
+            "clearpath-mind"
+        ],
+        "fileSize": 68519,
+        "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
+        "language": "ar",
+        "tvTypes": [
+            "Live"
+        ],
+        "iconUrl": "https://yt3.googleusercontent.com/ulm35tweg3do5istps0TgCjMmJSVczGUL2NIrXMwI1DDRi5ty29BIzQSUHVgqZN5CSo1PHhiA6M=s900-c-k-c0x00ffffff-no-rj",
+        "apiVersion": 1,
+        "fileHash": "sha256-3ae9a857a3b57d00ea8abb106601ab2354484af4d92613e9e560ae923962643b"
+    }
+]

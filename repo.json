@@ -1,0 +1,7 @@
+{
+    "name": "Clearpath-mind Repo",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/plugins.json"
+    ]
+}
