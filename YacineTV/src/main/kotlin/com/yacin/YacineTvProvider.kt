@@ -31,7 +31,8 @@ import java.net.URLEncoder
 
 class YacineTvProvider : MainAPI() {
     override var mainUrl = "https://def.ycnapi.com/api"
-    private val fallbackUrl = "https://deft.yacinelive.com/api"
+    // NOTE: former fallback deft.yacinelive.com/api now 403s on
+    // events/categories (Oct 2026) — removed, single-host loop.
 
     override var name = "YacineTV"
     override val hasMainPage = true
@@ -72,18 +73,21 @@ class YacineTvProvider : MainAPI() {
     )
 
     data class YacineTeam(
+        @JsonProperty("id") val id: Int? = null,
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("logo") val logo: String? = null,
     )
 
     data class YacineCategoryEnvelope(
         @JsonProperty("data") val data: List<YacineCategory>? = null,
+        @JsonProperty("vt") val vt: Int? = null,
     )
 
     data class YacineCategory(
         @JsonProperty("id") val id: String = "",
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("child_count") val childCount: Int? = null,
+        @JsonProperty("logo") val logo: String? = null,
     )
 
     data class YacineChannelResponse(
@@ -93,6 +97,9 @@ class YacineTvProvider : MainAPI() {
     data class YacineChannel(
         @JsonProperty("id") val id: String? = null,
         @JsonProperty("name") val name: String? = null,
+        @JsonProperty("logo") val logo: String? = null,
+        @JsonProperty("priority") val priority: Int? = null,
+        @JsonProperty("is_hide") val isHide: Int? = null,
     )
 
     data class YacineStreamResponse(
@@ -106,6 +113,8 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("user_agent") val userAgent: String? = null,
         @JsonProperty("url_type") val urlType: Int? = null,
         @JsonProperty("headers") val headers: Map<String, Any?>? = null,
+        @JsonProperty("drm") val drm: Any? = null,
+        @JsonProperty("event_channel_id") val eventChannelId: Int? = null,
     )
 
     private fun decrypt(encryptedText: String, tHeader: String): String {
@@ -138,18 +147,16 @@ class YacineTvProvider : MainAPI() {
 
     private suspend fun getDecrypted(path: String): String? {
         return retryIO(times = 5) {
-            for (base in listOf(mainUrl, fallbackUrl)) {
-                try {
-                    val res = app.get(
-                        join(base, path),
-                        headers = mapOf("User-Agent" to "okhttp/4.12.0"),
-                        timeout = 15,
-                    )
-                    if (res.code == 200 && res.text.isNotBlank()) {
-                        return@retryIO decrypt(res.text, res.headers["t"] ?: "")
-                    }
-                } catch (_: Exception) { continue }
-            }
+            try {
+                val res = app.get(
+                    join(mainUrl, path),
+                    headers = mapOf("User-Agent" to "okhttp/4.12.0"),
+                    timeout = 15,
+                )
+                if (res.code == 200 && res.text.isNotBlank()) {
+                    return@retryIO decrypt(res.text, res.headers["t"] ?: "")
+                }
+            } catch (_: Exception) { /* retry */ }
             null
         }
     }
@@ -170,11 +177,20 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
+    /** Visible channels first: hidden entries (is_hide=1) never
+     * resolve, priority desc so main feeds (5) win over XTRA (4)
+     * when the card label matches several quality groups. */
+    private fun visibleByPriority(channels: List<YacineChannel>): List<YacineChannel> {
+        return channels
+            .filter { it.isHide != 1 }
+            .sortedByDescending { it.priority ?: 0 }
+    }
+
     private suspend fun getChannels(categoryId: String): List<YacineChannel> {
         val json = getDecrypted("categories/$categoryId/channels") ?: return emptyList()
         if (json.isBlank()) return emptyList()
         return runCatching {
-            parseJson<YacineChannelResponse>(json).data ?: emptyList()
+            visibleByPriority(parseJson<YacineChannelResponse>(json).data ?: emptyList())
         }.getOrNull() ?: emptyList()
     }
 
@@ -187,9 +203,8 @@ class YacineTvProvider : MainAPI() {
     }
 
     private suspend fun getEventStreams(eventId: String): List<YacineStream> {
-        val json = getDecrypted("event/$eventId")
-            ?: getDecrypted("event/$eventId/servers")
-            ?: return emptyList()
+        // NOTE: event/{id}/servers now 404s (Oct 2026) — single path.
+        val json = getDecrypted("event/$eventId") ?: return emptyList()
         if (json.isBlank()) return emptyList()
         return runCatching {
             parseJson<YacineStreamResponse>(json).data ?: emptyList()
@@ -255,7 +270,7 @@ class YacineTvProvider : MainAPI() {
             val json = getDecrypted("search?query=${URLEncoder.encode(label.trim(), "UTF-8")}")
                 ?: return@runCatching null
             if (json.isBlank()) return@runCatching null
-            matchIds(parseJson<YacineChannelResponse>(json).data.orEmpty())
+            matchIds(visibleByPriority(parseJson<YacineChannelResponse>(json).data.orEmpty()))
         }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { return it }
         // Full category walk (not just beIN quality groups): ARABIC
         // CHANNELS nests by country (ALGERIA/MOROCCO/...) — /channels on
