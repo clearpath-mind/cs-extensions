@@ -64,7 +64,14 @@ object StreamlyConcurrency {
         vararg tasks: suspend () -> Unit,
     ) {
         if (tasks.isEmpty()) return
-        val concurrency = detectDeviceProfile(context).recommendedConcurrency
+        // Honor a user-saved concurrency (set on first run from the device
+        // profile); fall back to live detection when unset or out of range.
+        val saved = runCatching {
+            context?.getSharedPreferences("streamly_prefs", Context.MODE_PRIVATE)
+                ?.getInt("provider_concurrency", -1) ?: -1
+        }.getOrDefault(-1)
+        val concurrency = if (saved in 8..50) saved
+        else detectDeviceProfile(context).recommendedConcurrency
         val semaphore = Semaphore(concurrency)
         coroutineScope {
             tasks.map { task ->
