@@ -59,3 +59,29 @@
 - `CricifyProvider/` (`com.cncverse`) — live-sports provider
   (Firebase Remote Config, crypto utils, event manager). Reference for live
   event patterns only, not VOD extractor work.
+
+## Extension ecosystem reference (CloudStream Wiki)
+
+- Full list of maintained repos + plugins lives here, don't copy it into
+  this file: `https://cloudstream.miraheze.org/wiki/List_of_extensions`
+  (plugin list updated 12 Oct 2026).
+- Key: `⭐` = works well, `🛑` = anti-features (closed-source/ads),
+  `~~strikethrough~~` = disabled/broken.
+- Directly relevant to this repo (`Streamly/`, `YacineTV/`, `FreeSidePlus/`):
+  - `re-3arabi` (`arb` / `343`, open) — `github.com/Abodabodd/re-3arabi` —
+    Arabic VOD, tracks FaselHD/MyCima/EgyDead/TopCinema.
+  - `Phisher Repo` (`phisherrepo` / `864`, 🛑 closed-source) —
+    `github.com/phisher98/cloudstream-extensions-phisher` — StreamPlay
+    template source, behavior-only reference.
+  - `CNC Verse` (`cncv`, 🛑 closed-source) —
+    `github.com/NivinCNC/CNCVerse-Cloud-Stream-Extension` — Cricify /
+    live-sports pattern reference.
+  - Official `CloudStream providers repository` (`cspr` / `0094`) —
+    `github.com/recloudstream/extensions`.
+  - `Mega repository` (`megarepo` / `3737`) — bulk-installs all repos for
+    testing.
+- Workflow: before adding a new provider, check the wiki for an existing
+  implementation to port from. Prefer open-source repos for code reading;
+  use closed-source repos for behavior comparison only.
+- See also: `List of unmaintained repositories` on same wiki +
+  `https://rentry.org/cs3-repos` for complete list.
