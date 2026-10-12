@@ -46,6 +46,21 @@ private data class WyzieSubtitle(
 private fun wyzieKey(): String? =
     Streamly.companionSharedPref?.getString("wyzie_key", null)?.takeIf { it.isNotBlank() }
 
+/** Only Arabic + English subs are emitted (user preference). */
+private val WANTED_SUB_CODES = setOf("ar", "ara", "en", "eng")
+
+private fun isWantedSubtitle(code: String?, display: String?): Boolean {
+    val c = code?.lowercase()
+    if (c != null) {
+        if (c in WANTED_SUB_CODES) return true
+        if (c == "arabic" || c == "english") return true
+        val mapped = subtitleLanguage(code).lowercase()
+        return mapped == "arabic" || mapped == "english"
+    }
+    val d = display?.lowercase() ?: return false
+    return d == "arabic" || d == "english"
+}
+
 /** OpenSubtitles-strem.io subtitle dump for an IMDb id (movie or S/E). */
 suspend fun invokeSubtitleApi(
     imdbId: String?,
@@ -69,12 +84,15 @@ suspend fun invokeSubtitleApi(
         )
         if (res.code != 200) return false
         val subs = runCatching { parseJson<OpenSubResponse>(res.text).subtitles }.getOrNull().orEmpty()
+        var emitted = 0
         subs.forEach {
+            if (!isWantedSubtitle(it.lang, null)) return@forEach
             val label = subtitleLanguage(it.lang)
                 .replaceFirstChar { c -> if (c.isLowerCase()) c.titlecase(Locale.getDefault()) else c.toString() }
             subtitleCallback(newSubtitleFile(label, it.url))
+            emitted++
         }
-        Log.d(SUBTITLES_TAG, "SubtitleAPI $imdbId s=${season}e=${episode} -> ${subs.size} subs")
+        Log.d(SUBTITLES_TAG, "SubtitleAPI $imdbId s=${season}e=${episode} -> $emitted subs")
         true
     }.getOrDefault(false)
 }
@@ -96,11 +114,14 @@ suspend fun invokeWyzieSubs(
         }
         val text = app.get(url, timeout = 10000).text
         val subs = runCatching { parseJson<Array<WyzieSubtitle>>(text) }.getOrNull().orEmpty()
+        var emitted = 0
         subs.forEach { sub ->
             val lang = sub.language ?: return@forEach
+            if (!isWantedSubtitle(lang, sub.display)) return@forEach
             subtitleCallback(newSubtitleFile(sub.display ?: subtitleLanguage(lang), sub.url))
+            emitted++
         }
-        Log.d(SUBTITLES_TAG, "Wyzie $imdbId s=${season}e=${episode} -> ${subs.size} subs")
+        Log.d(SUBTITLES_TAG, "Wyzie $imdbId s=${season}e=${episode} -> $emitted subs")
         true
     }.getOrDefault(false)
 }
