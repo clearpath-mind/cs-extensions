@@ -2966,3 +2966,63 @@ suspend fun invokeAkwam(
         emitted > 0
     }
 }
+
+// ---------------------------------------------------------------------------
+// 2Embed (English fallback, fast on new releases). IMDb-keyed embed
+// aggregator ported from StreamPlay: POST -> player iframe -> uqloads link,
+// routed through EmbedRouter so Streamly's own Uqload extractor handles it
+// (2Embed yields uqloads.xyz while Uqload is pinned to uqload.is, so a
+// direct loadExtractor call would miss).
+// ---------------------------------------------------------------------------
+
+private const val TWOEMBED_API = "https://www.2embed.cc"
+private const val TWOEMBED_TAG = "2Embed"
+
+suspend fun invoke2Embed(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val imdbId = res.imdbId?.trim().orEmpty()
+    Log.d(TWOEMBED_TAG, "[invoke] imdb=$imdbId movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "2Embed: start"
+    if (imdbId.isEmpty()) return false
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+    return try {
+        val url = if (res.isMovie) {
+            "$TWOEMBED_API/embed/$imdbId"
+        } else {
+            "$TWOEMBED_API/embedtv/$imdbId&s=${res.season ?: 1}&e=${res.episode ?: 1}"
+        }
+        val framesrc = app.post(
+            url,
+            data = mapOf("pls" to "pls"),
+            headers = mapOf(
+                "Content-Type" to "application/x-www-form-urlencoded",
+                "Referer" to url,
+            ),
+            timeout = 15000,
+        ).document.selectFirst("iframe#iframesrc")?.attr("data-src").orEmpty()
+        if (framesrc.isBlank()) {
+            Log.d(TWOEMBED_TAG, "[invoke] no player iframe for $imdbId")
+            StreamlyDiag.lastStage = "2Embed: no iframe"
+            return false
+        }
+        val ref = getBaseUrl(framesrc)
+        val id = framesrc.substringAfter("id=").substringBefore("&").takeIf { it.isNotBlank() }
+        if (id == null) {
+            Log.d(TWOEMBED_TAG, "[invoke] no stream id in $framesrc")
+            StreamlyDiag.lastStage = "2Embed: no id"
+            return false
+        }
+        EmbedRouter.route("https://uqloads.xyz/e/$id", "$ref/", subtitleCallback, counting, "2Embed")
+        Log.d(TWOEMBED_TAG, "[done  ] emitted=$emitted")
+        StreamlyDiag.lastStage = if (emitted > 0) "2Embed: ok" else "2Embed: no links"
+        emitted > 0
+    } catch (e: Exception) {
+        Log.e(TWOEMBED_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "2Embed: ${e.message}"
+        emitted > 0
+    }
+}

@@ -95,6 +95,7 @@ object StreamlyCache {
         "faselhd" to 1f,
         "egydead" to 1f,
         "akwam" to 1f,
+        "2embed" to 0.5f,
         "wyziesubs" to 0f,
         "subtitleapi" to 0f,
     )

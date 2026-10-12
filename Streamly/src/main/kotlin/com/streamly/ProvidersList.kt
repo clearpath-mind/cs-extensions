@@ -28,6 +28,10 @@ object ProvidersList {
             Provider("akwam", "Akwam") { res, sub, cb ->
                 invokeAkwam(res, sub, cb)
             },
+            // English embed fallback, fast on new releases (StreamPlay pattern).
+            Provider("2embed", "2Embed") { res, sub, cb ->
+                invoke2Embed(res, sub, cb)
+            },
             // Subtitle-only sources (StreamPlay pattern): Wyzie needs a user
             // key, SubtitleAPI is keyless. Both key off the IMDb id.
             Provider("wyziesubs", "WyzieSubs") { res, sub, _ ->
