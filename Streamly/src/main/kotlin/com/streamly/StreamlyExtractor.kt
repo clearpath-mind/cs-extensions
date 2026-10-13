@@ -3041,9 +3041,10 @@ suspend fun invoke2Embed(
 // VidSrc (rotating domain, seed vidsrc.to) IMDb-keyed provider: English video
 // + the player's subtitle tracks (often including Arabic). vidsrc's old
 // /ajax/embed RC4 flow is dead (404s) — the player is now a JS/WASM-gated
-// chain (vidsrc.to -> vsembed.ru -> per-load obfuscated bundle), so instead
-// of porting undecryptable JS we load the embed in the hidden WebView and
-// sniff the .m3u8 + .vtt/.srt traffic, auto-tapping big-play to start it.
+// chain, so instead of porting undecryptable JS we load the embed in the
+// hidden WebView and sniff the .m3u8 + .vtt/.srt traffic, auto-tapping
+// big-play to start it. Entry mirrors (vidsrc.to, then vsembed.ru direct)
+// are tried in order since vidsrc.to is CF-walled on some networks.
 // ---------------------------------------------------------------------------
 
 private const val VIDSRC_SEED_URL = "https://vidsrc.to"
@@ -3060,6 +3061,7 @@ private suspend fun vidsrcResolveWebView(
     embedUrl: String,
     referer: String,
     foundSubs: MutableList<String>,
+    timeoutMs: Long = 20000,
 ): String? =
     suspendCancellableCoroutine { cont ->
         val activity = StreamlyRuntime.context as? Activity
@@ -3128,6 +3130,9 @@ private suspend fun vidsrcResolveWebView(
             }
             fun handleFoundLink(url: String) {
                 val clean = url.substringBefore("?").lowercase()
+                if (clean.endsWith(".m3u8") || clean.endsWith(".vtt") || clean.endsWith(".srt")) {
+                    Log.d(VIDSRC_TAG, "[sniff  ] $url")
+                }
                 if (clean.endsWith(".m3u8")) {
                     synchronized(foundM3u8) {
                         if (foundM3u8.add(url) && finishRunnable == null) {
@@ -3191,6 +3196,7 @@ private suspend fun vidsrcResolveWebView(
                 }
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
+                    Log.d(VIDSRC_TAG, "[page   ] finished $url")
                     view?.evaluateJavascript(netHookJs, null)
                     autoTouchRunnable?.let { handler.removeCallbacks(it) }
                     autoTouchRunnable = object : Runnable {
@@ -3228,7 +3234,8 @@ private suspend fun vidsrcResolveWebView(
                 }
             }
             try { webView.loadUrl(finalUrl, mapOf("Referer" to referer)) } catch (_: Exception) {}
-            handler.postDelayed({ safeFinish(bestM3u8()) }, 25000)
+            Log.d(VIDSRC_TAG, "[load   ] $finalUrl")
+            handler.postDelayed({ safeFinish(bestM3u8()) }, timeoutMs)
             cont.invokeOnCancellation { handler.post { safeFinish(null) } }
         }
     }
@@ -3245,13 +3252,28 @@ suspend fun invokeVidSrc(
     var emitted = 0
     val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
     return try {
-        val base = resolveOrigin(VIDSRC_SEED_URL)
-        val embed = if (res.isMovie) "$base/embed/movie/$imdbId"
-        else "$base/embed/tv/$imdbId/${res.season ?: 1}/${res.episode ?: 1}"
-        var subs = 0
+        val path = if (res.isMovie) "movie/$imdbId"
+        else "tv/$imdbId/${res.season ?: 1}/${res.episode ?: 1}"
+        // vidsrc.to fronts the chain but is CF-walled on some networks;
+        // vsembed.ru serves the same embed path directly (verified) and may
+        // not be walled. Try each mirror until one yields a stream.
+        val mirrors = listOf(resolveOrigin(VIDSRC_SEED_URL), "https://vsembed.ru").distinct()
+        var m3u8: String? = null
+        var winEmbed = ""
         val foundSubs = ArrayList<String>()
-        val m3u8 = vidsrcResolveWebView(embed, base, foundSubs)
+        for (mirror in mirrors) {
+            val embed = "$mirror/embed/$path"
+            m3u8 = vidsrcResolveWebView(embed, mirror, foundSubs)
+            if (!m3u8.isNullOrBlank()) {
+                winEmbed = embed
+                break
+            }
+            Log.d(VIDSRC_TAG, "[mirror ] no stream on $mirror, trying next")
+        }
+        var subs = 0
+        val seenSubUrls = LinkedHashSet<String>()
         foundSubs.forEachIndexed { i, url ->
+            if (!seenSubUrls.add(url)) return@forEachIndexed
             subs++
             subtitleCallback(newSubtitleFile(vidsrcSubLabel(url, i + 1), url))
         }
@@ -3261,14 +3283,14 @@ suspend fun invokeVidSrc(
             StreamlyDiag.lastStage = "VidSrc: no stream"
             return false
         }
-        val origin = runCatching { val u = URI(m3u8); "${u.scheme}://${u.host}" }.getOrDefault(base)
+        val origin = runCatching { val u = URI(m3u8); "${u.scheme}://${u.host}" }.getOrDefault(winEmbed)
         val variants = runCatching {
             generateM3u8(
                 "VidSrc",
                 m3u8,
-                referer = embed,
+                referer = winEmbed,
                 headers = mapOf(
-                    "Referer" to embed,
+                    "Referer" to winEmbed,
                     "Origin" to origin,
                     "User-Agent" to effectiveUa(),
                 ),
@@ -3279,11 +3301,11 @@ suspend fun invokeVidSrc(
         } else {
             counting(
                 newExtractorLink("VidSrc", "VidSrc", url = m3u8) {
-                    this.referer = embed
+                    this.referer = winEmbed
                     this.quality = Qualities.Unknown.value
                     this.type = ExtractorLinkType.M3U8
                     this.headers = mapOf(
-                        "Referer" to embed,
+                        "Referer" to winEmbed,
                         "Origin" to origin,
                         "User-Agent" to effectiveUa(),
                     )
