@@ -3059,7 +3059,7 @@ private fun vidsrcSubLabel(url: String, n: Int): String {
 private suspend fun vidsrcResolveWebView(
     embedUrl: String,
     referer: String,
-    onSubtitle: (String) -> Unit = {},
+    foundSubs: MutableList<String>,
 ): String? =
     suspendCancellableCoroutine { cont ->
         val activity = StreamlyRuntime.context as? Activity
@@ -3138,7 +3138,7 @@ private suspend fun vidsrcResolveWebView(
                     }
                 } else if (clean.endsWith(".vtt") || clean.endsWith(".srt")) {
                     synchronized(seenSubs) {
-                        if (seenSubs.add(url)) onSubtitle(url)
+                        if (seenSubs.add(url)) foundSubs.add(url)
                     }
                 }
             }
@@ -3249,9 +3249,11 @@ suspend fun invokeVidSrc(
         val embed = if (res.isMovie) "$base/embed/movie/$imdbId"
         else "$base/embed/tv/$imdbId/${res.season ?: 1}/${res.episode ?: 1}"
         var subs = 0
-        val m3u8 = vidsrcResolveWebView(embed, base) { url ->
+        val foundSubs = ArrayList<String>()
+        val m3u8 = vidsrcResolveWebView(embed, base, foundSubs)
+        foundSubs.forEachIndexed { i, url ->
             subs++
-            subtitleCallback(newSubtitleFile(vidsrcSubLabel(url, subs), url))
+            subtitleCallback(newSubtitleFile(vidsrcSubLabel(url, i + 1), url))
         }
         Log.d(VIDSRC_TAG, "[sniff  ] stream=${m3u8 != null} subs=$subs")
         if (m3u8.isNullOrBlank()) {
