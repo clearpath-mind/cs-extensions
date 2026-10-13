@@ -580,6 +580,7 @@ private fun cfSolverTimeoutFor(url: String): Long {
     return when {
         "egydead" in host -> 30000L // EgyDead aggressively 403s datacenter traffic
         "fasel" in host -> 20000L   // FaselHD can be slow on complex challenges
+        "wecima" in host -> 30000L  // Wecima search POST sits behind Turnstile; 15s timed out with no cookies
         else -> 15000L              // Default: lightly CF-protected sites
     }
 }
@@ -873,9 +874,13 @@ private suspend fun cfPostText(
     referer: String? = null,
     headers: Map<String, String> = emptyMap(),
     timeout: Long = 15000,
+    solveUrl: String? = null,
 ): String {
     val baseHeaders = headers.toMutableMap().apply {
         putIfAbsent("X-Requested-With", "XMLHttpRequest")
+        // XHR JSON endpoints (Wecima /search) expect a JSON accept;
+        // cfHeaders only fills the HTML accept when absent.
+        putIfAbsent("Accept", "application/json, text/javascript, */*; q=0.01")
     }
     val target = applyHostOverride(url)
     val ref = safeReferer(referer)
@@ -894,9 +899,14 @@ private suspend fun cfPostText(
             return pre
         }
     }
-    // Challenge on a POST: solve, then retry with the freshly stored clearance cookie.
-    Log.d(TAG, "[cfPost ] wall ($target), solving…")
-    val solved = cfSolve(target, awaitContent = false, timeoutMs = cfSolverTimeoutFor(target))
+    // Challenge on a POST: solve a GET-able page on the same host, then
+    // retry with the freshly stored host-scoped clearance cookie. Solving
+    // the POST endpoint itself loads it via GET in the solver WebView, on
+    // which a POST-only endpoint renders nothing and the challenge may
+    // never complete (Wecima /search: solver timed out with no cookies).
+    val solveTarget = solveUrl?.let { applyHostOverride(it) } ?: target
+    Log.d(TAG, "[cfPost ] wall ($target), solving via $solveTarget…")
+    val solved = cfSolve(solveTarget, awaitContent = false, timeoutMs = cfSolverTimeoutFor(solveTarget))
     val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
     val ck = cfCookies(retryUrl)
     // Explicit String? type: app response accessors carry a jspecify
@@ -3061,14 +3071,38 @@ private fun wecimaDecodeUrl(encoded: String): String? {
 
 private suspend fun wecimaSearch(query: String): List<Candidate> {
     val base = wecimaBase()
+    // Solve the site root (a real GET page) rather than the POST-only
+    // /search endpoint: the solver WebView issues a GET, on which /search
+    // renders nothing and the challenge may never complete.
     val text = try {
-        cfPostText("$base/search", data = mapOf("q" to query), referer = base, timeout = 20000)
+        cfPostText(
+            "$base/search",
+            data = mapOf("q" to query),
+            referer = base,
+            timeout = 20000,
+            solveUrl = base,
+        )
     } catch (e: Exception) {
         Log.e(WECIMA_TAG, "[search ] POST failed: ${e.message}")
         return emptyList()
     }
     val arr = runCatching { JSONObject(text).optJSONArray("results") }.getOrNull()
-        ?: return emptyList()
+    if (arr == null) {
+        Log.d(WECIMA_TAG, "[search ] '$query' unparseable (${text.length} chars): ${text.take(120)}")
+        return emptyList()
+    }
+    if (arr.length() == 0) {
+        // English multi-word titles can miss the Arabic index under the
+        // full string; retry once with the head tokens before giving up.
+        // Recursion terminates: the retry has 2 tokens, below the branch.
+        val tokens = query.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (tokens.size >= 3) {
+            val short = tokens.take(2).joinToString(" ")
+            Log.d(WECIMA_TAG, "[search ] '$query' empty, retrying '$short'")
+            return wecimaSearch(short)
+        }
+        return emptyList()
+    }
     val out = ArrayList<Candidate>()
     for (i in 0 until arr.length()) {
         val o = arr.optJSONObject(i) ?: continue
