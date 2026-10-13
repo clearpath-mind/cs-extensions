@@ -1,20 +1,20 @@
 <RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
+    android:layout_height="wrap_content"
     android:background="#121212"
-    android:padding="16dp">
+    android:padding="12dp">
 
     <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:layout_marginTop="8dp">
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:paddingBottom="24dp">
+            android:paddingBottom="8dp">
 
             <!-- Card Layout Wrapper using standard LinearLayout (Programmatic Background) -->
             <LinearLayout
@@ -22,8 +22,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
-                android:padding="20dp"
-                android:layout_marginBottom="16dp">
+                android:padding="16dp">
 
                 <TextView
                     android:layout_width="wrap_content"
@@ -40,7 +39,7 @@
                     android:textSize="14sp"
                     android:textColor="#AAAAAA"
                     android:layout_marginTop="6dp"
-                    android:layout_marginBottom="18dp" />
+                    android:layout_marginBottom="12dp" />
 
                 <!-- Get Key Button -->
                 <Button
@@ -51,7 +50,7 @@
                     android:textColor="#FFFFFF"
                     android:textSize="14sp"
                     android:textStyle="bold"
-                    android:layout_marginBottom="16dp" />
+                    android:layout_marginBottom="12dp" />
 
                 <!-- Key Input EditText -->
                 <EditText
@@ -65,7 +64,7 @@
                     android:inputType="text"
                     android:padding="14dp"
                     android:textSize="15sp"
-                    android:layout_marginBottom="16dp"
+                    android:layout_marginBottom="12dp"
                     android:background="@null" />
 
                 <!-- Bottom Button Row -->
