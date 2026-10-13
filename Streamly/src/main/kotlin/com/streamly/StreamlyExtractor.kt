@@ -52,7 +52,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import me.xdrop.fuzzywuzzy.FuzzySearch
 import okhttp3.FormBody
-import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -3040,142 +3039,199 @@ suspend fun invoke2Embed(
 
 // ---------------------------------------------------------------------------
 // VidSrc (rotating domain, seed vidsrc.to) IMDb-keyed provider: English video
-// + the episode's subtitle tracks (often including Arabic). Port of
-// restreamer's VidSrcTo/VidPlay extractors + the vidsrc-cli shell flow,
-// adapted to Streamly's LinkData: embed/{movie|tv} -> data-id ->
-// ajax/episode sources (prefer Vidplay) -> ajax/source decrypt (base64url +
-// RC4 with a live key) -> vidplay futoken + RC4 x2 -> mediainfo file.
-// The master m3u8 is expanded into per-quality variants like every source.
+// + the player's subtitle tracks (often including Arabic). vidsrc's old
+// /ajax/embed RC4 flow is dead (404s) — the player is now a JS/WASM-gated
+// chain (vidsrc.to -> vsembed.ru -> per-load obfuscated bundle), so instead
+// of porting undecryptable JS we load the embed in the hidden WebView and
+// sniff the .m3u8 + .vtt/.srt traffic, auto-tapping big-play to start it.
 // ---------------------------------------------------------------------------
 
 private const val VIDSRC_SEED_URL = "https://vidsrc.to"
 private const val VIDSRC_TAG = "VidSrc"
 
-/** restreamer's hardcoded vidsrc decrypt key; live keys come from keys4.fun. */
-private const val VIDSRC_FALLBACK_KEY = "8z5Ag5wgagfsOuhz"
-
-private fun vidsrcRc4(key: ByteArray, data: ByteArray): ByteArray {
-    val s = IntArray(256) { it }
-    var j = 0
-    for (i in 0 until 256) {
-        j = (j + s[i] + (key[i % key.size].toInt() and 0xFF)) and 0xFF
-        val t = s[i]; s[i] = s[j]; s[j] = t
-    }
-    val out = ByteArray(data.size)
-    var i = 0; j = 0
-    for (k in data.indices) {
-        i = (i + 1) and 0xFF
-        j = (j + s[i]) and 0xFF
-        val t = s[i]; s[i] = s[j]; s[j] = t
-        out[k] = (data[k].toInt() xor s[(s[i] + s[j]) and 0xFF]).toByte()
-    }
-    return out
+private fun vidsrcSubLabel(url: String, n: Int): String {
+    val name = url.substringAfterLast("/").substringBefore("?").substringBefore(".vtt")
+        .substringBefore(".srt").replace('_', ' ').replace('-', ' ').replace('+', ' ').trim()
+    return name.ifBlank { "Subtitle ${n + 1}" }
 }
 
-private data class VidSrcKeys(val vidsrc: String, val vp1: String, val vp2: String)
-
-@Volatile
-private var vidsrcKeysCache: VidSrcKeys? = null
-
-/** Live decrypt keys (they rotate): structured keys4.fun first, flat
- *  worstsource-keys + hardcoded vidsrc key as fallback. */
-private suspend fun vidsrcKeys(refresh: Boolean = false): VidSrcKeys? {
-    if (!refresh) vidsrcKeysCache?.let { return it }
-    runCatching {
-        val o = JSONObject(cfGetText("https://keys4.fun", timeout = 10000))
-        val vs = o.optJSONObject("vidsrc_to")?.optJSONArray("keys")
-        val vp = o.optJSONObject("vidplay")?.optJSONArray("keys")
-        if (vs != null && vs.length() > 0 && vp != null && vp.length() >= 2) {
-            val k = VidSrcKeys(vs.getString(vs.length() - 1), vp.getString(0), vp.getString(1))
-            vidsrcKeysCache = k
-            return k
+@SuppressLint("SetJavaScriptEnabled")
+private suspend fun vidsrcResolveWebView(
+    embedUrl: String,
+    referer: String,
+    onSubtitle: (String) -> Unit = {},
+): String? =
+    suspendCancellableCoroutine { cont ->
+        val activity = StreamlyRuntime.context as? Activity
+        if (activity == null || activity.isFinishing) {
+            cont.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        val finalUrl = embedUrl.trim()
+        activity.runOnUiThread {
+            val dialog = Dialog(activity)
+            dialog.setCancelable(false)
+            dialog.setCanceledOnTouchOutside(false)
+            dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+            dialog.window?.apply {
+                setBackgroundDrawableResource(android.R.color.transparent)
+                setDimAmount(0f)
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                attributes = attributes?.apply { width = 1; height = 1; x = -10000; y = -10000; gravity = Gravity.START or Gravity.TOP }
+            }
+            val webView = WebView(activity).apply {
+                layoutParams = ViewGroup.LayoutParams(1, 1)
+                visibility = View.INVISIBLE
+                isHorizontalScrollBarEnabled = false
+                isVerticalScrollBarEnabled = false
+            }
+            try { dialog.setContentView(webView, ViewGroup.LayoutParams(1, 1)); dialog.show() } catch (e: Exception) {
+                try { (activity.window?.decorView as? ViewGroup)?.addView(webView, FrameLayout.LayoutParams(1, 1, Gravity.START or Gravity.TOP)) } catch (_: Exception) {}
+            }
+            webView.settings.apply {
+                javaScriptEnabled = true; domStorageEnabled = true; databaseEnabled = true
+                allowContentAccess = true; allowFileAccess = true; allowFileAccessFromFileURLs = true
+                allowUniversalAccessFromFileURLs = true; javaScriptCanOpenWindowsAutomatically = true
+                setSupportMultipleWindows(true); mediaPlaybackRequiresUserGesture = false
+                loadWithOverviewMode = true; useWideViewPort = true
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                cacheMode = WebSettings.LOAD_DEFAULT; userAgentString = effectiveUa(); blockNetworkImage = true
+            }
+            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            val cookieManager = CookieManager.getInstance()
+            try { cookieManager.setAcceptCookie(true); cookieManager.setAcceptThirdPartyCookies(webView, true); cookieManager.flush() } catch (_: Exception) {}
+            val foundM3u8 = LinkedHashSet<String>()
+            val seenSubs = LinkedHashSet<String>()
+            var finished = false
+            val finishLock = Any()
+            val handler = Handler(Looper.getMainLooper())
+            var finishRunnable: Runnable? = null
+            var autoTouchRunnable: Runnable? = null
+            fun cleanup() {
+                try { finishRunnable?.let { handler.removeCallbacks(it) } } catch (_: Exception) {}
+                try { autoTouchRunnable?.let { handler.removeCallbacks(it) } } catch (_: Exception) {}
+                try { (webView.parent as? ViewGroup)?.removeView(webView) } catch (_: Exception) {}
+                try { webView.stopLoading() } catch (_: Exception) {}
+                try { webView.destroy() } catch (_: Exception) {}
+                try { cookieManager.flush() } catch (_: Exception) {}
+                try { if (dialog.isShowing) dialog.dismiss() } catch (_: Exception) {}
+            }
+            fun bestM3u8(): String? =
+                foundM3u8.firstOrNull { val c = it.substringBefore("?"); c.endsWith(".m3u8") && (c.contains("master") || c.contains("playlist") || c.contains("index")) }
+                    ?: foundM3u8.firstOrNull { it.substringBefore("?").endsWith(".m3u8") }
+                    ?: foundM3u8.firstOrNull()
+            fun safeFinish(result: String?) {
+                synchronized(finishLock) { if (finished) return; finished = true }
+                try { if (cont.isActive) cont.resume(result) } catch (_: Exception) {}
+                cleanup()
+            }
+            fun handleFoundLink(url: String) {
+                val clean = url.substringBefore("?").lowercase()
+                if (clean.endsWith(".m3u8")) {
+                    synchronized(foundM3u8) {
+                        if (foundM3u8.add(url) && finishRunnable == null) {
+                            // Give subtitle tracks a moment to surface, then out.
+                            finishRunnable = Runnable { safeFinish(bestM3u8()) }
+                            handler.postDelayed(finishRunnable!!, 2500)
+                        }
+                    }
+                } else if (clean.endsWith(".vtt") || clean.endsWith(".srt")) {
+                    synchronized(seenSubs) {
+                        if (seenSubs.add(url)) onSubtitle(url)
+                    }
+                }
+            }
+            // JW big-play + any <video>: the gate shows a poster until tapped.
+            val playJs = """
+                (function() {
+                    try {
+                        var b = document.querySelector('#bigPlay, .jw-bigplay, .jwplayer-play, [aria-label="Play"]');
+                        if (b) b.click();
+                    } catch(e){}
+                    try {
+                        var vs = document.querySelectorAll('video');
+                        for (var i = 0; i < vs.length; i++) {
+                            try { vs[i].muted = true; var p = vs[i].play(); if (p && p.catch) p.catch(function(){}); } catch(e){}
+                        }
+                    } catch(e){}
+                })();
+            """.trimIndent()
+            // fetch/XHR hook: the player pulls playlists + captions via JS.
+            val netHookJs = """
+                (function() {
+                    if (window.__VS_HOOKED__) return; window.__VS_HOOKED__ = true;
+                    function rep(u) {
+                        if (typeof u === 'string' && (u.indexOf('.m3u8') !== -1 || u.indexOf('.vtt') !== -1 || u.indexOf('.srt') !== -1)) {
+                            console.log('NET_VS::' + u);
+                        }
+                    }
+                    try {
+                        var f = window.fetch;
+                        if (f) { window.fetch = function() { try { var a = arguments[0]; rep(a && (a.url || a)); } catch(e){} return f.apply(this, arguments).then(function(r) { try { rep(r && r.url); } catch(e){} return r; }); }; }
+                    } catch(e){}
+                    try {
+                        var o = XMLHttpRequest.prototype.open;
+                        XMLHttpRequest.prototype.open = function(m, u) { try { rep(u); } catch(e){} return o.apply(this, arguments); };
+                    } catch(e){}
+                })();
+            """.trimIndent()
+            webView.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url.toString()
+                    if (!url.lowercase().startsWith("http")) return true
+                    // The chain legitimately hops hosts
+                    // (vidsrc.to -> vsembed.ru -> player host); the view is
+                    // hidden/untouchable and popups are refused below.
+                    return false
+                }
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    view?.evaluateJavascript(netHookJs, null)
+                }
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    view?.evaluateJavascript(netHookJs, null)
+                    autoTouchRunnable?.let { handler.removeCallbacks(it) }
+                    autoTouchRunnable = object : Runnable {
+                        override fun run() {
+                            if (finished) return
+                            view?.evaluateJavascript(playJs, null)
+                            handler.postDelayed(this, 1200)
+                        }
+                    }
+                    handler.postDelayed(autoTouchRunnable!!, 800)
+                }
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val url = request.url.toString()
+                    if (request.method.equals("GET", ignoreCase = true)) {
+                        val lower = url.lowercase()
+                        if (lower.contains(".m3u8") || lower.contains(".vtt") || lower.contains(".srt")) {
+                            handleFoundLink(url)
+                        }
+                    }
+                    return super.shouldInterceptRequest(view, request)
+                }
+                @SuppressLint("WebViewClientOnReceivedSslError")
+                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                    handler?.proceed()
+                }
+            }
+            webView.webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
+                    val msg = cm?.message() ?: ""
+                    if (msg.startsWith("NET_VS::")) handleFoundLink(msg.substringAfter("::").trim())
+                    return true
+                }
+                override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
+                    return false
+                }
+            }
+            try { webView.loadUrl(finalUrl, mapOf("Referer" to referer)) } catch (_: Exception) {}
+            handler.postDelayed({ safeFinish(bestM3u8()) }, 25000)
+            cont.invokeOnCancellation { handler.post { safeFinish(null) } }
         }
     }
-    runCatching {
-        val arr = JSONArray(
-            cfGetText(
-                "https://raw.githubusercontent.com/Claudemirovsky/worstsource-keys/keys/keys.json",
-                timeout = 10000,
-            )
-        )
-        if (arr.length() >= 2) {
-            val k = VidSrcKeys(VIDSRC_FALLBACK_KEY, arr.getString(0), arr.getString(1))
-            vidsrcKeysCache = k
-            return k
-        }
-    }
-    return vidsrcKeysCache
-}
-
-/** base64url (-/_ alphabet) + RC4 + double URI-decode (restreamer shape). */
-private fun vidsrcDecryptUrl(encrypted: String, key: String): String? {
-    return runCatching {
-        var s = encrypted.replace("_", "/").replace("-", "+").trim()
-        repeat((4 - s.length % 4) % 4) { s += "=" }
-        val raw = android.util.Base64.decode(s, android.util.Base64.DEFAULT)
-        val plain = vidsrcRc4(key.toByteArray(Charsets.UTF_8), raw).toString(Charsets.UTF_8)
-        runCatching { URLDecoder.decode(URLDecoder.decode(plain, "UTF-8"), "UTF-8") }.getOrNull()
-            ?: URLDecoder.decode(plain, "UTF-8")
-    }.getOrNull()?.takeIf { it.startsWith("http") }
-}
-
-/** Vidplay leg: futoken + double-RC4 id -> mediainfo -> m3u8 file. */
-private suspend fun vidplayFile(vpUrl: String, keys: VidSrcKeys): String? {
-    return runCatching {
-        val vpBase = runCatching {
-            val u = URI(vpUrl); "${u.scheme}://${u.host}"
-        }.getOrDefault(vpUrl)
-        val futokenHtml = cfGetText("$vpBase/futoken", referer = vpUrl, timeout = 15000)
-        val futoken = Regex("""k\s*=\s*'([^']+)'""").find(futokenHtml)
-            ?.groupValues?.get(1)?.takeIf { it.isNotBlank() } ?: return null
-        val id = vpUrl.substringAfter("/e/").substringBefore("?").substringBefore("#")
-            .takeIf { it.isNotBlank() } ?: return null
-        val once = vidsrcRc4(keys.vp1.toByteArray(Charsets.UTF_8), id.toByteArray(Charsets.UTF_8))
-        val twice = vidsrcRc4(keys.vp2.toByteArray(Charsets.UTF_8), once)
-        // node base64 with only '/' escaped; sums fold the futoken over it.
-        val hash = android.util.Base64.encodeToString(twice, android.util.Base64.NO_WRAP).replace("/", "_")
-        val sums = StringBuilder(futoken)
-        for (i in hash.indices) sums.append(",").append(futoken[i % futoken.length].code + hash[i].code)
-        var query = vpUrl.substringAfter("?", "")
-        if (!query.contains("autostart")) query = if (query.isEmpty()) "autostart=true" else "$query&autostart=true"
-        val media = JSONObject(cfGetText("$vpBase/mediainfo/$sums?$query", referer = vpUrl, timeout = 15000))
-        media.optJSONObject("result")?.optJSONArray("sources")?.optJSONObject(0)?.optString("file")
-            ?.replace("\\/", "/")?.takeIf { it.startsWith("http") }
-    }.getOrNull()
-}
-
-/** vidsrc's per-episode subtitle tracks (vtt/srt URLs with lang labels). */
-private suspend fun vidsrcSubtitles(
-    base: String,
-    dataId: String,
-    embed: String,
-    subtitleCallback: (SubtitleFile) -> Unit,
-): Int {
-    return runCatching {
-        val text = cfGetText("$base/ajax/embed/episode/$dataId/subtitles", referer = embed, timeout = 15000)
-        val arr = runCatching { JSONArray(text) }.getOrNull()
-            ?: runCatching { JSONObject(text).optJSONArray("result") }.getOrNull()
-            ?: return 0
-        var n = 0
-        var arabic = 0
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            var file = o.optString("file").ifBlank { o.optString("url") }.trim().replace("\\/", "/")
-            if (file.startsWith("//")) file = "https:$file"
-            if (!file.startsWith("http")) continue
-            val label = o.optString("label").ifBlank { o.optString("lang") }
-                .ifBlank { o.optString("language") }.ifBlank { o.optString("name") }
-                .ifBlank { "Subtitle ${n + 1}" }
-            if (label.contains("arab", ignoreCase = true) || label.contains("عربي") ||
-                o.optString("lang").equals("ar", ignoreCase = true)
-            ) arabic++
-            subtitleCallback(newSubtitleFile(label, file))
-            n++
-        }
-        Log.d(VIDSRC_TAG, "[subs   ] $n tracks (${arabic} arabic)")
-        n
-    }.getOrDefault(0)
-}
 
 suspend fun invokeVidSrc(
     res: LinkData,
@@ -3192,86 +3248,26 @@ suspend fun invokeVidSrc(
         val base = resolveOrigin(VIDSRC_SEED_URL)
         val embed = if (res.isMovie) "$base/embed/movie/$imdbId"
         else "$base/embed/tv/$imdbId/${res.season ?: 1}/${res.episode ?: 1}"
-        val html = cfGetText(embed, referer = base, timeout = 15000)
-        val dataId = Regex("""data-id\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
-            ?: Jsoup.parse(html).selectFirst("a[data-id]")?.attr("data-id")?.takeIf { it.isNotBlank() }
-        if (dataId.isNullOrBlank()) {
-            Log.d(VIDSRC_TAG, "[embed  ] no data-id in $embed")
-            StreamlyDiag.lastStage = "VidSrc: no data-id"
+        var subs = 0
+        val m3u8 = vidsrcResolveWebView(embed, base) { url ->
+            subs++
+            subtitleCallback(newSubtitleFile(vidsrcSubLabel(url, subs), url))
+        }
+        Log.d(VIDSRC_TAG, "[sniff  ] stream=${m3u8 != null} subs=$subs")
+        if (m3u8.isNullOrBlank()) {
+            Log.d(VIDSRC_TAG, "[done  ] no stream (subs=$subs)")
+            StreamlyDiag.lastStage = "VidSrc: no stream"
             return false
         }
-        val xhr = mapOf("X-Requested-With" to "XMLHttpRequest")
-        val sources = JSONObject(
-            cfGetText("$base/ajax/embed/episode/$dataId/sources", referer = embed, headers = xhr, timeout = 15000)
-        )
-        if (sources.optInt("status", 0) != 200) {
-            Log.d(VIDSRC_TAG, "[sources] status=${sources.optInt("status", -1)} for $dataId")
-            StreamlyDiag.lastStage = "VidSrc: no sources"
-            return false
-        }
-        val list = sources.optJSONArray("result") ?: JSONArray()
-        var sourceId: String? = null
-        var sourceTitle = ""
-        var firstId: String? = null
-        var firstTitle = ""
-        for (i in 0 until list.length()) {
-            val o = list.optJSONObject(i) ?: continue
-            val id = o.optString("id").takeIf { it.isNotBlank() } ?: continue
-            val title = o.optString("title")
-            if (firstId == null) {
-                firstId = id; firstTitle = title
-            }
-            if (title.equals("Vidplay", ignoreCase = true)) {
-                sourceId = id; sourceTitle = title; break
-            }
-        }
-        if (sourceId == null) {
-            sourceId = firstId; sourceTitle = firstTitle
-        }
-        if (sourceId.isNullOrBlank()) {
-            Log.d(VIDSRC_TAG, "[sources] empty list for $dataId")
-            StreamlyDiag.lastStage = "VidSrc: no sources"
-            return false
-        }
-        val enc = JSONObject(
-            cfGetText("$base/ajax/embed/source/$sourceId", referer = embed, headers = xhr, timeout = 15000)
-        ).optJSONObject("result")?.optString("url").orEmpty()
-        var keys = vidsrcKeys()
-        var vpUrl = keys?.let { vidsrcDecryptUrl(enc, it.vidsrc) }
-        if (vpUrl == null) {
-            keys = vidsrcKeys(refresh = true)
-            vpUrl = keys?.let { vidsrcDecryptUrl(enc, it.vidsrc) }
-        }
-        if (vpUrl == null) {
-            Log.d(VIDSRC_TAG, "[decrypt] failed for source $sourceId ($sourceTitle)")
-            StreamlyDiag.lastStage = "VidSrc: decrypt failed"
-            return false
-        }
-        Log.d(VIDSRC_TAG, "[source ] $sourceTitle -> ${vpUrl.take(80)}")
-        // Subtitle tracks are cheap and survive even a failed stream resolve.
-        vidsrcSubtitles(base, dataId, embed, subtitleCallback)
-        if (!sourceTitle.equals("Vidplay", ignoreCase = true)) {
-            EmbedRouter.route(vpUrl, embed, subtitleCallback, counting, "VidSrc")
-            Log.d(VIDSRC_TAG, "[done  ] emitted=$emitted (routed $sourceTitle)")
-            StreamlyDiag.lastStage = if (emitted > 0) "VidSrc: ok" else "VidSrc: no links"
-            return emitted > 0
-        }
-        val k = keys ?: return false
-        val file = vidplayFile(vpUrl, k)
-        if (file.isNullOrBlank()) {
-            Log.d(VIDSRC_TAG, "[media  ] no file for $vpUrl")
-            StreamlyDiag.lastStage = "VidSrc: no file"
-            return emitted > 0
-        }
-        val vpBase = runCatching { val u = URI(file); "${u.scheme}://${u.host}" }.getOrDefault(base)
+        val origin = runCatching { val u = URI(m3u8); "${u.scheme}://${u.host}" }.getOrDefault(base)
         val variants = runCatching {
             generateM3u8(
                 "VidSrc",
-                file,
-                referer = vpUrl,
+                m3u8,
+                referer = embed,
                 headers = mapOf(
-                    "Referer" to vpUrl,
-                    "Origin" to vpBase,
+                    "Referer" to embed,
+                    "Origin" to origin,
                     "User-Agent" to effectiveUa(),
                 ),
             )
@@ -3280,19 +3276,19 @@ suspend fun invokeVidSrc(
             dropRedundantMasters(variants).forEach(counting)
         } else {
             counting(
-                newExtractorLink("VidSrc", "VidSrc", url = file) {
-                    this.referer = vpUrl
+                newExtractorLink("VidSrc", "VidSrc", url = m3u8) {
+                    this.referer = embed
                     this.quality = Qualities.Unknown.value
                     this.type = ExtractorLinkType.M3U8
                     this.headers = mapOf(
-                        "Referer" to vpUrl,
-                        "Origin" to vpBase,
+                        "Referer" to embed,
+                        "Origin" to origin,
                         "User-Agent" to effectiveUa(),
                     )
                 },
             )
         }
-        Log.d(VIDSRC_TAG, "[done  ] emitted=$emitted")
+        Log.d(VIDSRC_TAG, "[done  ] emitted=$emitted subs=$subs")
         StreamlyDiag.lastStage = if (emitted > 0) "VidSrc: ok" else "VidSrc: no links"
         emitted > 0
     } catch (e: Exception) {
