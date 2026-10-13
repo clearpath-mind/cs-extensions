@@ -28,6 +28,10 @@ object ProvidersList {
             Provider("akwam", "Akwam") { res, sub, cb ->
                 invokeAkwam(res, sub, cb)
             },
+            // EasyPlex app API (TMDB-keyed search, exact tmdb_id match).
+            Provider("egywatch", "EgyWatch") { res, sub, cb ->
+                invokeEgyWatch(res, sub, cb)
+            },
             // English embed fallback, fast on new releases (StreamPlay pattern).
             Provider("2embed", "2Embed") { res, sub, cb ->
                 invoke2Embed(res, sub, cb)

@@ -3036,3 +3036,167 @@ suspend fun invoke2Embed(
         emitted > 0
     }
 }
+
+// ---------------------------------------------------------------------------
+// EgyWatch (EasyPlex app API). Search hits carry tmdb_id, so matching is
+// exact against LinkData.id with a fuzzy-title fallback — no slug scraping.
+// The {code} path segment is not validated server-side (verified: any value
+// returns 200 with real data), and the live base comes from a public mirror
+// config (client.egywatch.live/api_urls.json). Video mirrors route through
+// EmbedRouter like every other Arabic source.
+// ---------------------------------------------------------------------------
+
+private const val EGYWATCH_API_URLS = "https://client.egywatch.live/api_urls.json"
+private const val EGYWATCH_DEFAULT_BASE = "https://gateway.egywatch.live/egywatchapp/public/api"
+private const val EGYWATCH_CODE = "android"
+private const val EGYWATCH_TAG = "EgyWatch"
+
+private val EGYWATCH_HEADERS = mapOf(
+    "User-Agent" to "EasyPlex/5.0.0 (Android)",
+    "packagename" to "com.linkletter.app",
+    "Accept" to "application/json",
+    "x-app-id" to "Egywatch-mobile",
+    "x-platform" to "android",
+)
+
+/** Candidate API bases: live mirror config first, hardcoded fallbacks after. */
+private suspend fun egyWatchBases(): List<String> {
+    val live = runCatching {
+        JSONObject(app.get(EGYWATCH_API_URLS, timeout = 10000).text)
+            .optString("EgywatchV5").trim().removeSuffix("/")
+    }.getOrNull().orEmpty()
+    return (listOf(
+        live,
+        EGYWATCH_DEFAULT_BASE,
+        "https://gateway.egywatch.live/egywatch/public/api",
+        "https://rn62mwg.com/egywatchapp/public/api",
+    ).map { it.trim().removeSuffix("/") }
+        .filter { it.startsWith("http") }
+        .distinct())
+}
+
+/** GET a JSON endpoint, trying each base in order. Returns working base + body. */
+private suspend fun egyWatchGet(bases: List<String>, path: String): Pair<String, JSONObject>? {
+    for (base in bases) {
+        val json = runCatching {
+            JSONObject(app.get("$base$path", headers = EGYWATCH_HEADERS, timeout = 15000).text)
+        }.getOrNull()
+        if (json != null) return base to json
+    }
+    return null
+}
+
+/** Pick the API item id: exact tmdb_id match first, fuzzy title fallback (>= 60). */
+private fun egyWatchPickId(search: JSONObject, res: LinkData): Pair<Int, String>? {
+    val arr = search.optJSONArray("search") ?: return null
+    val wantSeries = !res.isMovie
+    var fuzzyId = -1
+    var fuzzyType = ""
+    var fuzzyScore = 0
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val id = o.optInt("id", -1)
+        if (id <= 0) continue
+        val type = o.optString("type")
+        // Blank type: assume it matches rather than discarding the hit.
+        val isSeries = if (type.isBlank()) wantSeries else !type.equals("movie", ignoreCase = true)
+        if (o.optInt("tmdb_id", -1) == res.id && isSeries == wantSeries) return id to type
+        val title = o.optString("title").ifBlank { o.optString("name") }
+        val score = FuzzySearch.ratio(res.title?.lowercase().orEmpty(), title.lowercase())
+        if (isSeries == wantSeries && score > fuzzyScore) {
+            fuzzyScore = score
+            fuzzyId = id
+            fuzzyType = type
+        }
+    }
+    return if (fuzzyId > 0 && fuzzyScore >= 60) fuzzyId to fuzzyType else null
+}
+
+private suspend fun egyWatchRouteVideos(
+    base: String,
+    videos: org.json.JSONArray,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    counting: (ExtractorLink) -> Unit,
+) {
+    (0 until videos.length()).mapNotNull { videos.optJSONObject(it) }.amap { v ->
+        runCatching {
+            val link = v.optString("link").trim()
+            if (!link.startsWith("http")) return@runCatching
+            val ref = v.optString("header").trim().takeIf { it.startsWith("http") } ?: base
+            EmbedRouter.route(link, ref, subtitleCallback, counting, "EgyWatch")
+        }
+    }
+}
+
+suspend fun invokeEgyWatch(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(EGYWATCH_TAG, "[invoke] title=$title tmdb=${res.id} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "EgyWatch: start"
+    if (title.isEmpty()) return false
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+    return try {
+        val bases = egyWatchBases()
+        val encoded = URLEncoder.encode("$title|vide", "UTF-8")
+        val searchRes = egyWatchGet(bases, "/search/$encoded/$EGYWATCH_CODE")
+        if (searchRes == null) {
+            StreamlyDiag.lastStage = "EgyWatch: search failed"
+            return false
+        }
+        val (base, search) = searchRes
+        val pick = egyWatchPickId(search, res)
+        if (pick == null) {
+            Log.d(EGYWATCH_TAG, "[invoke] no match for $title")
+            StreamlyDiag.lastStage = "EgyWatch: no match"
+            return false
+        }
+        val (itemId, _) = pick
+        StreamlyCache.markEpisodeMatched("egywatch")
+        if (res.isMovie) {
+            val detail = egyWatchGet(listOf(base), "/media/detail/$itemId/$EGYWATCH_CODE")?.second
+            val videos = detail?.optJSONArray("videos")
+            if (videos == null) {
+                StreamlyDiag.lastStage = "EgyWatch: no videos"
+                return false
+            }
+            egyWatchRouteVideos(base, videos, subtitleCallback, counting)
+        } else {
+            val show = egyWatchGet(listOf(base), "/series/show/$itemId/$EGYWATCH_CODE")?.second
+            val seasons = show?.optJSONArray("seasons")
+            if (seasons == null) {
+                StreamlyDiag.lastStage = "EgyWatch: no seasons"
+                return false
+            }
+            val seasonId = (0 until seasons.length())
+                .mapNotNull { seasons.optJSONObject(it) }
+                .firstOrNull { it.optInt("season_number") == (res.season ?: 1) }
+                ?.optInt("id", -1) ?: -1
+            if (seasonId <= 0) {
+                StreamlyDiag.lastStage = "EgyWatch: no season"
+                return false
+            }
+            val season = egyWatchGet(listOf(base), "/series/season/$seasonId/$EGYWATCH_CODE")?.second
+            val episodes = season?.optJSONArray("episodes")
+            val ep = if (episodes == null) null else (0 until episodes.length())
+                .mapNotNull { episodes.optJSONObject(it) }
+                .firstOrNull { it.optInt("episode_number") == (res.episode ?: 1) }
+            val videos = ep?.optJSONArray("videos")
+            if (videos == null) {
+                StreamlyDiag.lastStage = "EgyWatch: no episode"
+                return false
+            }
+            egyWatchRouteVideos(base, videos, subtitleCallback, counting)
+        }
+        Log.d(EGYWATCH_TAG, "[done  ] emitted=$emitted")
+        StreamlyDiag.lastStage = if (emitted > 0) "EgyWatch: ok" else "EgyWatch: no links"
+        emitted > 0
+    } catch (e: Exception) {
+        Log.e(EGYWATCH_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "EgyWatch: ${e.message}"
+        emitted > 0
+    }
+}
