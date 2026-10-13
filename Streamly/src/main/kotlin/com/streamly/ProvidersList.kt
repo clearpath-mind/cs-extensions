@@ -32,10 +32,6 @@ object ProvidersList {
             Provider("2embed", "2Embed") { res, sub, cb ->
                 invoke2Embed(res, sub, cb)
             },
-            // English video + vidsrc subtitle tracks (often incl. Arabic), IMDb-keyed like 2Embed.
-            Provider("vidsrc", "VidSrc") { res, sub, cb ->
-                invokeVidSrc(res, sub, cb)
-            },
             // Subtitle-only sources (StreamPlay pattern): Wyzie needs a user
             // key, SubtitleAPI is keyless. Both key off the IMDb id.
             Provider("wyziesubs", "WyzieSubs") { res, sub, _ ->

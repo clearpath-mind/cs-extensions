@@ -27,7 +27,6 @@ class StreamlyPlugin : Plugin() {
         registerExtractorAPI(Mp4Plus())
         registerExtractorAPI(VoeExtractor())
         registerExtractorAPI(KwikExtractor())
-        registerExtractorAPI(VidSrcExtractor())
 
         val sharedPref = context.getSharedPreferences("streamly_prefs", Context.MODE_PRIVATE)
 
