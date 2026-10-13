@@ -39,6 +39,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.newSubtitleFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -51,6 +52,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import me.xdrop.fuzzywuzzy.FuzzySearch
 import okhttp3.FormBody
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -3032,6 +3034,270 @@ suspend fun invoke2Embed(
     } catch (e: Exception) {
         Log.e(TWOEMBED_TAG, "[invoke] failed: ${e.message}")
         StreamlyDiag.lastStage = "2Embed: ${e.message}"
+        emitted > 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VidSrc (rotating domain, seed vidsrc.to) IMDb-keyed provider: English video
+// + the episode's subtitle tracks (often including Arabic). Port of
+// restreamer's VidSrcTo/VidPlay extractors + the vidsrc-cli shell flow,
+// adapted to Streamly's LinkData: embed/{movie|tv} -> data-id ->
+// ajax/episode sources (prefer Vidplay) -> ajax/source decrypt (base64url +
+// RC4 with a live key) -> vidplay futoken + RC4 x2 -> mediainfo file.
+// The master m3u8 is expanded into per-quality variants like every source.
+// ---------------------------------------------------------------------------
+
+private const val VIDSRC_SEED_URL = "https://vidsrc.to"
+private const val VIDSRC_TAG = "VidSrc"
+
+/** restreamer's hardcoded vidsrc decrypt key; live keys come from keys4.fun. */
+private const val VIDSRC_FALLBACK_KEY = "8z5Ag5wgagfsOuhz"
+
+private fun vidsrcRc4(key: ByteArray, data: ByteArray): ByteArray {
+    val s = IntArray(256) { it }
+    var j = 0
+    for (i in 0 until 256) {
+        j = (j + s[i] + (key[i % key.size].toInt() and 0xFF)) and 0xFF
+        val t = s[i]; s[i] = s[j]; s[j] = t
+    }
+    val out = ByteArray(data.size)
+    var i = 0; j = 0
+    for (k in data.indices) {
+        i = (i + 1) and 0xFF
+        j = (j + s[i]) and 0xFF
+        val t = s[i]; s[i] = s[j]; s[j] = t
+        out[k] = (data[k].toInt() xor s[(s[i] + s[j]) and 0xFF]).toByte()
+    }
+    return out
+}
+
+private data class VidSrcKeys(val vidsrc: String, val vp1: String, val vp2: String)
+
+@Volatile
+private var vidsrcKeysCache: VidSrcKeys? = null
+
+/** Live decrypt keys (they rotate): structured keys4.fun first, flat
+ *  worstsource-keys + hardcoded vidsrc key as fallback. */
+private suspend fun vidsrcKeys(refresh: Boolean = false): VidSrcKeys? {
+    if (!refresh) vidsrcKeysCache?.let { return it }
+    runCatching {
+        val o = JSONObject(cfGetText("https://keys4.fun", timeout = 10000))
+        val vs = o.optJSONObject("vidsrc_to")?.optJSONArray("keys")
+        val vp = o.optJSONObject("vidplay")?.optJSONArray("keys")
+        if (vs != null && vs.length() > 0 && vp != null && vp.length() >= 2) {
+            val k = VidSrcKeys(vs.getString(vs.length() - 1), vp.getString(0), vp.getString(1))
+            vidsrcKeysCache = k
+            return k
+        }
+    }
+    runCatching {
+        val arr = JSONArray(
+            cfGetText(
+                "https://raw.githubusercontent.com/Claudemirovsky/worstsource-keys/keys/keys.json",
+                timeout = 10000,
+            )
+        )
+        if (arr.length() >= 2) {
+            val k = VidSrcKeys(VIDSRC_FALLBACK_KEY, arr.getString(0), arr.getString(1))
+            vidsrcKeysCache = k
+            return k
+        }
+    }
+    return vidsrcKeysCache
+}
+
+/** base64url (-/_ alphabet) + RC4 + double URI-decode (restreamer shape). */
+private fun vidsrcDecryptUrl(encrypted: String, key: String): String? {
+    return runCatching {
+        var s = encrypted.replace("_", "/").replace("-", "+").trim()
+        repeat((4 - s.length % 4) % 4) { s += "=" }
+        val raw = android.util.Base64.decode(s, android.util.Base64.DEFAULT)
+        val plain = vidsrcRc4(key.toByteArray(Charsets.UTF_8), raw).toString(Charsets.UTF_8)
+        runCatching { URLDecoder.decode(URLDecoder.decode(plain, "UTF-8"), "UTF-8") }.getOrNull()
+            ?: URLDecoder.decode(plain, "UTF-8")
+    }.getOrNull()?.takeIf { it.startsWith("http") }
+}
+
+/** Vidplay leg: futoken + double-RC4 id -> mediainfo -> m3u8 file. */
+private suspend fun vidplayFile(vpUrl: String, keys: VidSrcKeys): String? {
+    return runCatching {
+        val vpBase = runCatching {
+            val u = URI(vpUrl); "${u.scheme}://${u.host}"
+        }.getOrDefault(vpUrl)
+        val futokenHtml = cfGetText("$vpBase/futoken", referer = vpUrl, timeout = 15000)
+        val futoken = Regex("""k\s*=\s*'([^']+)'""").find(futokenHtml)
+            ?.groupValues?.get(1)?.takeIf { it.isNotBlank() } ?: return null
+        val id = vpUrl.substringAfter("/e/").substringBefore("?").substringBefore("#")
+            .takeIf { it.isNotBlank() } ?: return null
+        val once = vidsrcRc4(keys.vp1.toByteArray(Charsets.UTF_8), id.toByteArray(Charsets.UTF_8))
+        val twice = vidsrcRc4(keys.vp2.toByteArray(Charsets.UTF_8), once)
+        // node base64 with only '/' escaped; sums fold the futoken over it.
+        val hash = android.util.Base64.encodeToString(twice, android.util.Base64.NO_WRAP).replace("/", "_")
+        val sums = StringBuilder(futoken)
+        for (i in hash.indices) sums.append(",").append(futoken[i % futoken.length].code + hash[i].code)
+        var query = vpUrl.substringAfter("?", "")
+        if (!query.contains("autostart")) query = if (query.isEmpty()) "autostart=true" else "$query&autostart=true"
+        val media = JSONObject(cfGetText("$vpBase/mediainfo/$sums?$query", referer = vpUrl, timeout = 15000))
+        media.optJSONObject("result")?.optJSONArray("sources")?.optJSONObject(0)?.optString("file")
+            ?.replace("\\/", "/")?.takeIf { it.startsWith("http") }
+    }.getOrNull()
+}
+
+/** vidsrc's per-episode subtitle tracks (vtt/srt URLs with lang labels). */
+private suspend fun vidsrcSubtitles(
+    base: String,
+    dataId: String,
+    embed: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+): Int {
+    return runCatching {
+        val text = cfGetText("$base/ajax/embed/episode/$dataId/subtitles", referer = embed, timeout = 15000)
+        val arr = runCatching { JSONArray(text) }.getOrNull()
+            ?: runCatching { JSONObject(text).optJSONArray("result") }.getOrNull()
+            ?: return 0
+        var n = 0
+        var arabic = 0
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            var file = o.optString("file").ifBlank { o.optString("url") }.trim().replace("\\/", "/")
+            if (file.startsWith("//")) file = "https:$file"
+            if (!file.startsWith("http")) continue
+            val label = o.optString("label").ifBlank { o.optString("lang") }
+                .ifBlank { o.optString("language") }.ifBlank { o.optString("name") }
+                .ifBlank { "Subtitle ${n + 1}" }
+            if (label.contains("arab", ignoreCase = true) || label.contains("عربي") ||
+                o.optString("lang").equals("ar", ignoreCase = true)
+            ) arabic++
+            subtitleCallback(newSubtitleFile(label, file))
+            n++
+        }
+        Log.d(VIDSRC_TAG, "[subs   ] $n tracks (${arabic} arabic)")
+        n
+    }.getOrDefault(0)
+}
+
+suspend fun invokeVidSrc(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val imdbId = res.imdbId?.trim().orEmpty()
+    Log.d(VIDSRC_TAG, "[invoke] imdb=$imdbId movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "VidSrc: start"
+    if (imdbId.isEmpty()) return false
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+    return try {
+        val base = resolveOrigin(VIDSRC_SEED_URL)
+        val embed = if (res.isMovie) "$base/embed/movie/$imdbId"
+        else "$base/embed/tv/$imdbId/${res.season ?: 1}/${res.episode ?: 1}"
+        val html = cfGetText(embed, referer = base, timeout = 15000)
+        val dataId = Regex("""data-id\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+            ?: Jsoup.parse(html).selectFirst("a[data-id]")?.attr("data-id")?.takeIf { it.isNotBlank() }
+        if (dataId.isNullOrBlank()) {
+            Log.d(VIDSRC_TAG, "[embed  ] no data-id in $embed")
+            StreamlyDiag.lastStage = "VidSrc: no data-id"
+            return false
+        }
+        val xhr = mapOf("X-Requested-With" to "XMLHttpRequest")
+        val sources = JSONObject(
+            cfGetText("$base/ajax/embed/episode/$dataId/sources", referer = embed, headers = xhr, timeout = 15000)
+        )
+        if (sources.optInt("status", 0) != 200) {
+            Log.d(VIDSRC_TAG, "[sources] status=${sources.optInt("status", -1)} for $dataId")
+            StreamlyDiag.lastStage = "VidSrc: no sources"
+            return false
+        }
+        val list = sources.optJSONArray("result") ?: JSONArray()
+        var sourceId: String? = null
+        var sourceTitle = ""
+        var firstId: String? = null
+        var firstTitle = ""
+        for (i in 0 until list.length()) {
+            val o = list.optJSONObject(i) ?: continue
+            val id = o.optString("id").takeIf { it.isNotBlank() } ?: continue
+            val title = o.optString("title")
+            if (firstId == null) {
+                firstId = id; firstTitle = title
+            }
+            if (title.equals("Vidplay", ignoreCase = true)) {
+                sourceId = id; sourceTitle = title; break
+            }
+        }
+        if (sourceId == null) {
+            sourceId = firstId; sourceTitle = firstTitle
+        }
+        if (sourceId.isNullOrBlank()) {
+            Log.d(VIDSRC_TAG, "[sources] empty list for $dataId")
+            StreamlyDiag.lastStage = "VidSrc: no sources"
+            return false
+        }
+        val enc = JSONObject(
+            cfGetText("$base/ajax/embed/source/$sourceId", referer = embed, headers = xhr, timeout = 15000)
+        ).optJSONObject("result")?.optString("url").orEmpty()
+        var keys = vidsrcKeys()
+        var vpUrl = keys?.let { vidsrcDecryptUrl(enc, it.vidsrc) }
+        if (vpUrl == null) {
+            keys = vidsrcKeys(refresh = true)
+            vpUrl = keys?.let { vidsrcDecryptUrl(enc, it.vidsrc) }
+        }
+        if (vpUrl == null) {
+            Log.d(VIDSRC_TAG, "[decrypt] failed for source $sourceId ($sourceTitle)")
+            StreamlyDiag.lastStage = "VidSrc: decrypt failed"
+            return false
+        }
+        Log.d(VIDSRC_TAG, "[source ] $sourceTitle -> ${vpUrl.take(80)}")
+        // Subtitle tracks are cheap and survive even a failed stream resolve.
+        vidsrcSubtitles(base, dataId, embed, subtitleCallback)
+        if (!sourceTitle.equals("Vidplay", ignoreCase = true)) {
+            EmbedRouter.route(vpUrl, embed, subtitleCallback, counting, "VidSrc")
+            Log.d(VIDSRC_TAG, "[done  ] emitted=$emitted (routed $sourceTitle)")
+            StreamlyDiag.lastStage = if (emitted > 0) "VidSrc: ok" else "VidSrc: no links"
+            return emitted > 0
+        }
+        val k = keys ?: return false
+        val file = vidplayFile(vpUrl, k)
+        if (file.isNullOrBlank()) {
+            Log.d(VIDSRC_TAG, "[media  ] no file for $vpUrl")
+            StreamlyDiag.lastStage = "VidSrc: no file"
+            return emitted > 0
+        }
+        val vpBase = runCatching { val u = URI(file); "${u.scheme}://${u.host}" }.getOrDefault(base)
+        val variants = runCatching {
+            generateM3u8(
+                "VidSrc",
+                file,
+                referer = vpUrl,
+                headers = mapOf(
+                    "Referer" to vpUrl,
+                    "Origin" to vpBase,
+                    "User-Agent" to effectiveUa(),
+                ),
+            )
+        }.getOrNull().orEmpty()
+        if (variants.isNotEmpty()) {
+            dropRedundantMasters(variants).forEach(counting)
+        } else {
+            counting(
+                newExtractorLink("VidSrc", "VidSrc", url = file) {
+                    this.referer = vpUrl
+                    this.quality = Qualities.Unknown.value
+                    this.type = ExtractorLinkType.M3U8
+                    this.headers = mapOf(
+                        "Referer" to vpUrl,
+                        "Origin" to vpBase,
+                        "User-Agent" to effectiveUa(),
+                    )
+                },
+            )
+        }
+        Log.d(VIDSRC_TAG, "[done  ] emitted=$emitted")
+        StreamlyDiag.lastStage = if (emitted > 0) "VidSrc: ok" else "VidSrc: no links"
+        emitted > 0
+    } catch (e: Exception) {
+        Log.e(VIDSRC_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "VidSrc: ${e.message}"
         emitted > 0
     }
 }
