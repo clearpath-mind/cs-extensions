@@ -3026,3 +3026,237 @@ suspend fun invoke2Embed(
         emitted > 0
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wecima (rotating domain, seed wecima.ac) link source. Port of the re-3arabi
+// WecimaProvider search + watch chain, adapted to Streamly's TMDB-title
+// matching: POST $base/search {q} -> JSON results [{title, slug, year,
+// istv}] (istv 0 = movie -> /watch/, else series -> /series/). Movies pull
+// ul.WatchServersList li btn[data-url] (base64 with an "aHR0c" prefix when
+// the payload omits the scheme); series resolve seasons via POST
+// $base/ajax/Episode {post_id, season} and match the episode /watch/ page.
+// All traffic uses cfGet*/cfPostText: the site sits behind Cloudflare.
+// re-3arabi's hardcoded cf_clearance seed is deliberately NOT ported (a
+// stale personal cookie) — the on-device solver clears the wall instead.
+// ---------------------------------------------------------------------------
+
+private const val WECIMA_SEED_URL = "https://wecima.ac"
+private const val WECIMA_TAG = "Wecima"
+
+/** Wecima rotates domains; resolve the live origin once and reuse it. */
+private suspend fun wecimaBase(): String = resolveOrigin(WECIMA_SEED_URL)
+
+/** Wecima's base64 watch payloads omit the "aHR0c" (http) head. */
+private fun wecimaDecodeUrl(encoded: String): String? {
+    return runCatching {
+        if (encoded.isBlank()) return null
+        val cleaned = encoded.replace("+", "").trim()
+        if (cleaned.isBlank()) return null
+        val padded = if (cleaned.startsWith("aHR0c")) cleaned else "aHR0c$cleaned"
+        val decoded = android.util.Base64.decode(padded, android.util.Base64.DEFAULT)
+            .toString(Charsets.UTF_8).trim()
+        decoded.takeIf { it.startsWith("http") }
+    }.getOrNull()
+}
+
+private suspend fun wecimaSearch(query: String): List<Candidate> {
+    val base = wecimaBase()
+    val text = try {
+        cfPostText("$base/search", data = mapOf("q" to query), referer = base, timeout = 20000)
+    } catch (e: Exception) {
+        Log.e(WECIMA_TAG, "[search ] POST failed: ${e.message}")
+        return emptyList()
+    }
+    val arr = runCatching { JSONObject(text).optJSONArray("results") }.getOrNull()
+        ?: return emptyList()
+    val out = ArrayList<Candidate>()
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val title = o.optString("title").trim().takeIf { it.isNotEmpty() } ?: continue
+        val slug = o.optString("slug").trim().takeIf { it.isNotEmpty() } ?: continue
+        if (o.optInt("istv", -1) == 2) continue
+        val isMovie = o.optInt("istv", 0) == 0
+        val encoded = runCatching {
+            URLEncoder.encode(slug, "UTF-8").replace("+", "%20")
+        }.getOrDefault(slug)
+        val url = if (slug.startsWith("http")) slug
+        else "$base${if (isMovie) "/watch/" else "/series/"}$encoded"
+        val decoded = runCatching { URLDecoder.decode(slug, "UTF-8") }.getOrDefault(slug)
+        out.add(
+            Candidate(
+                url = url,
+                slug = decoded,
+                latinTitle = latinTitleFromSlug("$title $decoded"),
+                year = o.optString("year").toIntOrNull(),
+                isSeries = !isMovie,
+            )
+        )
+    }
+    return out
+}
+
+/** /watch/ page -> WatchServersList + download buttons -> EmbedRouter. */
+private suspend fun wecimaWatchServers(
+    pageUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    StreamlyCache.markEpisodeMatched("wecima")
+    val doc = try {
+        cfGetDoc(pageUrl, referer = pageUrl, timeout = 20000)
+    } catch (e: Exception) {
+        Log.e(WECIMA_TAG, "[watch  ] page failed: ${e.message}")
+        return false
+    }
+    val links = LinkedHashSet<String>()
+    doc.select("ul.WatchServersList li btn[data-url]").forEach { btn ->
+        wecimaDecodeUrl(btn.attr("data-url"))?.let { links.add(it) }
+    }
+    doc.select(".openLinkDown[data-href]").forEach { btn ->
+        wecimaDecodeUrl(btn.attr("data-href"))?.let { links.add(it) }
+    }
+    // Fallback: raw iframes / player anchors on the page.
+    if (links.isEmpty()) links.addAll(extractIframeSources(doc, pageUrl))
+    if (links.isEmpty()) {
+        Log.d(WECIMA_TAG, "[watch  ] no servers on $pageUrl")
+        return false
+    }
+    Log.d(WECIMA_TAG, "[watch  ] ${links.size} servers")
+    links.toList().amap { link ->
+        runCatching {
+            EmbedRouter.route(link, pageUrl, subtitleCallback, callback, "Wecima")
+        }
+    }
+    return true
+}
+
+private suspend fun wecimaResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = wecimaSearch(title).filter { it.isSeries != true }
+    Log.d(WECIMA_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+    val above = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_MOVIE }
+    if (above.isEmpty()) {
+        Log.d(WECIMA_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    val winners = above.sortedByDescending { it.second }.take(3).map { it.first }
+    var ok = false
+    winners.forEachIndexed { i, post ->
+        Log.d(WECIMA_TAG, "[match  ] WINNER ${i + 1}/${winners.size} ${post.url}")
+        ok = wecimaWatchServers(post.url, subtitleCallback, callback) || ok
+    }
+    return ok
+}
+
+private suspend fun wecimaResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = wecimaSearch(title).filter { it.isSeries != false }
+    Log.d(WECIMA_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(WECIMA_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(WECIMA_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("wecima")
+
+    // Direct episode /watch/ hit still wins when its numbers agree.
+    val anchorEp = egDeadNum(EGDEAD_EPISODE_REGEX, "${anchor.slug} $title")
+    if ("/series/" !in anchor.url && anchorEp == episode) {
+        return wecimaWatchServers(anchor.url, subtitleCallback, callback)
+    }
+    val base = wecimaBase()
+    val seriesDoc = try {
+        cfGetDoc(anchor.url, timeout = 20000)
+    } catch (e: Exception) {
+        Log.e(WECIMA_TAG, "[anchor ] failed: ${e.message}")
+        return false
+    }
+    var epUrl: String? = null
+    val seasonTabs = seriesDoc.select("div.List--Seasons--Episodes a.SeasonsEpisodes")
+    if (seasonTabs.isNotEmpty()) {
+        Log.d(WECIMA_TAG, "[season ] ${seasonTabs.size} season tabs")
+        val tab = seasonTabs.mapNotNull { el ->
+            val s = egDeadNum(SEASON_DIGIT_REGEX, el.text()) ?: 9999
+            Triple(el.attr("data-id"), el.attr("data-season"), s)
+        }.firstOrNull { it.third == season }
+        if (tab == null) {
+            Log.d(WECIMA_TAG, "[match  ] S$season not in season tabs")
+            return false
+        }
+        val seasonHtml = try {
+            cfPostText(
+                "$base/ajax/Episode",
+                data = mapOf("post_id" to tab.first, "season" to tab.second),
+                referer = anchor.url,
+                timeout = 20000,
+            )
+        } catch (e: Exception) {
+            Log.e(WECIMA_TAG, "[season ] ajax failed: ${e.message}")
+            return false
+        }
+        epUrl = Jsoup.parse(seasonHtml).select("a.hoverable.activable").mapNotNull { a ->
+            val href = fixUrl(a.attr("href"), anchor.url).takeIf { it.startsWith("http") }
+                ?: return@mapNotNull null
+            val name = a.selectFirst("episodetitle")?.text() ?: a.text()
+            href to (egDeadNum(EGDEAD_EPISODE_REGEX, name) ?: 9999)
+        }.firstOrNull { it.second == episode }?.first
+    } else {
+        // Single-season layout.
+        epUrl = seriesDoc.select(".EpisodesList.Full--Width a").mapNotNull { a ->
+            val href = fixUrl(a.attr("href"), anchor.url).takeIf { it.startsWith("http") }
+                ?: return@mapNotNull null
+            val name = a.selectFirst("episodetitle")?.text() ?: a.text()
+            href to (egDeadNum(EGDEAD_EPISODE_REGEX, name) ?: 9999)
+        }.firstOrNull { it.second == episode }?.first
+    }
+    if (epUrl == null) {
+        Log.d(WECIMA_TAG, "[match  ] E$episode not found")
+        return false
+    }
+    Log.d(WECIMA_TAG, "[match  ] E$episode -> $epUrl")
+    return wecimaWatchServers(epUrl, subtitleCallback, callback)
+}
+
+suspend fun invokeWecima(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(WECIMA_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "Wecima: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    return try {
+        val ok = if (res.isMovie) {
+            wecimaResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            wecimaResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(WECIMA_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "Wecima: ok" else "Wecima: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(WECIMA_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "Wecima: ${e.message}"
+        emitted > 0
+    }
+}
