@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -62,6 +63,7 @@ class StreamlyProvidersFragment(
 
     private val providerStatuses = mutableMapOf<String, ProviderStatus>()
     private val testScope: CoroutineScope = MainScope()
+    private val categoryHeaders = mutableMapOf<String, TextView>()
 
     /** Known-good titles used as test probes (movie + show, TMDB + IMDb keyed). */
     private val testCandidates = listOf(
@@ -234,6 +236,31 @@ class StreamlyProvidersFragment(
         val enabled = providers.count { !adapter.isDisabled(it.id) }
         val total = providers.size
         tvProviderCount.text = "$enabled / $total enabled"
+        // Per-category header counts (display-only, same disabled set).
+        ProvidersList.categoryOrder.forEach { category ->
+            val header = categoryHeaders[category] ?: return@forEach
+            val inCategory = providers.filter { it.category == category }
+            if (inCategory.isEmpty()) return@forEach
+            val enabledInCategory = inCategory.count { !adapter.isDisabled(it.id) }
+            header.text = "$category ($enabledInCategory/${inCategory.size})"
+        }
+    }
+
+    private fun addCategoryHeader(category: String) {
+        val density = container.context.resources.displayMetrics.density
+        val header = TextView(container.context).apply {
+            tag = "header_$category"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(
+                (16 * density).toInt(),
+                (12 * density).toInt(),
+                (16 * density).toInt(),
+                (4 * density).toInt(),
+            )
+        }
+        categoryHeaders[category] = header
+        container.addView(header)
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
@@ -251,7 +278,12 @@ class StreamlyProvidersFragment(
         btnDeselectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FFBB2D3B"))
         container = view.findView("list_container")
         container.makeTvCompatible()
-        providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
+        container.removeAllViews()
+        categoryHeaders.clear()
+        val order = ProvidersList.categoryOrder
+        providers = ProvidersList.providers.sortedWith(
+            compareBy({ order.indexOf(it.category).takeIf { idx -> idx >= 0 } ?: Int.MAX_VALUE }, { it.name.lowercase() })
+        )
         loadTestStatuses()
 
         val savedDisabled = sharedPref.getStringSet(PREFS_DISABLED, emptySet()) ?: emptySet()
@@ -267,7 +299,9 @@ class StreamlyProvidersFragment(
         val testId = res.getIdentifier("btn_test_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
 
         providers.forEach { provider ->
+            if (categoryHeaders[provider.category] == null) addCategoryHeader(provider.category)
             val item = getLayout("item_provider_checkbox", layoutInflater, container)
+            item.tag = provider.id
             val chk = item.findViewById<CheckBox>(chkId)
             item.makeTvCompatible()
             chk.makeTvCompatible()
@@ -304,14 +338,17 @@ class StreamlyProvidersFragment(
     private fun updateUI() {
         val chkId = res.getIdentifier("chk_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
         val statusId = res.getIdentifier("tv_provider_status", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
+        val byId = providers.associateBy { it.id }
         for (i in 0 until container.childCount) {
             val row = container.getChildAt(i)
+            // Section headers carry a "header_<category>" tag, provider rows the provider id.
+            val provider = byId[row.tag as? String] ?: continue
             row.findViewById<CheckBox>(chkId)?.let { chk ->
-                chk.isChecked = !adapter.isDisabled(providers[i].id)
+                chk.isChecked = !adapter.isDisabled(provider.id)
             }
             if (statusId != 0) {
                 row.findViewById<TextView>(statusId)?.let { tv ->
-                    setStatusView(tv, providerStatuses[providers[i].id] ?: ProviderStatus.UNTESTED)
+                    setStatusView(tv, providerStatuses[provider.id] ?: ProviderStatus.UNTESTED)
                 }
             }
         }
