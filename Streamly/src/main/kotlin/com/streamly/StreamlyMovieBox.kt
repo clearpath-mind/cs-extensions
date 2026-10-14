@@ -1,11 +1,9 @@
 package com.streamly
 
 import android.util.Base64
-import androidx.core.net.toUri
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -109,7 +107,7 @@ fun generateMovieBoxXTrSignature(
 ): String {
     val timestamp = hardcodedTimestamp ?: System.currentTimeMillis()
     val canonical = buildMovieBoxCanonicalString(method, accept, contentType, url, body, timestamp)
-    val secretBytes = movieBoxSecretKey(useAlt)
+    val secretBytes = movieBoxSecretKey(useAltKey)
     val mac = Mac.getInstance("HmacMD5").apply { init(SecretKeySpec(secretBytes, "HmacMD5")) }
     val rawSignature = mac.doFinal(canonical.toByteArray(Charsets.UTF_8))
     val signatureBase64 = Base64.encodeToString(rawSignature, Base64.NO_WRAP)
@@ -124,13 +122,15 @@ private fun buildMovieBoxCanonicalString(
     body: String?,
     timestamp: Long,
 ): String {
-    val parsed = url.toUri()
-    val path = parsed.path ?: ""
-    val query = if (parsed.queryParameterNames.isNotEmpty()) {
-        parsed.queryParameterNames.sorted().joinToString("&") { key ->
-            parsed.getQueryParameters(key).joinToString("&") { value -> "$key=$value" }
-        }
-    } else ""
+    val uri = runCatching { java.net.URI(url) }.getOrNull()
+    val path = uri?.path.orEmpty()
+    val params = uri?.query?.split("&").orEmpty().mapNotNull { part ->
+        val idx = part.indexOf("=")
+        if (idx <= 0) null else part.substring(0, idx) to part.substring(idx + 1)
+    }.groupBy({ it.first }, { it.second })
+    val query = params.keys.sorted().joinToString("&") { key ->
+        params.getValue(key).joinToString("&") { value -> "$key=$value" }
+    }
     val canonicalUrl = if (query.isNotEmpty()) "$path?$query" else path
     val bodyBytes = body?.toByteArray(Charsets.UTF_8)
     val bodyHash = if (bodyBytes != null) {
@@ -205,7 +205,7 @@ suspend fun invokeMovieBox(
         }
         if (matchingIds.isEmpty()) return false
 
-        matchingIds.amap { id ->
+        for (id in matchingIds) {
             try {
                 val subjectUrl = "$MOVIEBOX_HOST/wefeed-mobile-bff/subject-api/get?subjectId=$id"
                 val subjectXToken = generateMovieBoxXClientToken()
@@ -225,7 +225,7 @@ suspend fun invokeMovieBox(
                         movieBoxBearerToken = newToken
                     }
                 }
-                if (subjectRes.code != 200) return@amap
+                if (subjectRes.code != 200) continue
 
                 val subjectJson = movieBoxMapper.readTree(subjectRes.text)
                 val subjectData = subjectJson["data"]

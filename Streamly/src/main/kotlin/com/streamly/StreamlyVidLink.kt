@@ -1,8 +1,5 @@
 package com.streamly
 
-import com.fasterxml.jackson.annotation.SerializedName
-import com.google.gson.Gson
-import com.google.gson.JsonObject
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -12,15 +9,6 @@ import java.net.URLDecoder
 
 private const val VIDLINK_TAG = "VidLink"
 private const val VIDLINK_API = "https://vidlink.pro"
-
-// Vidlink
-data class VidlinkResponse(
-    @SerializedName("stream") val stream: VidlinkStream,
-)
-
-data class VidlinkStream(
-    @SerializedName("playlist") val playlist: String,
-)
 
 /** VidLink provider ported from StreamPlay (v689). Uses an external enc-dec
  *  service to mint the encrypted id, then serves an m3u8 playlist. */
@@ -35,7 +23,7 @@ suspend fun invokeVidlink(
 
     return try {
         val encUrl = "https://enc-dec.app/api/enc-vidlink?text=$tmdbId"
-        val encResponse = app.get(encUrl).text
+        val encResponse = app.get(encUrl, timeout = 15000).text
         val encData = runCatching {
             org.json.JSONObject(encResponse).optString("result")
         }.getOrNull().takeIf { !it.isNullOrEmpty() } ?: return false
@@ -56,11 +44,10 @@ suspend fun invokeVidlink(
             "$base/api/b/tv/$encData/$season/$episode"
         }
 
-        val epResponse = app.get(apiUrl, headers = headers).text
-        val data = runCatching { Gson().fromJson(epResponse, VidlinkResponse::class.java) }.getOrNull()
-            ?: return false
-        val stream = data.stream
-        val m3u8 = stream.playlist
+        val epResponse = app.get(apiUrl, headers = headers, timeout = 15000).text
+        val m3u8 = runCatching {
+            org.json.JSONObject(epResponse).getJSONObject("stream").getString("playlist")
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: return false
 
         var referer = "$base/"
         var origin = base
@@ -69,9 +56,9 @@ suspend fun invokeVidlink(
             ?.let { URLDecoder.decode(it, "UTF-8") }
         if (!headersJson.isNullOrBlank()) {
             runCatching {
-                val obj = Gson().fromJson(headersJson, JsonObject::class.java)
-                obj["referer"]?.asString?.let { referer = it }
-                obj["origin"]?.asString?.let { origin = it }
+                val obj = org.json.JSONObject(headersJson)
+                obj.optString("referer").takeIf { it.isNotBlank() }?.let { referer = it }
+                obj.optString("origin").takeIf { it.isNotBlank() }?.let { origin = it }
             }
         }
         val m3u8url = m3u8.substringBefore("?")
@@ -81,8 +68,8 @@ suspend fun invokeVidlink(
             referer = referer,
             headers = mapOf(
                 "Origin" to origin,
-                "Referer" to referer,
-            ),
+                "Referer" to referer
+            )
         ).forEach(counting)
 
         Log.d(VIDLINK_TAG, "emitted=$emitted")
