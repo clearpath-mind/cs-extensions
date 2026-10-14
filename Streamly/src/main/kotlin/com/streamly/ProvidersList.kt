@@ -36,6 +36,14 @@ object ProvidersList {
             Provider("2embed", "2Embed") { res, sub, cb ->
                 invoke2Embed(res, sub, cb)
             },
+            // VidLink: encrypted m3u8 player (port from StreamPlay).
+            Provider("vidlink", "VidLink") { res, sub, cb ->
+                invokeVidlink(res, sub, cb)
+            },
+            // MovieBox: multi-quality source with captions (port from StreamPlay).
+            Provider("moviebox", "MovieBox") { res, sub, cb ->
+                invokeMovieBox(res, sub, cb)
+            },
             // Subtitle-only sources (StreamPlay pattern): Wyzie needs a user
             // key, SubtitleAPI is keyless. Both key off the IMDb id.
             Provider("wyziesubs", "WyzieSubs") { res, sub, _ ->
