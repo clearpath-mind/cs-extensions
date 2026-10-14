@@ -15,7 +15,7 @@ data class Provider(
 )
 
 object ProvidersList {
-    const val CATEGORY_VIDEO = "Video"
+    const val CATEGORY_VIDEO = "Sources"
     const val CATEGORY_SUBTITLES = "Subtitles"
     val categoryOrder = listOf(CATEGORY_VIDEO, CATEGORY_SUBTITLES)
 
