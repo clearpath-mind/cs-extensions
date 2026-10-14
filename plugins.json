@@ -21,13 +21,13 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
         "status": 1,
-        "version": 136,
+        "version": 137,
         "name": "Streamly",
         "internalName": "Streamly",
         "authors": [
             "clearpath-mind"
         ],
-        "fileSize": 273635,
+        "fileSize": 275634,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -36,7 +36,7 @@
         ],
         "iconUrl": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/Streamly/icon.png",
         "apiVersion": 1,
-        "fileHash": "sha256-14bb5dc86b01548241fcfcc6ce14c6a44ef7b64dbad4dc452eaa3292921aeb6f"
+        "fileHash": "sha256-2995c81a687a52c883d898c7eb8d8af1c90b1350370fc073304d442f49bded88"
     },
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
