@@ -596,7 +596,7 @@ open class Streamly : MainAPI() {
         }
 
         // Global dedup across all providers: same URL from
-        // multiple sites (e.g. vidtube on TopCinema + FaselHD) must not duplicate.
+        // multiple sites (e.g. shared vidtube mirrors) must not duplicate.
         val seenLinks = ConcurrentHashMap.newKeySet<String>()
         val seenSubs = ConcurrentHashMap.newKeySet<String>()
         // Dedup by normalized final URL only (allSeenLinks style).
@@ -623,8 +623,7 @@ open class Streamly : MainAPI() {
                 StreamlyCache.clearRunState(provider.id)
                 var success = false
                 // Emissions are side effects that survive cancellation: a
-                // provider killed mid-tail still contributed rows (FaselHD
-                // Server 2 out at ~47s, deferred cancelled at 75s). Count
+                // provider killed mid-tail still contributed rows. Count
                 // them so the breaker learns from rows, not just returns.
                 val emitted = java.util.concurrent.atomic.AtomicInteger(0)
                 val countingCallback: (ExtractorLink) -> Unit = {

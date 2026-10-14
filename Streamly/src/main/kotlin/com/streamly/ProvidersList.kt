@@ -19,9 +19,6 @@ object ProvidersList {
             Provider("topcinema", "TopCinema") { res, sub, cb ->
                 invokeTopCinema(res, sub, cb)
             },
-            Provider("faselhd", "FaselHD") { res, sub, cb ->
-                invokeFaselHd(res, sub, cb)
-            },
             Provider("egydead", "EgyDead") { res, sub, cb ->
                 invokeEgyDead(res, sub, cb)
             },

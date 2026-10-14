@@ -92,7 +92,6 @@ object StreamlyCache {
     /** Sensible cold-start order before any stats exist. */
     private val BASE_PRIORITY = mapOf(
         "topcinema" to 3f,
-        "faselhd" to 1f,
         "egydead" to 1f,
         "akwam" to 1f,
         "egywatch" to 1f,
@@ -129,12 +128,12 @@ object StreamlyCache {
         if (stats.successCount == 0) {
             // Broken without history gets 30s, not 20s: dead ends return in
             // seconds anyway (dead ends fail at ~5s), while a walled
-            // search needs ~25s just to anchor (FaselHD ?s= 24s on S1E13).
+            // search needs ~25s just to anchor.
             return if (stats.isCircuitBroken) 30000L else baseTimeoutMs
         }
         // Broken but previously successful: probe with room to repeat the
-        // slowest success (capped) — a flat 20s kills FaselHD mid-resolve
-        // when walled, locking it broken forever. Floor 45s: a walled
+        // slowest success (capped) — a flat 20s kills a walled provider
+        // mid-resolve, locking it broken forever. Floor 45s: a walled
         // search (~18s) plus episode extraction (~25s) must fit.
         if (stats.isCircuitBroken) {
             if (stats.maxTimeMs > 0) return minOf(maxOf(45000L, stats.maxTimeMs), 120000L)
