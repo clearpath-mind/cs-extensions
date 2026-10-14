@@ -357,6 +357,7 @@ suspend fun invokeMovieBox(
                             }
                         }
                     }
+                }
                 } catch (_: Exception) {
                     // ignore per-item failures
                 }
