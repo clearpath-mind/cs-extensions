@@ -3,9 +3,9 @@ package com.streamly.settings
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
-import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -17,10 +17,34 @@ import android.widget.TextView
 import androidx.annotation.RequiresApi
 import androidx.core.content.edit
 import androidx.fragment.app.DialogFragment
+import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.CommonActivity.showToast
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.streamly.BuildConfig
+import com.streamly.LinkData
 import com.streamly.Provider
 import com.streamly.ProvidersList
 import com.streamly.StreamlyPlugin
+import com.streamly.StreamlyRuntime
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+/** Source test states, ported from StreamPlay's providers settings. */
+enum class ProviderStatus {
+    UNTESTED,
+    TESTING,
+    ONLINE,
+    OFFLINE,
+}
 
 class StreamlyProvidersFragment(
     private val plugin: StreamlyPlugin,
@@ -32,11 +56,25 @@ class StreamlyProvidersFragment(
     private lateinit var btnSave: ImageButton
     private lateinit var btnSelectAll: Button
     private lateinit var btnDeselectAll: Button
+    private lateinit var btnTestAll: Button
+    private lateinit var btnDisableOffline: Button
     private lateinit var adapter: ProviderAdapter
     private lateinit var container: LinearLayout
     private var providers: List<Provider> = emptyList()
+    private val rowViews = mutableListOf<View>()
     private val PREFS_DISABLED = "disabled_providers"
+    private val PREFS_TEST_STATUS = "provider_test_status"
     private lateinit var tvProviderCount: TextView
+
+    private val providerStatuses = mutableMapOf<String, ProviderStatus>()
+    private val testScope: CoroutineScope = MainScope()
+
+    /** Known-good titles used as test probes (movie + show, TMDB + IMDb keyed). */
+    private val testCandidates = listOf(
+        LinkData(id = 550, type = "movie", title = "Fight Club", year = 1999, imdbId = "tt0137523"),
+        LinkData(id = 27205, type = "movie", title = "Inception", year = 2010, imdbId = "tt1375666"),
+        LinkData(id = 1396, type = "tv", title = "Breaking Bad", year = 2008, season = 1, episode = 1, imdbId = "tt0903747"),
+    )
 
     private fun <T : View> View.findView(name: String): T {
         val id = res.getIdentifier(name, "id", BuildConfig.LIBRARY_PACKAGE_NAME)
@@ -60,6 +98,137 @@ class StreamlyProvidersFragment(
         val id = res.getIdentifier(name, "layout", BuildConfig.LIBRARY_PACKAGE_NAME)
         val layout = res.getLayout(id)
         return inflater.inflate(layout, container, false)
+    }
+
+    private fun createStatusBadge(color: Int): Drawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 12f
+            setColor(color)
+        }
+    }
+
+    private fun setStatusView(tv: TextView, status: ProviderStatus) {
+        when (status) {
+            ProviderStatus.ONLINE -> {
+                tv.text = "● ONLINE"
+                tv.background = createStatusBadge(android.graphics.Color.parseColor("#2E7D32"))
+                tv.visibility = View.VISIBLE
+            }
+            ProviderStatus.OFFLINE -> {
+                tv.text = "● OFFLINE"
+                tv.background = createStatusBadge(android.graphics.Color.parseColor("#C62828"))
+                tv.visibility = View.VISIBLE
+            }
+            ProviderStatus.TESTING -> {
+                tv.text = "TESTING..."
+                tv.background = createStatusBadge(android.graphics.Color.parseColor("#EF6C00"))
+                tv.visibility = View.VISIBLE
+            }
+            ProviderStatus.UNTESTED -> {
+                tv.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun saveTestStatuses() {
+        val encoded = providerStatuses.entries.joinToString("|") { "${it.key}:${it.value.name}" }
+        sharedPref.edit { putString(PREFS_TEST_STATUS, encoded) }
+    }
+
+    private fun loadTestStatuses() {
+        val raw = sharedPref.getString(PREFS_TEST_STATUS, null) ?: return
+        raw.split("|").forEach { entry ->
+            val parts = entry.split(":")
+            if (parts.size == 2) {
+                runCatching { ProviderStatus.valueOf(parts[1]) }.getOrNull()
+                    ?.takeIf { it != ProviderStatus.TESTING }
+                    ?.let { providerStatuses[parts[0]] = it }
+            }
+        }
+    }
+
+    /**
+     * Probe a provider against the known-good candidates. Returns true on the
+     * first candidate that yields any video link or subtitle URL (25s budget
+     * each, StreamPlay testProvider pattern adapted to the 3-arg invoke).
+     */
+    private suspend fun testProvider(provider: Provider): Boolean = withContext(Dispatchers.IO) {
+        StreamlyRuntime.context = CommonActivity.activity
+        for (candidate in testCandidates) {
+            var found = false
+            val subCb: (SubtitleFile) -> Unit = { sub ->
+                if (!sub.url.isNullOrBlank()) found = true
+            }
+            val cb: (ExtractorLink) -> Unit = { link ->
+                if (link.url.isNotBlank()) found = true
+            }
+            runCatching {
+                withTimeoutOrNull(25000L) {
+                    provider.invoke(candidate, subCb, cb)
+                }
+            }
+            if (found) return@withContext true
+        }
+        false
+    }
+
+    private fun testSingleProvider(provider: Provider, statusView: TextView, testBtn: Button) {
+        testScope.launch {
+            testBtn.isEnabled = false
+            providerStatuses[provider.id] = ProviderStatus.TESTING
+            setStatusView(statusView, ProviderStatus.TESTING)
+            val ok = testProvider(provider)
+            val status = if (ok) ProviderStatus.ONLINE else ProviderStatus.OFFLINE
+            providerStatuses[provider.id] = status
+            setStatusView(statusView, status)
+            saveTestStatuses()
+            testBtn.isEnabled = true
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun testAllProviders() {
+        testScope.launch {
+            btnTestAll.isEnabled = false
+            btnTestAll.text = "TESTING..."
+            val semaphore = Semaphore(3)
+            val jobs = providers.map { provider ->
+                async {
+                    semaphore.withPermit { testProvider(provider) }
+                }
+            }
+            var online = 0
+            providers.forEachIndexed { index, provider ->
+                val ok = runCatching { jobs[index].await() }.getOrDefault(false)
+                val status = if (ok) ProviderStatus.ONLINE else ProviderStatus.OFFLINE
+                if (ok) online++
+                providerStatuses[provider.id] = status
+                rowStatusView(index)?.let { setStatusView(it, status) }
+            }
+            saveTestStatuses()
+            btnTestAll.isEnabled = true
+            btnTestAll.text = "TEST ALL SOURCES"
+            showToast("$online / ${providers.size} sources online")
+        }
+    }
+
+    private fun disableOfflineProviders() {
+        val offlineIds = providerStatuses.filterValues { it == ProviderStatus.OFFLINE }.keys
+        if (offlineIds.isEmpty()) {
+            showToast("No offline providers found to disable")
+            return
+        }
+        offlineIds.forEach { adapter.setDisabled(it, true) }
+        updateUI()
+        showToast("Disabled ${offlineIds.size} offline sources")
+    }
+
+    private fun rowStatusView(index: Int): TextView? {
+        if (index !in rowViews.indices) return null
+        val id = res.getIdentifier("tv_provider_status", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
+        if (id == 0) return null
+        return rowViews[index].findViewById(id)
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
@@ -106,9 +275,12 @@ class StreamlyProvidersFragment(
         btnDeselectAll = view.findView("btn_deselect_all")
         btnSelectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF2E7D32"))
         btnDeselectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FFBB2D3B"))
+        btnTestAll = view.findView("btn_test_all")
+        btnDisableOffline = view.findView("btn_disable_offline")
         container = view.findView("list_container")
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
+        loadTestStatuses()
 
         val savedDisabled = sharedPref.getStringSet(PREFS_DISABLED, emptySet()) ?: emptySet()
 
@@ -119,7 +291,10 @@ class StreamlyProvidersFragment(
         }
 
         val chkId = res.getIdentifier("chk_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
+        val statusId = res.getIdentifier("tv_provider_status", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
+        val testId = res.getIdentifier("btn_test_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
 
+        rowViews.clear()
         providers.forEach { provider ->
             val item = getLayout("item_provider_checkbox", layoutInflater, container)
             val chk = item.findViewById<CheckBox>(chkId)
@@ -132,20 +307,45 @@ class StreamlyProvidersFragment(
                 adapter.setDisabled(provider.id, !isChecked)
             }
 
+            if (statusId != 0) {
+                val statusView = item.findViewById<TextView>(statusId)
+                if (statusView != null) {
+                    setStatusView(statusView, providerStatuses[provider.id] ?: ProviderStatus.UNTESTED)
+                }
+            }
+            if (testId != 0) {
+                val testBtn = item.findViewById<Button>(testId)
+                val statusView = if (statusId != 0) item.findViewById<TextView>(statusId) else null
+                testBtn?.setOnClickListener {
+                    if (statusView != null) testSingleProvider(provider, statusView, testBtn)
+                }
+            }
+
             container.addView(item)
+            rowViews.add(item)
             updateProviderCount()
         }
 
         btnSelectAll.setOnClickListener { adapter.setAll(true) }
         btnDeselectAll.setOnClickListener { adapter.setAll(false) }
+        btnTestAll.setOnClickListener { testAllProviders() }
+        btnDisableOffline.setOnClickListener { disableOfflineProviders() }
         btnSave.setOnClickListener { dismissFragment() }
     }
 
     private fun updateUI() {
         val chkId = res.getIdentifier("chk_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
+        val statusId = res.getIdentifier("tv_provider_status", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
         for (i in 0 until container.childCount) {
-            val chk = container.getChildAt(i).findViewById<CheckBox>(chkId)
-            chk.isChecked = !adapter.isDisabled(providers[i].id)
+            val row = container.getChildAt(i)
+            row.findViewById<CheckBox>(chkId)?.let { chk ->
+                chk.isChecked = !adapter.isDisabled(providers[i].id)
+            }
+            if (statusId != 0) {
+                row.findViewById<TextView>(statusId)?.let { tv ->
+                    setStatusView(tv, providerStatuses[providers[i].id] ?: ProviderStatus.UNTESTED)
+                }
+            }
         }
         updateProviderCount()
     }
@@ -174,6 +374,11 @@ class StreamlyProvidersFragment(
             if (!value) disabled.addAll(items.map { it.id })
             onChange(disabled)
         }
+    }
+
+    override fun onDestroyView() {
+        testScope.cancel()
+        super.onDestroyView()
     }
 
     override fun onDismiss(dialog: android.content.DialogInterface) {
