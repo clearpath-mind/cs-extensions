@@ -2309,8 +2309,10 @@ suspend fun invoke2Embed(
         val srcAttr = doc.selectFirst("iframe#iframesrc")?.attr("src").orEmpty().trim()
         if (dataSrc.isNotBlank() && dataSrc != "about:blank") servers.add(dataSrc)
         if (srcAttr.isNotBlank() && srcAttr != "about:blank") servers.add(srcAttr)
-        doc.select("a[onclick*=go(").forEach { a ->
-            Regex("""go\(['"](https?://[^'"]+)['"]\)""").find(a.attr("onclick"))
+        doc.select("a[onclick]").forEach { a ->
+            val onclick = a.attr("onclick")
+            if ("go(" !in onclick) return@forEach
+            Regex("""go\s*\(\s*['"](https?://[^'"]+)['"]\s*\)""").find(onclick)
                 ?.groupValues?.get(1)?.trim()
                 ?.takeIf { it.isNotBlank() }?.let { servers.add(it) }
         }
