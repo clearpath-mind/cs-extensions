@@ -18,7 +18,6 @@ import androidx.annotation.RequiresApi
 import androidx.core.content.edit
 import androidx.fragment.app.DialogFragment
 import com.lagradost.cloudstream3.CommonActivity
-import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.streamly.BuildConfig
@@ -30,11 +29,8 @@ import com.streamly.StreamlyRuntime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -56,12 +52,9 @@ class StreamlyProvidersFragment(
     private lateinit var btnSave: ImageButton
     private lateinit var btnSelectAll: Button
     private lateinit var btnDeselectAll: Button
-    private lateinit var btnTestAll: Button
-    private lateinit var btnDisableOffline: Button
     private lateinit var adapter: ProviderAdapter
     private lateinit var container: LinearLayout
     private var providers: List<Provider> = emptyList()
-    private val rowViews = mutableListOf<View>()
     private val PREFS_DISABLED = "disabled_providers"
     private val PREFS_TEST_STATUS = "provider_test_status"
     private lateinit var tvProviderCount: TextView
@@ -187,50 +180,6 @@ class StreamlyProvidersFragment(
         }
     }
 
-    @SuppressLint("SetTextI18n")
-    private fun testAllProviders() {
-        testScope.launch {
-            btnTestAll.isEnabled = false
-            btnTestAll.text = "TESTING..."
-            val semaphore = Semaphore(3)
-            val jobs = providers.map { provider ->
-                async {
-                    semaphore.withPermit { testProvider(provider) }
-                }
-            }
-            var online = 0
-            providers.forEachIndexed { index, provider ->
-                val ok = runCatching { jobs[index].await() }.getOrDefault(false)
-                val status = if (ok) ProviderStatus.ONLINE else ProviderStatus.OFFLINE
-                if (ok) online++
-                providerStatuses[provider.id] = status
-                rowStatusView(index)?.let { setStatusView(it, status) }
-            }
-            saveTestStatuses()
-            btnTestAll.isEnabled = true
-            btnTestAll.text = "TEST ALL SOURCES"
-            showToast("$online / ${providers.size} sources online")
-        }
-    }
-
-    private fun disableOfflineProviders() {
-        val offlineIds = providerStatuses.filterValues { it == ProviderStatus.OFFLINE }.keys
-        if (offlineIds.isEmpty()) {
-            showToast("No offline providers found to disable")
-            return
-        }
-        offlineIds.forEach { adapter.setDisabled(it, true) }
-        updateUI()
-        showToast("Disabled ${offlineIds.size} offline sources")
-    }
-
-    private fun rowStatusView(index: Int): TextView? {
-        if (index !in rowViews.indices) return null
-        val id = res.getIdentifier("tv_provider_status", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
-        if (id == 0) return null
-        return rowViews[index].findViewById(id)
-    }
-
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         val view = getLayout("fragment_providers", inflater, container)
         val drawableId = res.getIdentifier("dialog_background", "drawable", BuildConfig.LIBRARY_PACKAGE_NAME)
@@ -275,8 +224,6 @@ class StreamlyProvidersFragment(
         btnDeselectAll = view.findView("btn_deselect_all")
         btnSelectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FF2E7D32"))
         btnDeselectAll.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.parseColor("#FFBB2D3B"))
-        btnTestAll = view.findView("btn_test_all")
-        btnDisableOffline = view.findView("btn_disable_offline")
         container = view.findView("list_container")
         container.makeTvCompatible()
         providers = ProvidersList.providers.sortedBy { it.name.lowercase() }
@@ -294,7 +241,6 @@ class StreamlyProvidersFragment(
         val statusId = res.getIdentifier("tv_provider_status", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
         val testId = res.getIdentifier("btn_test_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
 
-        rowViews.clear()
         providers.forEach { provider ->
             val item = getLayout("item_provider_checkbox", layoutInflater, container)
             val chk = item.findViewById<CheckBox>(chkId)
@@ -322,14 +268,11 @@ class StreamlyProvidersFragment(
             }
 
             container.addView(item)
-            rowViews.add(item)
             updateProviderCount()
         }
 
         btnSelectAll.setOnClickListener { adapter.setAll(true) }
         btnDeselectAll.setOnClickListener { adapter.setAll(false) }
-        btnTestAll.setOnClickListener { testAllProviders() }
-        btnDisableOffline.setOnClickListener { disableOfflineProviders() }
         btnSave.setOnClickListener { dismissFragment() }
     }
 

@@ -72,12 +72,12 @@ import kotlin.coroutines.resume
 // is expanded into per-quality variants so slow networks can pick manually.
 /// ---------------------------------------------------------------------------
 
-private const val FASELHD_RES_UA =
+private const val RESOLVER_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-// Default header origin for the shared WebView resolver below (kept after
-// FaselHD removal: EgyDead still routes through faselHdResolveWebView).
-internal const val FASELHD_MAIN_URL = "https://www.fasel-hd.co"
+// Default header origin for the shared WebView resolver below (used by
+// the remaining WebView-routed sources, e.g. EgyDead).
+internal const val RESOLVER_DEFAULT_ORIGIN = "https://www.fasel-hd.co"
 
 fun extractIframeSources(doc: Document, base: String): List<String> {
     val results = LinkedHashSet<String>()
@@ -118,7 +118,7 @@ fun extractIframeSources(doc: Document, base: String): List<String> {
 }
 
 @SuppressLint("SetJavaScriptEnabled")
-suspend fun faselHdResolveWebView(
+suspend fun sharedWebViewResolve(
     iframeUrl: String,
     referer: String,
     sniffMp4: Boolean = false,
@@ -170,7 +170,7 @@ suspend fun faselHdResolveWebView(
                 .followSslRedirects(true)
                 .cookieJar(okhttp3.CookieJar.NO_COOKIES)
                 .build()
-            val mainUrlForHeader = FASELHD_MAIN_URL
+            val mainUrlForHeader = RESOLVER_DEFAULT_ORIGIN
             val foundM3u8 = LinkedHashSet<String>()
             val foundMp4 = LinkedHashSet<String>()
             var finished = false
@@ -306,7 +306,7 @@ suspend fun faselHdResolveWebView(
                     if (sniffMp4 && method.equals("GET", ignoreCase = true) && lower.substringBefore("?").endsWith(".mp4")) {
                         handleFoundLink(url)
                     }
-                    if (method.equals("GET", ignoreCase = true) && (lower.contains("fasel") || lower.contains("jwplayer") || lower.contains("config") || lower.contains("player"))) {
+                    if (method.equals("GET", ignoreCase = true) && (lower.contains("jwplayer") || lower.contains("config") || lower.contains("player"))) {
                         try {
                             val reqBuilder = OkRequest.Builder().url(url)
                                 .header("User-Agent", effectiveUa())
@@ -694,8 +694,8 @@ private fun cfHeaders(
     putIfAbsent("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
     putIfAbsent("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
     putIfAbsent("Upgrade-Insecure-Requests", "1")
-    // Client-hint + fetch-metadata headers (re-3arabi Faselhd
-    // getModernHeaders): CF bot score weighs their presence heavily.
+    // Client-hint + fetch-metadata headers (ported from re-3arabi):
+    // CF bot score weighs their presence heavily.
     // Values mirror a modern Android Chrome.
     putIfAbsent("sec-ch-ua", "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")
     putIfAbsent("sec-ch-ua-mobile", "?1")
@@ -712,7 +712,7 @@ private fun cfHeaders(
 }
 
 /** Post-solve retry bound: with fresh clearance a healthy origin answers
- *  HTML in seconds — a longer hang is a rate-limit tarpit (fasel-hd.co held
+ *  HTML in seconds — a longer hang is a rate-limit tarpit (a walled host held
  *  the retry the full 30s on Blacklist S1E13, then threw), not worth waiting
  *  out when a bounded refetch can try again instead. */
 private fun cfRetryTimeout(timeout: Long): Long = maxOf(timeout, 12000)
@@ -1429,8 +1429,8 @@ private fun unwrapPlayUrl(url: String): String {
 
 
 // ---------------------------------------------------------------------------
-// Shared resolve helpers (kept after FaselHD removal: EgyDead still uses
-// cleanServerName/hostOfUrl/emitResolvedVariants).
+// Shared resolve helpers used by the remaining WebView-routed sources
+// (cleanServerName/hostOfUrl/emitResolvedVariants).
 // ---------------------------------------------------------------------------
 
 private const val RESOLVE_TAG = "StreamlyResolve"
@@ -1924,7 +1924,7 @@ private suspend fun egDeadWatchServers(
                         return@async
                     }
                     var playerUrl = link
-                    val hit = faselHdResolveWebView(link, watchUrl, sniffMp4 = true) {
+                    val hit = sharedWebViewResolve(link, watchUrl, sniffMp4 = true) {
                         playerUrl = it
                     }
                     if (!hit.isNullOrBlank()) {

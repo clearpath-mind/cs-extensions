@@ -114,41 +114,6 @@
                 android:nextFocusLeft="@id/btn_select_all"/>
         </LinearLayout>
 
-        <!-- TEST ALL / DISABLE OFFLINE -->
-        <LinearLayout
-            android:id="@+id/test_buttons_row"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginBottom="14dp">
-
-            <Button
-                android:id="@+id/btn_test_all"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="TEST ALL SOURCES"
-                android:textAllCaps="true"
-                android:textColor="#FFFFFF"
-                android:backgroundTint="#00897B"
-                android:focusable="true"/>
-
-            <Space
-                android:layout_width="8dp"
-                android:layout_height="wrap_content"/>
-
-            <Button
-                android:id="@+id/btn_disable_offline"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="DISABLE OFFLINE"
-                android:textAllCaps="true"
-                android:textColor="#FFFFFF"
-                android:backgroundTint="#8E24AA"
-                android:focusable="true"/>
-        </LinearLayout>
-
         <!-- DIVIDER -->
         <View
             android:layout_width="match_parent"
