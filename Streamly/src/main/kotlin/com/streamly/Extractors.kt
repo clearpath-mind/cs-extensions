@@ -377,17 +377,24 @@ class Uqload : ExtractorApi() {    override val name = "Uqload"
         } ?: return
 
         val regex = Regex("""hls2":"(?<hls2>[^"]+)"|hls4":"(?<hls4>[^"]+)"""")
+        // 2Embed serves uqloads.xyz while mainUrl is pinned to uqload.is:
+        // prefix relative hls4 paths (and the playback Referer) with the
+        // host that actually served the page, not the hardcoded mainUrl.
+        val origin = runCatching {
+            val u = java.net.URI(response.url)
+            "${u.scheme}://${u.host}"
+        }.getOrDefault(mainUrl)
         regex.findAll(script).mapNotNull { matchResult ->
             when {
                 matchResult.groups["hls2"] != null -> matchResult.groups["hls2"]!!.value
-                matchResult.groups["hls4"] != null -> "$mainUrl${matchResult.groups["hls4"]!!.value}"
+                matchResult.groups["hls4"] != null -> "$origin${matchResult.groups["hls4"]!!.value}"
                 else -> null
             }
         }.toList().forEach { m3u8 ->
             // Expand each playlist into per-quality variants.
             emitM3u8Variants(
-                name, m3u8, mainUrl,
-                mapOf("Referer" to mainUrl),
+                name, m3u8, origin,
+                mapOf("Referer" to origin),
                 callback,
             )
         }

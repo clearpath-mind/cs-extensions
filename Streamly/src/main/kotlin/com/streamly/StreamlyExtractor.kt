@@ -2260,10 +2260,15 @@ suspend fun invokeAkwam(
 
 // ---------------------------------------------------------------------------
 // 2Embed (English fallback, fast on new releases). IMDb-keyed embed
-// aggregator ported from StreamPlay: POST -> player iframe -> uqloads link,
-// routed through EmbedRouter so Streamly's own Uqload extractor handles it
-// (2Embed yields uqloads.xyz while Uqload is pinned to uqload.is, so a
-// direct loadExtractor call would miss).
+// aggregator ported from StreamPlay: POST -> player iframe -> server link,
+// routed through EmbedRouter so the right extractor handles it.
+//
+// Oct 2026: 2embed.cc rotated its default player from uqloads (?id=...) to
+// vidsrc-family servers (vidsrc.buzz / videm.xyz / streamsrcs.2embed.cc,
+// chosen via go('...') entries). Only the legacy uqloads player carries an
+// id= param, so anything without one is handed to the router untouched —
+// mangling it into https://uqloads.xyz/e/<whole-url> yields a bogus link
+// and a false "no links" (which the settings Test badge showed as OFFLINE).
 // ---------------------------------------------------------------------------
 
 private const val TWOEMBED_API = "https://www.2embed.cc"
@@ -2286,7 +2291,7 @@ suspend fun invoke2Embed(
         } else {
             "$TWOEMBED_API/embedtv/$imdbId&s=${res.season ?: 1}&e=${res.episode ?: 1}"
         }
-        val framesrc = app.post(
+        val doc = app.post(
             url,
             data = mapOf("pls" to "pls"),
             headers = mapOf(
@@ -2294,20 +2299,48 @@ suspend fun invoke2Embed(
                 "Referer" to url,
             ),
             timeout = 15000,
-        ).document.selectFirst("iframe#iframesrc")?.attr("data-src").orEmpty()
-        if (framesrc.isBlank()) {
+        ).document
+        // Default player first, then every go('...') server entry
+        // (Vsrc/Videm/Vcr). Cap at 3 so a long server list can't stall us.
+        val servers = linkedSetOf<String>()
+        doc.selectFirst("iframe#iframesrc")?.let {
+            val dataSrc = it.attr("data-src").trim()
+            val src = it.attr("src").trim()
+            if (dataSrc.isNotBlank() && dataSrc != "about:blank") servers.add(dataSrc)
+            if (src.isNotBlank() && src != "about:blank") servers.add(src)
+        }
+        doc.select("a[onclick*=go(").forEach { a ->
+            Regex("""go\(['"](https?://[^'"]+)['"]\)""").find(a.attr("onclick"))
+                ?.groupValues?.get(1)?.trim()
+                ?.takeIf { it.isNotBlank() }?.let { servers.add(it) }
+        }
+        if (servers.isEmpty()) {
             Log.d(TWOEMBED_TAG, "[invoke] no player iframe for $imdbId")
             StreamlyDiag.lastStage = "2Embed: no iframe"
             return false
         }
-        val ref = getBaseUrl(framesrc)
-        val id = framesrc.substringAfter("id=").substringBefore("&").takeIf { it.isNotBlank() }
-        if (id == null) {
-            Log.d(TWOEMBED_TAG, "[invoke] no stream id in $framesrc")
-            StreamlyDiag.lastStage = "2Embed: no id"
-            return false
+        for (framesrc in servers.take(3)) {
+            val ref = getBaseUrl(framesrc)
+            if ("id=" in framesrc) {
+                // Legacy uqloads player (?id=...): keep the fast path. The
+                // delimiter is checked first: substringAfter without a
+                // default returns the whole URL when id= is absent, which
+                // previously built a bogus uqloads link.
+                val id = framesrc.substringAfter("id=").substringBefore("&").trim()
+                if (id.isBlank() || id.startsWith("http")) {
+                    Log.d(TWOEMBED_TAG, "[invoke] no stream id in $framesrc")
+                    StreamlyDiag.lastStage = "2Embed: no id"
+                    continue
+                }
+                EmbedRouter.route("https://uqloads.xyz/e/$id", "$ref/", subtitleCallback, counting, "2Embed")
+            } else {
+                // Vidsrc-family player: route the real URL (upstream
+                // extractors or generic loadExtractor) with the 2embed page
+                // as referer.
+                EmbedRouter.route(framesrc, "$url/", subtitleCallback, counting, "2Embed")
+            }
+            if (emitted > 0) break
         }
-        EmbedRouter.route("https://uqloads.xyz/e/$id", "$ref/", subtitleCallback, counting, "2Embed")
         Log.d(TWOEMBED_TAG, "[done  ] emitted=$emitted")
         StreamlyDiag.lastStage = if (emitted > 0) "2Embed: ok" else "2Embed: no links"
         emitted > 0

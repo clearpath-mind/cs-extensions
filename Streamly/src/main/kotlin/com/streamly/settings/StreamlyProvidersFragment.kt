@@ -24,6 +24,7 @@ import com.streamly.BuildConfig
 import com.streamly.LinkData
 import com.streamly.Provider
 import com.streamly.ProvidersList
+import com.streamly.StreamlyDiag
 import com.streamly.StreamlyPlugin
 import com.streamly.StreamlyRuntime
 import kotlinx.coroutines.CoroutineScope
@@ -64,6 +65,7 @@ class StreamlyProvidersFragment(
 
     /** Known-good titles used as test probes (movie + show, TMDB + IMDb keyed). */
     private val testCandidates = listOf(
+        LinkData(id = 693134, type = "movie", title = "Dune: Part Two", year = 2024, imdbId = "tt15239678"),
         LinkData(id = 550, type = "movie", title = "Fight Club", year = 1999, imdbId = "tt0137523"),
         LinkData(id = 27205, type = "movie", title = "Inception", year = 2010, imdbId = "tt1375666"),
         LinkData(id = 1396, type = "tv", title = "Breaking Bad", year = 2008, season = 1, episode = 1, imdbId = "tt0903747"),
@@ -101,7 +103,7 @@ class StreamlyProvidersFragment(
         }
     }
 
-    private fun setStatusView(tv: TextView, status: ProviderStatus) {
+    private fun setStatusView(tv: TextView, status: ProviderStatus, detail: String? = null) {
         when (status) {
             ProviderStatus.ONLINE -> {
                 tv.text = "● ONLINE"
@@ -109,7 +111,13 @@ class StreamlyProvidersFragment(
                 tv.visibility = View.VISIBLE
             }
             ProviderStatus.OFFLINE -> {
-                tv.text = "● OFFLINE"
+                // Surface the failing stage (e.g. "no links") so a red badge
+                // is diagnosable without logcat. StreamlyDiag.lastStage is
+                // written by every provider invoke as "<Name>: <stage>".
+                val reason = detail?.trim().orEmpty()
+                    .let { if (":" in it) it.substringAfter(":").trim() else it }
+                    .take(24).trim()
+                tv.text = if (reason.isNotEmpty() && reason != "start") "● OFFLINE · $reason" else "● OFFLINE"
                 tv.background = createStatusBadge(android.graphics.Color.parseColor("#C62828"))
                 tv.visibility = View.VISIBLE
             }
@@ -125,7 +133,12 @@ class StreamlyProvidersFragment(
     }
 
     private fun saveTestStatuses() {
-        val encoded = providerStatuses.entries.joinToString("|") { "${it.key}:${it.value.name}" }
+        // Never persist OFFLINE: a red badge from one bad night (rotated
+        // upstream, slow network) must not stick across restarts. ONLINE
+        // persists; anything else re-tests as UNTESTED.
+        val encoded = providerStatuses.entries
+            .filter { it.value == ProviderStatus.ONLINE }
+            .joinToString("|") { "${it.key}:${it.value.name}" }
         sharedPref.edit { putString(PREFS_TEST_STATUS, encoded) }
     }
 
@@ -135,19 +148,28 @@ class StreamlyProvidersFragment(
             val parts = entry.split(":")
             if (parts.size == 2) {
                 runCatching { ProviderStatus.valueOf(parts[1]) }.getOrNull()
-                    ?.takeIf { it != ProviderStatus.TESTING }
+                    ?.takeIf { it == ProviderStatus.ONLINE }
                     ?.let { providerStatuses[parts[0]] = it }
             }
         }
     }
 
+    /** Embed-chain providers (2Embed -> Uqload -> m3u8) need room: the real
+     * loadLinks path gives them 90s+ while the old 25s probe budget timed
+     * out healthy runs and reported OFFLINE. */
+    private fun probeBudgetMs(provider: Provider): Long =
+        if (provider.id == "2embed") 60000L else 25000L
+
     /**
-     * Probe a provider against the known-good candidates. Returns true on the
-     * first candidate that yields any video link or subtitle URL (25s budget
-     * each, StreamPlay testProvider pattern adapted to the 3-arg invoke).
+     * Probe a provider against known-good candidates. Returns true on the
+     * first candidate that yields any video link or subtitle URL (StreamPlay
+     * testProvider pattern adapted to the 3-arg invoke). Dune: Part Two
+     * (2024) goes first: 2Embed serves new releases on its legacy uqloads
+     * path while old catalogue titles moved to vidsrc-family players.
      */
     private suspend fun testProvider(provider: Provider): Boolean = withContext(Dispatchers.IO) {
         StreamlyRuntime.context = CommonActivity.activity
+        val budget = probeBudgetMs(provider)
         for (candidate in testCandidates) {
             var found = false
             val subCb: (SubtitleFile) -> Unit = { sub ->
@@ -157,7 +179,7 @@ class StreamlyProvidersFragment(
                 if (link.url.isNotBlank()) found = true
             }
             runCatching {
-                withTimeoutOrNull(25000L) {
+                withTimeoutOrNull(budget) {
                     provider.invoke(candidate, subCb, cb)
                 }
             }
@@ -172,9 +194,12 @@ class StreamlyProvidersFragment(
             providerStatuses[provider.id] = ProviderStatus.TESTING
             setStatusView(statusView, ProviderStatus.TESTING)
             val ok = testProvider(provider)
+            // Capture the failing stage for the badge before anything else
+            // overwrites the shared diagnostic channel.
+            val stage = StreamlyDiag.lastStage
             val status = if (ok) ProviderStatus.ONLINE else ProviderStatus.OFFLINE
             providerStatuses[provider.id] = status
-            setStatusView(statusView, status)
+            setStatusView(statusView, status, if (ok) null else stage)
             saveTestStatuses()
             testBtn.isEnabled = true
         }
