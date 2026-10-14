@@ -2303,12 +2303,12 @@ suspend fun invoke2Embed(
         // Default player first, then every go('...') server entry
         // (Vsrc/Videm/Vcr). Cap at 3 so a long server list can't stall us.
         val servers = linkedSetOf<String>()
-        doc.selectFirst("iframe#iframesrc")?.let {
-            val dataSrc = it.attr("data-src").trim()
-            val src = it.attr("src").trim()
-            if (dataSrc.isNotBlank() && dataSrc != "about:blank") servers.add(dataSrc)
-            if (src.isNotBlank() && src != "about:blank") servers.add(src)
-        }
+        // Chained ?.attr() (no ?.let on the Element): Jsoup's jspecify
+        // @Nullable annotation breaks Kotlin inference inside let lambdas.
+        val dataSrc = doc.selectFirst("iframe#iframesrc")?.attr("data-src").orEmpty().trim()
+        val srcAttr = doc.selectFirst("iframe#iframesrc")?.attr("src").orEmpty().trim()
+        if (dataSrc.isNotBlank() && dataSrc != "about:blank") servers.add(dataSrc)
+        if (srcAttr.isNotBlank() && srcAttr != "about:blank") servers.add(srcAttr)
         doc.select("a[onclick*=go(").forEach { a ->
             Regex("""go\(['"](https?://[^'"]+)['"]\)""").find(a.attr("onclick"))
                 ?.groupValues?.get(1)?.trim()
