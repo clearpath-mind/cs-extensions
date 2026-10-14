@@ -285,7 +285,7 @@ suspend fun invokeMovieBox(
                                             resUrl.endsWith(".torrent", true) -> ExtractorLinkType.TORRENT
                                             format.equals("HLS", true) || resUrl.endsWith(".m3u8", true) -> ExtractorLinkType.M3U8
                                             else -> INFER_TYPE
-                                        },
+                                        }
                                     ) {
                                         this.headers = mapOf("Referer" to MOVIEBOX_HOST) +
                                             (if (signCookie != null) mapOf("Cookie" to signCookie) else emptyMap())
@@ -308,7 +308,7 @@ suspend fun invokeMovieBox(
                                         singleUrl.endsWith(".torrent", true) -> ExtractorLinkType.TORRENT
                                         format.equals("HLS", true) || singleUrl.endsWith(".m3u8", true) -> ExtractorLinkType.M3U8
                                         else -> INFER_TYPE
-                                    },
+                                    }
                                 ) {
                                     this.headers = mapOf("Referer" to MOVIEBOX_HOST) +
                                         (if (signCookie != null) mapOf("Cookie" to signCookie) else emptyMap())
