@@ -75,6 +75,10 @@ import kotlin.coroutines.resume
 private const val FASELHD_RES_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
+// Default header origin for the shared WebView resolver below (kept after
+// FaselHD removal: EgyDead still routes through faselHdResolveWebView).
+internal const val FASELHD_MAIN_URL = "https://www.fasel-hd.co"
+
 fun extractIframeSources(doc: Document, base: String): List<String> {
     val results = LinkedHashSet<String>()
     val blocked = listOf(
