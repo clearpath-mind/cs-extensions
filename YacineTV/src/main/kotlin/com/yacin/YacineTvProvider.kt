@@ -153,15 +153,16 @@ class YacineTvProvider : MainAPI() {
     private val hostTtlMs = 6 * 60 * 60_000L
     private val hostRetryMs = 30_000L
 
+    // API roots; the mandatory /api prefix is added in apiHosts()
+    // (https://def67.ycnapi.com/events is a 404, /api/events is not).
     private val fallbackHosts = listOf(
         "https://def67.ycnapi.com",
         "https://def.ycnapi.com",
         "https://deft.yacinelive.com",
     )
 
-    // Cloudflare rejects the phone's OkHttp requests (403) on some
-    // networks, so after the direct hosts fail every call would pay
-    // 3-4 failed requests. Skip them for a while and use the relay.
+    // If every direct host fails (WAF/network), each call would pay 3
+    // failed requests. Skip them briefly and go straight to the relay.
     @Volatile private var relayUntil = 0L
     private val relayCooldownMs = 10 * 60_000L
 
@@ -218,6 +219,15 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { null }
     }
 
+    /** Remote Config publishes a bare origin ("def67.ycnapi.com"), while
+     *  every endpoint lives under /api. Keeping the suffix here (not in
+     *  join(), which also resolves page-relative m3u8/iframe URLs) is
+     *  what v22 missed: it requested /events and got the origin's 404. */
+    private fun apiBase(origin: String): String {
+        val base = (if (origin.startsWith("http")) origin else "https://$origin").trimEnd('/')
+        return if (base.endsWith("/api")) base else "$base/api"
+    }
+
     /** Hosts to try, current one first. Discovery is cached 6h; a failed
      *  lookup retries shortly instead of pinning fallbacks for hours. */
     private suspend fun apiHosts(): List<String> {
@@ -227,7 +237,9 @@ class YacineTvProvider : MainAPI() {
             hostCheckedAt = now
             discoverHost()?.let { discoveredHost = it }
         }
-        return (listOfNotNull(discoveredHost) + fallbackHosts).distinct()
+        return (listOfNotNull(discoveredHost) + fallbackHosts)
+            .map { apiBase(it) }
+            .distinct()
     }
 
     /** Only accept decrypted JSON: a Cloudflare HTML challenge (or a
