@@ -156,9 +156,14 @@ class YacineTvProvider : MainAPI() {
     private val fallbackHosts = listOf(
         "https://def67.ycnapi.com",
         "https://def.ycnapi.com",
-        "https://def11.ycnapi.com",
         "https://deft.yacinelive.com",
     )
+
+    // Cloudflare rejects the phone's OkHttp requests (403) on some
+    // networks, so after the direct hosts fail every call would pay
+    // 3-4 failed requests. Skip them for a while and use the relay.
+    @Volatile private var relayUntil = 0L
+    private val relayCooldownMs = 10 * 60_000L
 
     @Volatile private var discoveredHost: String? = null
     @Volatile private var hostCheckedAt: Long = 0L
@@ -225,20 +230,44 @@ class YacineTvProvider : MainAPI() {
         return (listOfNotNull(discoveredHost) + fallbackHosts).distinct()
     }
 
+    /** Only accept decrypted JSON: a Cloudflare HTML challenge (or a
+     *  missing/stale `t`) decrypts to noise, and returning that would
+     *  stop the host/relay fallback with an empty row. */
+    private fun decryptJson(encryptedText: String, tHeader: String): String? {
+        val out = decrypt(encryptedText, tHeader).trim()
+        return out.takeIf { it.startsWith("{") }
+    }
+
+    /** Encrypted API payload, decryptable with the response `t` header.
+     *  Direct hosts first (fast, no third party); when this network's
+     *  OkHttp traffic is WAF-blocked, the card worker relays the same
+     *  body from Cloudflare's egress. */
     private suspend fun getDecrypted(path: String): String? {
-        for (host in apiHosts()) {
-            try {
-                val res = app.get(
-                    join(host, path),
-                    headers = mapOf("User-Agent" to "okhttp/4.12.0"),
-                    timeout = 15,
-                )
-                if (res.code == 200 && res.text.isNotBlank()) {
-                    return decrypt(res.text, res.headers["t"] ?: "")
-                }
-            } catch (_: Exception) { /* try next host */ }
+        if (System.currentTimeMillis() >= relayUntil) {
+            for (host in apiHosts()) {
+                try {
+                    val res = app.get(
+                        join(host, path),
+                        headers = mapOf("User-Agent" to "okhttp/4.12.0"),
+                        timeout = 15,
+                    )
+                    if (res.code == 200 && res.text.isNotBlank()) {
+                        decryptJson(res.text, res.headers["t"] ?: "")?.let { return it }
+                    }
+                } catch (_: Exception) { /* try next host */ }
+            }
+            relayUntil = System.currentTimeMillis() + relayCooldownMs
         }
-        return null
+        return getViaRelay(path)
+    }
+
+    private suspend fun getViaRelay(path: String): String? {
+        return try {
+            val res = app.get("$cardBase/yacine/$path", timeout = 20)
+            if (res.code == 200 && res.text.isNotBlank()) {
+                decryptJson(res.text, res.headers["t"] ?: "")
+            } else null
+        } catch (_: Exception) { null }
     }
 
     private suspend fun getEvents(): List<YacineEvent> {
