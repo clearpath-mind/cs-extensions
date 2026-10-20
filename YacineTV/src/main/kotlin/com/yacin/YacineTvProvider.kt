@@ -23,16 +23,25 @@ import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
+import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 class YacineTvProvider : MainAPI() {
-    override var mainUrl = "https://def.ycnapi.com/api"
-    // NOTE: former fallback deft.yacinelive.com/api now 403s on
-    // events/categories (Oct 2026) — removed, single-host loop.
+    override var mainUrl = "https://def67.ycnapi.com/api"
+    // API hosts rotate. The app publishes the current one in Firebase Remote
+    // Config ("defaults"); retired hosts answer Cloudflare 403 "Attention
+    // Required", which used to leave Today's Matches empty (Oct 2026:
+    // def.ycnapi.com retired -> def67.ycnapi.com).
 
     override var name = "YacineTV"
     override val hasMainPage = true
@@ -133,32 +142,103 @@ class YacineTvProvider : MainAPI() {
         return base.trimEnd('/') + "/" + path.trimStart('/')
     }
 
-    private suspend inline fun <T> retryIO(
-        times: Int = 3,
-        delayMs: Long = 800,
-        block: suspend () -> T?,
-    ): T? {
-        repeat(times) { attempt ->
-            runCatching { block() }.getOrNull()?.let { return it }
-            if (attempt < times - 1) runCatching { delay(delayMs) }
+    // ---- Rotating API host (Firebase Remote Config) -----------------------
+    // Public mobile-client identifiers shipped in the Yacine APK
+    // (ver3.ycntivi.ofg), not user credentials: they only read the same
+    // public Remote Config the Android app uses to rotate its API host.
+    private val firebaseProjectNumber = "692330584196"
+    private val firebaseApiKey = "AIzaSyDRKL14PPiXzk7qNUNLgV2IsjasxNpWLeU"
+    private val firebaseAppId = "1:692330584196:android:68ea9f0c920aa17904cad1"
+    private val androidPackage = "ver3.ycntivi.ofg"
+    private val hostTtlMs = 6 * 60 * 60_000L
+    private val hostRetryMs = 30_000L
+
+    private val fallbackHosts = listOf(
+        "https://def67.ycnapi.com",
+        "https://def.ycnapi.com",
+        "https://def11.ycnapi.com",
+        "https://deft.yacinelive.com",
+    )
+
+    @Volatile private var discoveredHost: String? = null
+    @Volatile private var hostCheckedAt: Long = 0L
+
+    private val firebaseClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .build()
+
+    data class FirebaseEntries(
+        @JsonProperty("entries") val entries: Map<String, String>? = null,
+    )
+
+    /** Current API origin from the app's Remote Config, or null on failure. */
+    private suspend fun discoverHost(): String? = withContext(Dispatchers.IO) {
+        try {
+            val payload = """
+                {
+                  "appInstanceId": "${UUID.randomUUID().toString().replace("-", "")}",
+                  "appInstanceIdToken": "",
+                  "appId": "$firebaseAppId",
+                  "countryCode": "US",
+                  "languageCode": "en-US",
+                  "platformVersion": "34",
+                  "timeZone": "UTC",
+                  "appVersion": "3.1",
+                  "appBuild": "4",
+                  "packageName": "$androidPackage",
+                  "sdkVersion": "21.6.2",
+                  "analyticsUserProperties": {}
+                }
+            """.trimIndent()
+            val request = Request.Builder()
+                .url("https://firebaseremoteconfig.googleapis.com/v1/projects/$firebaseProjectNumber/namespaces/firebase:fetch")
+                .post(payload.toRequestBody("application/json".toMediaType()))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("X-Android-Package", androidPackage)
+                .header("X-Goog-Api-Key", firebaseApiKey)
+                .header("X-Google-GFE-Can-Retry", "yes")
+                .build()
+            firebaseClient.newCall(request).execute().use { res ->
+                if (!res.isSuccessful) return@withContext null
+                val body = res.body?.string().orEmpty()
+                if (body.isBlank()) return@withContext null
+                val host = parseJson<FirebaseEntries>(body).entries
+                    ?.get("defaults")?.trim()?.takeIf { it.isNotBlank() }
+                    ?: return@withContext null
+                val origin = if (host.startsWith("http")) host else "https://$host"
+                origin.trimEnd('/')
+            }
+        } catch (_: Exception) { null }
+    }
+
+    /** Hosts to try, current one first. Discovery is cached 6h; a failed
+     *  lookup retries shortly instead of pinning fallbacks for hours. */
+    private suspend fun apiHosts(): List<String> {
+        val now = System.currentTimeMillis()
+        val ttl = if (discoveredHost == null) hostRetryMs else hostTtlMs
+        if (now - hostCheckedAt >= ttl) {
+            hostCheckedAt = now
+            discoverHost()?.let { discoveredHost = it }
         }
-        return null
+        return (listOfNotNull(discoveredHost) + fallbackHosts).distinct()
     }
 
     private suspend fun getDecrypted(path: String): String? {
-        return retryIO(times = 5) {
+        for (host in apiHosts()) {
             try {
                 val res = app.get(
-                    join(mainUrl, path),
+                    join(host, path),
                     headers = mapOf("User-Agent" to "okhttp/4.12.0"),
                     timeout = 15,
                 )
                 if (res.code == 200 && res.text.isNotBlank()) {
-                    return@retryIO decrypt(res.text, res.headers["t"] ?: "")
+                    return decrypt(res.text, res.headers["t"] ?: "")
                 }
-            } catch (_: Exception) { /* retry */ }
-            null
+            } catch (_: Exception) { /* try next host */ }
         }
+        return null
     }
 
     private suspend fun getEvents(): List<YacineEvent> {
