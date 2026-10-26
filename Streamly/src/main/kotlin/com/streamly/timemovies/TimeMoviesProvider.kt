@@ -468,7 +468,7 @@ class TimeMovies : MainAPI() {
         }
 
         if (resolvedPayload.fileCode.isBlank() && !unlimitedActive && !hasCachedStream) {
-            TimeMoviesPlugin.notifyUserAr("تعذر العثور على رمز ملف التشغيل لهذا العمل — يرجى تحديث الصفحة")
+            android.util.Log.w("TimeMovies", "missing file code")
             return false
         }
 
