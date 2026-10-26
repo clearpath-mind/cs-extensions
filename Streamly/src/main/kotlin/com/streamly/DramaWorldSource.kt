@@ -627,7 +627,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
         if (title.isEmpty()) return false
 
         var emitted = 0
-        val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+        val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(relabelLink(link, "DramaWorld")) }
 
         return try {
             val results = search(title)

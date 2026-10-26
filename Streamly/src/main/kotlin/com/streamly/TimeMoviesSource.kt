@@ -28,7 +28,7 @@ suspend fun invokeTimeMovies(
     }
 
     var emitted = 0
-    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+    val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(relabelLink(link, "TimeMovies")) }
 
     return try {
         val page = TimeMoviesApi.searchTriple(title, page0Based = 0) ?: run {

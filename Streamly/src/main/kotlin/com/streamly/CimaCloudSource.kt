@@ -860,7 +860,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
         if (title.isEmpty()) return false
 
         var emitted = 0
-        val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+        val counting: (ExtractorLink) -> Unit = { link -> emitted++; callback(relabelLink(link, "CimaCloud")) }
 
         return try {
             val searchRes = apiPostForm(
