@@ -609,21 +609,24 @@ class YacineTvProvider : MainAPI() {
         if (items.isNotEmpty()) {
             homeLists.add(HomePageList("Today's Matches", items, isHorizontalImages = true))
         }
-        // Browsable channels (one entry per channel name; beIN quality tiers
-        // merged so "beIN Sports 1" appears once and resolves all qualities).
+        // Browsable beIN SPORTS channels only (one entry per channel name;
+        // quality tiers merged, so tapping resolves all qualities). Horizontal
+        // thumbnails like Today's Matches.
         runCatching {
-            for ((groupName, chs) in getAllChannelGroups()) {
-                val channelItems = chs.mapNotNull { ch ->
-                    val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                    val data = LinkData(kind = "channel", name = nm).toJson()
-                    newLiveSearchResponse(nm, data, TvType.Live) {
-                        ch.logo?.takeIf { it.isNotBlank() }?.let { this.posterUrl = it }
+            getAllChannelGroups()
+                .firstOrNull { it.first == "beIN SPORTS" }
+                ?.let { (_, chs) ->
+                    val channelItems = chs.mapNotNull { ch ->
+                        val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                        val data = LinkData(kind = "channel", name = nm).toJson()
+                        newLiveSearchResponse(nm, data, TvType.Live) {
+                            ch.logo?.takeIf { it.isNotBlank() }?.let { this.posterUrl = it }
+                        }
+                    }
+                    if (channelItems.isNotEmpty()) {
+                        homeLists.add(HomePageList("beIN SPORTS", channelItems, isHorizontalImages = true))
                     }
                 }
-                if (channelItems.isNotEmpty()) {
-                    homeLists.add(HomePageList(groupName, channelItems, isHorizontalImages = false))
-                }
-            }
         }
         return newHomePageResponse(homeLists, false)
     }
