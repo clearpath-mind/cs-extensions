@@ -315,6 +315,59 @@ class YacineTvProvider : MainAPI() {
         }.getOrNull() ?: emptyList()
     }
 
+    @Volatile private var cachedChannelGroups: List<Pair<String, List<YacineChannel>>>? = null
+    @Volatile private var cachedChannelGroupsAt: Long = 0L
+    private val channelGroupsTtlMs = 10 * 60_000L
+
+    /** Walk the category tree once and merge the four beIN SPORTS quality
+     *  tiers into a single "beIN SPORTS" group (dedup by channel name), so
+     *  the home page shows one beIN category and one entry per channel. */
+    private suspend fun collectChannelGroups(): List<Pair<String, List<YacineChannel>>> {
+        val beinMerged = mutableListOf<YacineChannel>()
+        val beinSeen = mutableSetOf<String>()
+        val others = mutableListOf<Pair<String, List<YacineChannel>>>()
+
+        suspend fun walkBein(cat: YacineCategory) {
+            getChannels(cat.id).forEach { c ->
+                val key = norm(c.name ?: "")
+                if (key.isNotBlank() && beinSeen.add(key)) beinMerged.add(c)
+            }
+            if (cat.childCount == null || cat.childCount != 0) {
+                for (sub in getSubcategories(cat.id)) walkBein(sub)
+            }
+        }
+
+        suspend fun walk(cat: YacineCategory, parentName: String?) {
+            val groupName = if (parentName.isNullOrBlank()) (cat.name ?: "") else "$parentName / ${cat.name}"
+            val chs = getChannels(cat.id)
+            if (chs.isNotEmpty()) others.add(groupName to chs)
+            if (cat.childCount == null || cat.childCount != 0) {
+                for (sub in getSubcategories(cat.id)) walk(sub, cat.name)
+            }
+        }
+
+        for (cat in getCategories()) {
+            if ((cat.name ?: "").startsWith("beIN SPORTS")) {
+                walkBein(cat)
+            } else {
+                walk(cat, null)
+            }
+        }
+        val result = mutableListOf<Pair<String, List<YacineChannel>>>()
+        if (beinMerged.isNotEmpty()) result.add("beIN SPORTS" to beinMerged)
+        result.addAll(others)
+        return result
+    }
+
+    private suspend fun getAllChannelGroups(): List<Pair<String, List<YacineChannel>>> {
+        val now = System.currentTimeMillis()
+        cachedChannelGroups?.takeIf { now - cachedChannelGroupsAt < channelGroupsTtlMs }?.let { return it }
+        val groups = collectChannelGroups()
+        cachedChannelGroups = groups
+        cachedChannelGroupsAt = now
+        return groups
+    }
+
     private suspend fun getChannelStreams(channelId: String): List<YacineStream> {
         val json = getDecrypted("channel/$channelId") ?: return emptyList()
         if (json.isBlank()) return emptyList()
@@ -552,79 +605,134 @@ class YacineTvProvider : MainAPI() {
                 this.posterUrl = poster
             }
         }
-        return newHomePageResponse(listOf(HomePageList("Today's Matches", items, isHorizontalImages = true)), false)
+        val homeLists = mutableListOf<HomePageList>()
+        if (items.isNotEmpty()) {
+            homeLists.add(HomePageList("Today's Matches", items, isHorizontalImages = true))
+        }
+        // Browsable channels (one entry per channel name; beIN quality tiers
+        // merged so "beIN Sports 1" appears once and resolves all qualities).
+        runCatching {
+            for ((groupName, chs) in getAllChannelGroups()) {
+                val channelItems = chs.mapNotNull { ch ->
+                    val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val data = LinkData(kind = "channel", name = nm).toJson()
+                    newLiveSearchResponse(nm, data, TvType.Live) {
+                        ch.logo?.takeIf { it.isNotBlank() }?.let { this.posterUrl = it }
+                    }
+                }
+                if (channelItems.isNotEmpty()) {
+                    homeLists.add(HomePageList(groupName, channelItems, isHorizontalImages = false))
+                }
+            }
+        }
+        return newHomePageResponse(homeLists, false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val q = query.trim()
         val nowSec = System.currentTimeMillis() / 1000
-        return getEvents()
-            .filter { e ->
-                listOfNotNull(
-                    e.team1?.name,
-                    e.team2?.name,
-                    e.champions,
-                    e.channel,
-                    e.commentary,
-                ).joinToString(" ").contains(q, ignoreCase = true)
-            }
-            .sortedWith(
-                compareBy(
-                    { e ->
-                        when {
-                            e.startTime != null && e.startTime > 0 && nowSec < e.startTime -> 1
-                            e.endTime != null && e.endTime > 0 && nowSec > e.endTime -> 2
-                            else -> 0
-                        }
-                    },
-                    { e -> e.startTime ?: Long.MAX_VALUE },
+        val results = mutableListOf<SearchResponse>()
+
+        // Events
+        results.addAll(
+            getEvents()
+                .filter { e ->
+                    listOfNotNull(
+                        e.team1?.name,
+                        e.team2?.name,
+                        e.champions,
+                        e.channel,
+                        e.commentary,
+                    ).joinToString(" ").contains(q, ignoreCase = true)
+                }
+                .sortedWith(
+                    compareBy(
+                        { e ->
+                            when {
+                                e.startTime != null && e.startTime > 0 && nowSec < e.startTime -> 1
+                                e.endTime != null && e.endTime > 0 && nowSec > e.endTime -> 2
+                                else -> 0
+                            }
+                        },
+                        { e -> e.startTime ?: Long.MAX_VALUE },
+                    )
                 )
-            )
-            .map { e ->
-                val t1 = e.team1?.name?.trim().orEmpty()
-                val t2 = e.team2?.name?.trim().orEmpty()
-                val displayTitle = createDisplayTitle(t1, t2)
-                val status = getEventStatus(
-                    e.startTime?.takeIf { it > 0 },
-                    e.endTime?.takeIf { it > 0 },
-                )
-                val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
-                val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
-                    generateCardUrl(
-                        t1,
-                        t2,
-                        e.champions?.trim()?.takeIf { it.isNotBlank() },
-                        e.team1?.logo?.takeIf { it.isNotBlank() },
-                        e.team2?.logo?.takeIf { it.isNotBlank() },
+                .map { e ->
+                    val t1 = e.team1?.name?.trim().orEmpty()
+                    val t2 = e.team2?.name?.trim().orEmpty()
+                    val displayTitle = createDisplayTitle(t1, t2)
+                    val status = getEventStatus(
                         e.startTime?.takeIf { it > 0 },
                         e.endTime?.takeIf { it > 0 },
-                        e.channel?.trim()?.takeIf { it.isNotBlank() },
-                        e.commentary?.trim()?.takeIf { it.isNotBlank() },
-                        nowSec,
                     )
-                } else null
-                val data = LinkData(
-                    eventId = e.id,
-                    name = fullTitle,
-                    channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
-                    competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
-                    commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
-                    kickoff = e.startTime?.takeIf { it > 0 },
-                    end = e.endTime?.takeIf { it > 0 },
-                    team1 = t1.takeIf { it.isNotBlank() },
-                    team2 = t2.takeIf { it.isNotBlank() },
-                    logo1 = e.team1?.logo?.takeIf { it.isNotBlank() },
-                    logo2 = e.team2?.logo?.takeIf { it.isNotBlank() },
-                ).toJson()
-                newLiveSearchResponse(fullTitle, data, TvType.Live) {
-                    this.posterUrl = poster
+                    val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
+                    val poster = if (t1.isNotBlank() && t2.isNotBlank()) {
+                        generateCardUrl(
+                            t1,
+                            t2,
+                            e.champions?.trim()?.takeIf { it.isNotBlank() },
+                            e.team1?.logo?.takeIf { it.isNotBlank() },
+                            e.team2?.logo?.takeIf { it.isNotBlank() },
+                            e.startTime?.takeIf { it > 0 },
+                            e.endTime?.takeIf { it > 0 },
+                            e.channel?.trim()?.takeIf { it.isNotBlank() },
+                            e.commentary?.trim()?.takeIf { it.isNotBlank() },
+                            nowSec,
+                        )
+                    } else null
+                    val data = LinkData(
+                        eventId = e.id,
+                        name = fullTitle,
+                        channel = e.channel?.trim()?.takeIf { it.isNotBlank() },
+                        competition = e.champions?.trim()?.takeIf { it.isNotBlank() },
+                        commentary = e.commentary?.trim()?.takeIf { it.isNotBlank() },
+                        kickoff = e.startTime?.takeIf { it > 0 },
+                        end = e.endTime?.takeIf { it > 0 },
+                        team1 = t1.takeIf { it.isNotBlank() },
+                        team2 = t2.takeIf { it.isNotBlank() },
+                        logo1 = e.team1?.logo?.takeIf { it.isNotBlank() },
+                        logo2 = e.team2?.logo?.takeIf { it.isNotBlank() },
+                    ).toJson()
+                    newLiveSearchResponse(fullTitle, data, TvType.Live) {
+                        this.posterUrl = poster
+                    }
                 }
+        )
+
+        // Channels: API search first, local fallback.
+        val channelCandidates = runCatching {
+            val json = getDecrypted("search?query=${URLEncoder.encode(q, "UTF-8")}")
+            if (json != null) {
+                visibleByPriority(parseJson<YacineChannelResponse>(json).data.orEmpty())
+            } else {
+                getAllChannelGroups().flatMap { it.second }
+                    .filter { (it.name ?: "").contains(q, ignoreCase = true) }
             }
+        }.getOrNull() ?: getAllChannelGroups().flatMap { it.second }
+            .filter { (it.name ?: "").contains(q, ignoreCase = true) }
+
+        val seenNames = mutableSetOf<String>()
+        for (ch in channelCandidates) {
+            val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            if (!seenNames.add(norm(nm))) continue
+            val data = LinkData(kind = "channel", name = nm).toJson()
+            results.add(
+                newLiveSearchResponse(nm, data, TvType.Live) {
+                    ch.logo?.takeIf { it.isNotBlank() }?.let { this.posterUrl = it }
+                }
+            )
+        }
+
+        return results
     }
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LinkData>(url)
+        if (data.kind == "channel") {
+            val nm = data.name?.takeIf { it.isNotBlank() } ?: "Channel"
+            return newLiveStreamLoadResponse(name = nm, url = url, dataUrl = url) {}
+        }
         // Cricify-style plot (emoji fields) from the baked event data.
         // Lines join with <br><br>: the app renders plot via setTextHtml,
         // which collapses raw newlines.
@@ -1040,17 +1148,32 @@ class YacineTvProvider : MainAPI() {
         val tag = info.channel?.trim()?.takeIf { it.isNotEmpty() }
         val eid = info.eventId?.takeIf { it.isNotBlank() }
         val candidates = mutableListOf<Pair<String, YacineStream>>()
-        if (eid != null) {
-            getEventStreams(eid).forEach { candidates.add((tag ?: info.name) to it) }
-        }
-        // Fallback: the card's channel label across quality groups.
-        if (tag != null) {
-            val ids = resolveChannelIds(tag)
-            if (ids.isNotEmpty()) {
-                coroutineScope {
-                    ids.map { cid -> async { getChannelStreams(cid) } }
-                        .awaitAll().flatten()
-                        .forEach { candidates.add(tag to it) }
+        val isChannel = info.kind == "channel"
+        if (isChannel) {
+            val label = (info.name ?: info.channel)?.trim()?.takeIf { it.isNotEmpty() }
+            if (label != null) {
+                val ids = resolveChannelIds(label)
+                if (ids.isNotEmpty()) {
+                    coroutineScope {
+                        ids.map { cid -> async { getChannelStreams(cid) } }
+                            .awaitAll().flatten()
+                            .forEach { candidates.add(label to it) }
+                    }
+                }
+            }
+        } else {
+            if (eid != null) {
+                getEventStreams(eid).forEach { candidates.add((tag ?: info.name) to it) }
+            }
+            // Fallback: the card's channel label across quality groups.
+            if (tag != null) {
+                val ids = resolveChannelIds(tag)
+                if (ids.isNotEmpty()) {
+                    coroutineScope {
+                        ids.map { cid -> async { getChannelStreams(cid) } }
+                            .awaitAll().flatten()
+                            .forEach { candidates.add(tag to it) }
+                    }
                 }
             }
         }
