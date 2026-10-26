@@ -125,14 +125,14 @@ object DramaWorldHostExtractor {
         suspend fun tryDirect(): Boolean {
             if (embed == null) return false
             val direct = parseLinks(embed)
-            return direct.isNotEmpty() && emit(direct, server, playReferer, cdnHeaders, callback)
+            return direct.isNotEmpty() && emit(direct, server, playReferer, cdnHeaders, callback, sourceName)
         }
 
         if (rule == null) return tryDirect()
 
         if (rule.method == Method.GET) {
             val body = runCatching { app.get(buildGetUrl(rule.endpoint, link), referer = SCRAPER).text }.getOrNull()
-            if (emit(parseLinks(body), server, playReferer, cdnHeaders, callback)) return true
+            if (emit(parseLinks(body), server, playReferer, cdnHeaders, callback, sourceName)) return true
             return tryDirect()
         }
 
@@ -146,10 +146,10 @@ object DramaWorldHostExtractor {
                     referer = SCRAPER
                 ).text
             }.getOrNull()
-            if (emit(parseLinks(body), server, playReferer, cdnHeaders, callback)) return true
+            if (emit(parseLinks(body), server, playReferer, cdnHeaders, callback, sourceName)) return true
         }
         val body = runCatching { app.get(buildGetUrl(rule.endpoint, link), referer = SCRAPER).text }.getOrNull()
-        if (emit(parseLinks(body), server, playReferer, cdnHeaders, callback)) return true
+        if (emit(parseLinks(body), server, playReferer, cdnHeaders, callback, sourceName)) return true
         return tryDirect()
     }
 
@@ -158,7 +158,8 @@ object DramaWorldHostExtractor {
         server: String,
         referer: String?,
         headers: Map<String, String>,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        sourceName: String? = null,
     ): Boolean {
         if (links.isEmpty()) return false
         val seen = HashSet<String>()
