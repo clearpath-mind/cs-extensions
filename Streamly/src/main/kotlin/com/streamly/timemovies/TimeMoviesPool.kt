@@ -379,11 +379,7 @@ object TimeMoviesPool {
     fun loadAllSlots(allowNetworkFetch: Boolean = true): List<EffectivePoolSlot> {
         val localBundles = parseBundleLines(TimeMoviesPrefs.localPoolBundlesRaw)
         val includeEmbedded = !TimeMoviesPrefs.isUnitTestMode || TimeMoviesPrefs.includeEmbeddedPoolInUnitTests
-        val embeddedBundles = if (includeEmbedded) {
-            TimeMoviesEmbeddedPool.BUNDLES.mapNotNull { PoolAccountBundle.unseal(it) }
-        } else {
-            emptyList()
-        }
+        val embeddedBundles = emptyList<TimeMoviesPool.PoolAccountBundle>()
         var remoteBundles = parseBundleLines(TimeMoviesPrefs.remotePoolBundlesRaw)
 
         if (allowNetworkFetch) {
