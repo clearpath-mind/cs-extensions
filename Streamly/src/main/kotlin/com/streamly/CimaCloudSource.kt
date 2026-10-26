@@ -74,7 +74,7 @@ import javax.crypto.spec.SecretKeySpec
  *   - egybestvid/vidspeed/...    -> scraped JWPlayer page (incl. p.a.c.k.e.d eval)
  *   - anything else              -> delegated to CloudStream's loadExtractor()
  */
-object CimaCloudSource {
+class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
 
 
     companion object {
@@ -450,7 +450,7 @@ object CimaCloudSource {
         when {
             clean.endsWith(".mp4") -> {
                 callback(
-                    newExtractorLink(source = name, name = label, url = link, type = ExtractorLinkType.VIDEO) {
+                    newExtractorLink(source = "Cima Cloud", name = label, url = link, type = ExtractorLinkType.VIDEO) {
                         this.headers = mapOf("User-Agent" to UA_CHROME)
                     },
                 )
@@ -460,7 +460,7 @@ object CimaCloudSource {
             clean.endsWith(".m3u8") || clean.endsWith(".mpd") -> {
                 callback(
                     newExtractorLink(
-                        source = name, name = label, url = link,
+                        source = "Cima Cloud", name = label, url = link,
                         type = if (clean.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.DASH,
                     ) {
                         this.headers = mapOf("User-Agent" to UA_CHROME)
@@ -544,7 +544,7 @@ object CimaCloudSource {
         Regex("""(https?://video-downloads[^"\\\s]+)""").find(page)?.groupValues?.get(1)?.let { dl ->
             callback(
                 newExtractorLink(
-                    source = name, name = "سيرفر Google (تنزيل)", url = dl,
+                    source = "Cima Cloud", name = "سيرفر Google (تنزيل)", url = dl,
                     type = ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = "https://photos.google.com"
@@ -561,7 +561,7 @@ object CimaCloudSource {
         Regex("""data-url=\\?"([^"\\]+)""").find(page)?.groupValues?.get(1)?.let { dataUrl ->
             callback(
                 newExtractorLink(
-                    source = name, name = "سيرفر Google Photos", url = dataUrl + MPD_SUFFIX,
+                    source = "Cima Cloud", name = "سيرفر Google Photos", url = dataUrl + MPD_SUFFIX,
                     type = ExtractorLinkType.DASH,
                 ) {
                     this.referer = "https://photos.google.com"
@@ -604,7 +604,7 @@ object CimaCloudSource {
 
                 clean.endsWith(".mp4") -> {
                     callback(
-                        newExtractorLink(source = name, name = "سيرفر Worker", url = u, type = ExtractorLinkType.VIDEO) {
+                        newExtractorLink(source = "Cima Cloud", name = "سيرفر Worker", url = u, type = ExtractorLinkType.VIDEO) {
                             this.headers = mapOf("User-Agent" to UA_CHROME)
                         },
                     )
@@ -613,7 +613,7 @@ object CimaCloudSource {
 
                 clean.endsWith(".m3u8") -> {
                     callback(
-                        newExtractorLink(source = name, name = "سيرفر Worker", url = u, type = ExtractorLinkType.M3U8) {
+                        newExtractorLink(source = "Cima Cloud", name = "سيرفر Worker", url = u, type = ExtractorLinkType.M3U8) {
                             this.headers = mapOf("User-Agent" to UA_CHROME)
                         },
                     )
@@ -661,7 +661,7 @@ object CimaCloudSource {
 
             callback(
                 newExtractorLink(
-                    source = name, name = label, url = url,
+                    source = "Cima Cloud", name = label, url = url,
                     type = if (clean.endsWith(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = referer ?: ""
@@ -721,7 +721,7 @@ object CimaCloudSource {
 
             clean.endsWith(".mp4") -> {
                 callback(
-                    newExtractorLink(source = name, name = label, url = url, type = ExtractorLinkType.VIDEO) {
+                    newExtractorLink(source = "Cima Cloud", name = label, url = url, type = ExtractorLinkType.VIDEO) {
                         this.referer = embedUrl
                         this.headers = mapOf("User-Agent" to UA_CHROME)
                     },
@@ -742,7 +742,7 @@ object CimaCloudSource {
     ): Boolean {
         try {
             val links = M3u8Helper.generateM3u8(
-                source = name,
+                source = "Cima Cloud",
                 streamUrl = masterUrl,
                 referer = referer,
                 headers = mapOf("User-Agent" to UA_CHROME),
@@ -767,7 +767,7 @@ object CimaCloudSource {
             throw e
         } catch (e: Exception) {
             callback(
-                newExtractorLink(source = name, name = label, url = masterUrl, type = ExtractorLinkType.M3U8) {
+                newExtractorLink(source = "Cima Cloud", name = label, url = masterUrl, type = ExtractorLinkType.M3U8) {
                     this.referer = referer
                     this.headers = mapOf("User-Agent" to UA_CHROME)
                 },
@@ -812,7 +812,7 @@ object CimaCloudSource {
         return Regex("""\b\w+\b""").replace(p) { m -> replaceMap[m.value] ?: m.value }
     }
 
-    private fun cimaCloudPickId(search: JSONObject?, res: LinkData): Pair<String, Boolean>? {
+    private fun cimaCloudPickId(search: JsonObject?, res: LinkData): Pair<String, Boolean>? {
         val arr = search?.arr("results") ?: return null
         val wantSeries = !res.isMovie
         var bestId: String? = null
@@ -900,4 +900,4 @@ suspend fun invokeCimaCloud(
     res: LinkData,
     subtitleCallback: (com.lagradost.cloudstream3.SubtitleFile) -> Unit,
     callback: (com.lagradost.cloudstream3.utils.ExtractorLink) -> Unit,
-): Boolean = CimaCloudSource.invokeCimaCloud(res, subtitleCallback, callback)
+): Boolean = CimaCloudSource().invokeCimaCloud(res, subtitleCallback, callback)

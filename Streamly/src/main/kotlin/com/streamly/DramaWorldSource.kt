@@ -50,7 +50,7 @@ import me.xdrop.fuzzywuzzy.FuzzySearch
  *
  * Live TV channels carry their (direct) stream URLs inline.
  */
-object DramaWorldSource {
+class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
     companion object {
         private const val TAG = "DramaWorld"
 
@@ -666,4 +666,4 @@ suspend fun invokeDramaWorld(
     res: LinkData,
     subtitleCallback: (com.lagradost.cloudstream3.SubtitleFile) -> Unit,
     callback: (com.lagradost.cloudstream3.utils.ExtractorLink) -> Unit,
-): Boolean = DramaWorldSource.invokeDramaWorld(res, subtitleCallback, callback)
+): Boolean = DramaWorldSource().invokeDramaWorld(res, subtitleCallback, callback)

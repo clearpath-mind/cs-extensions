@@ -1907,6 +1907,58 @@ private suspend fun egDeadWatchServers(
         false
     }
 }
+private fun cleanServerName(raw: String?): String? {
+    var name = raw?.trim().takeIf { !it.isNullOrBlank() } ?: return raw
+    name = name.replace(Regex("""(?i)\s*[\[(]?\d{3,4}\s*p[\])]??\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?\d+\s*K[\])]??\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?(HD|HQ|CAM|HDTC)[\])]??\s*$"""), "")
+        .trim()
+    return name.ifBlank { raw?.trim() }
+}
+
+/** Host only, no path/query/token — safe for logs. */
+private fun hostOfUrl(url: String): String =
+    runCatching { URI(url.substringBefore("#")).host ?: url.take(48) }.getOrDefault(url.take(48))
+
+/** Shared emit for a resolved m3u8: always expand into per-quality variants. */
+private suspend fun emitResolvedVariants(
+    m3u8: String,
+    iframe: String,
+    base: String,
+    callback: (ExtractorLink) -> Unit,
+    label: String = "Streamly",
+) {
+    val variants = runCatching {
+        generateM3u8(
+            label,
+            m3u8,
+            referer = iframe,
+            headers = mapOf(
+                "Referer" to iframe,
+                "Origin" to base,
+                "User-Agent" to RESOLVER_UA,
+                "Cookie" to cfCookies(m3u8),
+            ),
+        )
+    }.getOrNull().orEmpty()
+    if (variants.isNotEmpty()) {
+        dropRedundantMasters(variants).forEach(callback)
+        return
+    }
+    callback(
+        newExtractorLink(label, label, url = m3u8) {
+            this.referer = iframe
+            this.quality = Qualities.Unknown.value
+            this.type = ExtractorLinkType.M3U8
+            this.headers = mapOf(
+                "Referer" to iframe,
+                "Origin" to base,
+                "User-Agent" to RESOLVER_UA,
+            )
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // EgyWatch (EasyPlex app API). Search hits carry tmdb_id, so matching is
 // exact against LinkData.id with a fuzzy-title fallback — no slug scraping.
