@@ -26,7 +26,7 @@ object ProvidersList {
             Provider("egywatch", "EgyWatch") { res, sub, cb ->
                 invokeEgyWatch(res, sub, cb)
             },
-            Provider("cimacloud", "Cima Cloud") { res, sub, cb ->
+            Provider("cimacloud", "CimaCloud") { res, sub, cb ->
                 invokeCimaCloud(res, sub, cb)
             },
             Provider("dramaworld", "DramaWorld") { res, sub, cb ->

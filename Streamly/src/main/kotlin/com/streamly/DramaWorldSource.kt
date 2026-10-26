@@ -523,7 +523,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
         if (isDirect(link)) {
             val type = if (link.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(
-                newExtractorLink("DramaWorld - $label", "DramaWorld", link, type) {
+                newExtractorLink(source = "DramaWorld", name = label, url = link, type = type) {
                     this.referer = "$MAIN_HOST/"
                 }
             )
@@ -532,7 +532,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
         // First resolve the ecosystem embeds the official app handles via mawdhou3.com
         // (okhd, vidspeed, morencius, vidaraa, upzur, luluvdo, vidoba, film77, anafast, mp4plus …).
         val resolved = try {
-            DramaWorldHostExtractor.extract(link, "DramaWorld - $label", null, null, null, callback)
+            DramaWorldHostExtractor.extract(link, label, null, null, null, callback, "DramaWorld")
         } catch (e: Throwable) {
             android.util.Log.i(TAG, "DramaWorldHostExtractor FAILED $link -> $e")
             false

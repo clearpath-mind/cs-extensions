@@ -94,7 +94,8 @@ object DramaWorldHostExtractor {
         referer: String?,
         origin: String?,
         userAgent: String?,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
+        sourceName: String? = null,
     ): Boolean {
         val host = hostOf(link) ?: return false
 
@@ -173,14 +174,27 @@ object DramaWorldHostExtractor {
                     M3u8Helper.generateM3u8(server, url, referer, headers = fetchHeaders)
                 }.getOrNull()
                 if (!generated.isNullOrEmpty()) {
-                    generated.forEach { callback(it) }
+                    generated.forEach { link ->
+                        callback(
+                            newExtractorLink(
+                                source = sourceName ?: server,
+                                name = link.name,
+                                url = link.url,
+                                type = ExtractorLinkType.M3U8,
+                            ) {
+                                this.referer = link.referer
+                                this.quality = link.quality
+                                this.headers = link.headers
+                            },
+                        )
+                    }
                     found = true
                     continue
                 }
             }
             callback(
                 newExtractorLink(
-                    server,
+                    sourceName ?: server,
                     server,
                     url,
                     if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
