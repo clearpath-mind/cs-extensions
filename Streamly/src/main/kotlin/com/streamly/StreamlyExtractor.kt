@@ -68,7 +68,7 @@ import kotlin.coroutines.resume
 // post -> resolve season/episode structurally -> route every embed/direct
 // link through EmbedRouter.
 //
-// Currently: TopCinema, EgyDead, Akwam. Every master m3u8
+// Currently: TopCinema, FaselHD, EgyDead, Akwam, EgyWatch. Every master m3u8
 // is expanded into per-quality variants so slow networks can pick manually.
 /// ---------------------------------------------------------------------------
 
@@ -584,6 +584,7 @@ private fun cfSolverTimeoutFor(url: String): Long {
     val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("") ?: ""
     return when {
         "egydead" in host -> 30000L // EgyDead aggressively 403s datacenter traffic
+        "fasel" in host -> 20000L   // FaselHD can be slow on complex challenges
         else -> 15000L              // Default: lightly CF-protected sites
     }
 }
@@ -593,6 +594,7 @@ private fun cfRetryDelayFor(url: String): Long {
     val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("") ?: ""
     return when {
         "egydead" in host -> 1000L // EgyDead rate-limits aggressively
+        "fasel" in host -> 750L    // FaselHD moderate rate-limiting
         else -> 500L               // Default: light delay
     }
 }
@@ -1428,6 +1430,352 @@ private fun unwrapPlayUrl(url: String): String {
 }
 
 
+// ===========================================================================
+// FaselHD (fasel-hd.co) link source.
+//
+// WordPress (faselhd_2020 theme). Search is performed via `?s=` and is
+// Cloudflare-protected; `faselHdGet` routes through the shared WebView-based
+// CloudFlare solver (see cfGetDoc) when a "Just a moment…" challenge page is
+// returned. Post pages expose a player
+// iframe (iframe[name="player_iframe"] / iframe[src*="video_player"]) plus a
+// direct download path; resolved servers are routed through EmbedRouter so we
+// reuse the shared extractor registry (Vidtube/UpDown/Dooood/Filelion/…).
+// ===========================================================================
+
+private const val FASELHD_MAIN_URL = "https://www.fasel-hd.co"
+private const val FASELHD_FALLBACK_URL = "https://www.fasel-hd.cam"
+/** Redirector the re-3arabi FaselHD provider tracks (301s to the live mirror). */
+private const val FASELHD_REDIRECT_URL = "https://faselhdx.bid"
+private const val FASELHD_TAG = "FaselHD"
+
+/** Live-mirror winner, cached per process (mirrors die across days, not minutes). */
+private var faselHdLiveBase: String? = null
+
+/** Theme markers proving a fetched page is really FaselHD, not a parked/dead mirror. */
+private fun isFaselHdPage(html: String?): Boolean {
+    if (html.isNullOrBlank()) return false
+    return html.contains("postDiv", ignoreCase = true) ||
+        html.contains("dtc_live", ignoreCase = true) ||
+        html.contains("faselhd", ignoreCase = true) ||
+        html.contains("فاصل", ignoreCase = true)
+}
+
+internal suspend fun faselHdBase(): String {
+    faselHdLiveBase?.let { return it }
+    // Probe each known mirror and use the first that serves real FaselHD
+    // content. The site lives on fasel-hd.co; faselhdx.bid is the redirector
+    // re-3arabi tracks (it 301s to .co today) and .cam is kept as a spare.
+    // The domain root is a marker-less landing page — so probe /main, which
+    // carries the theme (postDiv/dtc_live). Probes run concurrently; list
+    // order decides on ties so .co stays preferred.
+    val seeds = listOf(FASELHD_MAIN_URL, FASELHD_FALLBACK_URL, FASELHD_REDIRECT_URL)
+    val live: Map<String, String> = coroutineScope {
+        seeds.map { seed ->
+            async {
+                val origin = resolveOrigin(seed)
+                // Explicit String? type: app response accessors carry a jspecify
+                // @Nullable annotation that isn't on the compile classpath.
+                val tProbe = SystemClock.elapsedRealtime()
+                // The origin flaps with 502s (Cloudflare serves "Bad gateway"
+                // while the backend restarts): retry a dead probe once before
+                // giving up on the mirror so a transient outage doesn't fail
+                // the whole base detection.
+                var probe: String? = null
+                var walled = false
+                for (attempt in 0..1) {
+                    probe = try {
+                        val resp = app.get("$origin/main", timeout = 15000)
+                        if (resp.code in 500..599) {
+                            Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin HTTP ${resp.code} (attempt ${attempt + 1}/2)")
+                            null
+                        } else {
+                            // A CF challenge page still proves the mirror is
+                            // live: the origin answers behind Cloudflare and
+                            // cfGetDoc solves the wall on real requests. Read
+                            // as dead, every walled network burned both probe
+                            // rounds and reported "no live mirror".
+                            val text = resp.text.orEmpty()
+                            walled = resp.code in CF_BLOCK_CODES && isCfChallenge(text)
+                            text
+                        }
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (isFaselHdPage(probe) || walled) break
+                    if (attempt == 0) delay(2000)
+                }
+                if (isFaselHdPage(probe) || walled) {
+                    Log.d("StreamlyMirror", "faselHdBase probing $seed -> live $origin in ${SystemClock.elapsedRealtime() - tProbe}ms walled=$walled")
+                    seed to origin
+                } else {
+                    Log.w(FASELHD_TAG, "[mirror ] $seed -> $origin not serving FaselHD in ${SystemClock.elapsedRealtime() - tProbe}ms (page=${probe?.length ?: -1} chars), trying next")
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull().toMap()
+    }
+    val winner = seeds.firstNotNullOfOrNull { live[it] }
+    if (winner != null) {
+        faselHdLiveBase = winner
+        return winner
+    }
+    val fallback = resolveOrigin(FASELHD_MAIN_URL)
+    StreamlyDiag.lastStage = "FaselHD: no live mirror"
+    return fallback
+}
+
+/** CF-aware GET backed by the shared WebView solver (see cfGetDoc). */
+private suspend fun faselHdGet(url: String, referer: String? = null, fastSolve: Boolean = false): Document =
+    cfGetDoc(url, referer = referer, timeout = 20000, awaitContent = !fastSolve)
+
+/** Shared card parser for FaselHD list fragments (`?s=` pages and AJAX html). */
+private fun faselHdParseCards(doc: Document): List<Candidate> =
+    doc.select("div#postList div.postDiv, div.postDiv, article, .result, .search-item").mapNotNull { box ->
+        val a = box.selectFirst("a[href]") ?: return@mapNotNull null
+        val href = a.absUrl("href").ifEmpty { a.attr("href") }
+        if (href.isBlank() || !href.startsWith("http")) return@mapNotNull null
+        val slug = decodeSlug(href)
+        Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+    }
+
+/**
+ * FaselHD live-search via the theme's AJAX endpoint (`action=dtc_live`),
+ * ported from re-3arabi's Faselhd.kt: raw OkHttp POST with manual redirect
+ * handling and one CF-clearance refresh on HTTP 403. Unlike `?s=`, the
+ * server matches Arabic titles too, so this is the primary search path.
+ */
+private suspend fun faselHdAjaxSearch(query: String, base: String): List<Candidate> {
+    val formBody = FormBody.Builder()
+        .add("action", "dtc_live")
+        .add("trsearch", query)
+        .build()
+    val bodyStr = try {
+        faselHdAjaxPost("$base/wp-admin/admin-ajax.php", base, formBody)
+    } catch (e: CfWalledException) {
+        throw e
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[search ] ajax failed: ${e.message}")
+        null
+    }
+    if (bodyStr.isNullOrBlank()) return emptyList()
+    return faselHdParseCards(Jsoup.parse(bodyStr, base))
+}
+
+/**
+ * Raw OkHttp AJAX POST with manual redirect handling (re-3arabi
+ * `makeAjaxRequest`). Throws CfWalledException when the endpoint stays
+ * Cloudflare-blocked even after a clearance refresh, so the caller can skip
+ * straight to the `?s=` fallback instead of burning another ~30s round.
+ */
+private class CfWalledException : IllegalStateException("CF_WALLED")
+
+private suspend fun faselHdAjaxPost(
+    ajaxUrl: String,
+    base: String,
+    formBody: FormBody,
+): String? {
+    try {
+        return faselHdAjaxAttempt(ajaxUrl, base, formBody, cfCookies(base))
+    } catch (e: IllegalStateException) {
+        if (e.message != "403_FORBIDDEN") return null
+    }
+    Log.d(FASELHD_TAG, "[search ] 403 on AJAX, refreshing CF clearance…")
+    // Solve the renderable base page, not the AJAX endpoint itself: the
+    // endpoint returns "0"/empty so the WebView solver can never observe a
+    // solved DOM there (re-3arabi smartPost solves mainUrl for the same
+    // reason). Clearance cookies are site-wide.
+    // awaitContent = false: we only need cookies, not rendered DOM (fastSolve pattern).
+    cfSolve(base, awaitContent = false, timeoutMs = cfSolverTimeoutFor(base))
+    return try {
+        faselHdAjaxAttempt(ajaxUrl, base, formBody, cfCookies(base))
+    } catch (e: IllegalStateException) {
+        if (e.message == "403_FORBIDDEN") throw CfWalledException()
+        null
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private suspend fun faselHdAjaxAttempt(
+    ajaxUrl: String,
+    base: String,
+    formBody: FormBody,
+    cookies: String,
+): String? {
+    val client = app.baseClient.newBuilder()
+        .cookieJar(okhttp3.CookieJar.NO_COOKIES)
+        .followRedirects(false) // follow manually to keep the POST across hops
+        .build()
+    var currentUrl = ajaxUrl
+    var redirects = 0
+    var rateRetries = 0
+    while (redirects < 5) {
+        val reqBuilder = OkRequest.Builder()
+            .url(currentUrl)
+            .post(formBody)
+            .header("User-Agent", CF_UA)
+            .header("Referer", base)
+        if (cookies.isNotBlank()) reqBuilder.header("Cookie", cookies)
+        val response = withContext(Dispatchers.IO) {
+            client.newCall(reqBuilder.build()).execute()
+        }
+        var backoffMs = 0L
+        response.use { res ->
+            when (res.code) {
+                403 -> throw IllegalStateException("403_FORBIDDEN")
+                429 -> {
+                    // Rate-limited infra: back off and retry (re-3arabi smartGet).
+                    if (rateRetries >= 3) {
+                        Log.w(FASELHD_TAG, "[search ] ajax 429 x3, giving up")
+                        StreamlyDiag.lastStage = "FaselHD: ajax rate-limited"
+                        return ""
+                    }
+                    rateRetries++
+                    Log.w(FASELHD_TAG, "[search ] ajax 429, retry $rateRetries/3")
+                    backoffMs = 1000L * rateRetries
+                }
+                301, 302, 307, 308 -> {
+                    val location = res.header("Location")
+                    if (location != null) {
+                        currentUrl = if (location.startsWith("http")) location else "$base$location"
+                        redirects++
+                    } else {
+                        return ""
+                    }
+                }
+                200 -> return res.body?.string() ?: ""
+                502, 503, 504 -> {
+                    // Transient origin errors (the backend 502s under load):
+                    // back off and retry like a 429 instead of failing empty.
+                    if (rateRetries >= 3) {
+                        Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code} x3, giving up")
+                        StreamlyDiag.lastStage = "FaselHD: origin error"
+                        return ""
+                    }
+                    rateRetries++
+                    Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code}, retry $rateRetries/3")
+                    backoffMs = 1000L * rateRetries
+                }
+                else -> {
+                    Log.w(FASELHD_TAG, "[search ] ajax HTTP ${res.code}")
+                    StreamlyDiag.lastStage = "FaselHD: ajax HTTP ${res.code}"
+                    return ""
+                }
+            }
+        }
+        // 429 backoff happens here so the response is already closed.
+        if (backoffMs > 0) delay(backoffMs)
+    }
+    return "" // redirect limit reached
+}
+
+private suspend fun faselHdSearch(query: String): List<Candidate> {
+    val tBase = SystemClock.elapsedRealtime()
+    val base = faselHdBase()
+    Log.d(FASELHD_TAG, "[search ] base=$base in ${SystemClock.elapsedRealtime() - tBase}ms")
+
+    // Primary: theme live-search AJAX (matches Arabic titles server-side).
+    // When circuit-broken the AJAX endpoint is what's walled (each round
+    // burns ~30s for nothing) while `?s=` still answers — skip AJAX and go
+    // straight to the fallback so the probe budget isn't wasted.
+    val skipAjax = StreamlyCache.getProviderStats("faselhd").isCircuitBroken
+    if (skipAjax) {
+        Log.d(FASELHD_TAG, "[search ] broken: skipping AJAX, ?s= direct")
+    }
+    // A CF wall (not a genuine empty) skips the stripped round: another
+    // ~30s AJAX cycle is pointless, the `?s=` fallback answers in ~15s.
+    val tAjax = SystemClock.elapsedRealtime()
+    var walled = false
+    val primary = if (skipAjax) {
+        walled = true
+        emptyList()
+    } else try {
+        faselHdAjaxSearch(query, base)
+    } catch (e: CfWalledException) {
+        walled = true
+        Log.d(FASELHD_TAG, "[search ] ajax walled for '$query', skipping to ?s=")
+        emptyList()
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[search ] ajax failed: ${e.message}")
+        emptyList()
+    }
+    if (primary.isNotEmpty()) {
+        Log.d(FASELHD_TAG, "[search ] ajax '$query' -> ${primary.size} candidates in ${SystemClock.elapsedRealtime() - tAjax}ms")
+        return primary
+    }
+    Log.d(FASELHD_TAG, "[search ] ajax '$query' empty in ${SystemClock.elapsedRealtime() - tAjax}ms")
+
+    // Same AJAX with leading article stripped ("The X" -> "X"), which the
+    // Arabic index often drops. Skipped when walled (see above).
+    val stripped = query.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
+    if (!walled && stripped.isNotBlank() && stripped != query) {
+        val tStripped = SystemClock.elapsedRealtime()
+        val retry = try {
+            faselHdAjaxSearch(stripped, base)
+        } catch (_: CfWalledException) {
+            walled = true
+            emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (retry.isNotEmpty()) {
+            Log.d(FASELHD_TAG, "[search ] ajax stripped '$stripped' -> ${retry.size} candidates in ${SystemClock.elapsedRealtime() - tStripped}ms")
+            return retry
+        }
+        Log.d(FASELHD_TAG, "[search ] ajax stripped '$stripped' empty in ${SystemClock.elapsedRealtime() - tStripped}ms")
+    }
+
+    // Fallback: classic `?s=` GET. WordPress 302-redirects straight to the
+    // post when there is a single hit — treat that as an exact hit instead
+    // of parsing list cards that aren't there (re-3arabi resp.url pattern).
+    Log.d(FASELHD_TAG, "[search ] ajax empty for '$query', trying ?s= fallback")
+    val tQs = SystemClock.elapsedRealtime()
+    try {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val searchUrl = "$base/?s=$encoded"
+        // The origin 502s under load: retry the single-hit redirect check
+        // once so a transient error doesn't read as "no redirect".
+        var finalUrl = searchUrl
+        for (attempt in 0..1) {
+            try {
+                val resp = app.get(searchUrl, timeout = 15000)
+                if (resp.code in 500..599) {
+                    Log.w(FASELHD_TAG, "[search ] ?s= HTTP ${resp.code} (attempt ${attempt + 1}/2)")
+                    if (attempt == 0) {
+                        delay(2000)
+                        continue
+                    }
+                }
+                finalUrl = resp.url
+                break
+            } catch (_: Exception) {
+                if (attempt == 0) {
+                    delay(2000)
+                    continue
+                }
+                break
+            }
+        }
+        if (!finalUrl.contains("?s=", ignoreCase = true) &&
+            finalUrl.trimEnd('/') != base.trimEnd('/')
+        ) {
+            Log.d(FASELHD_TAG, "[search ] redirect hit -> $finalUrl")
+            val slug = decodeSlug(finalUrl)
+            // latinTitle = query scores 100 in scoreCandidate: exact hit.
+            return listOf(Candidate(finalUrl, slug, query, yearFromSlug(slug)))
+        }
+        val items = faselHdParseCards(faselHdGet(searchUrl))
+        Log.d(FASELHD_TAG, "[search ] ?s= '$query' -> ${items.size} candidates in ${SystemClock.elapsedRealtime() - tQs}ms")
+        if (items.isNotEmpty()) return items
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[search ] ?s= fallback failed in ${SystemClock.elapsedRealtime() - tQs}ms: ${e.message}")
+    }
+
+    StreamlyDiag.lastStage = "FaselHD: search empty"
+    return emptyList()
+}
+
+
 // ---------------------------------------------------------------------------
 // Shared resolve helpers used by the remaining WebView-routed sources
 // (cleanServerName/hostOfUrl/emitResolvedVariants).
@@ -1497,6 +1845,403 @@ private suspend fun emitResolvedVariants(
 }
 
 
+
+
+/** Find the episode anchor on a series (or season) page that matches `episode`. */
+private fun faselHdExactEpisode(scope: Document, episode: Int): String? {
+    val anchors = scope.select("div#epAll a").takeIf { it.isNotEmpty() } ?: scope.select("a[href]")
+    for (a in anchors) {
+        val href = a.absUrl("href").ifEmpty { a.attr("href") }
+        if (!href.startsWith("http")) continue
+        val label = a.ownText().ifBlank { a.text() }
+        val ep = EPISODE_REGEX.find(label)?.groupValues?.get(1)?.toIntOrNull()
+            ?: EPISODE_REGEX.find(decodeSlug(href))?.groupValues?.get(1)?.toIntOrNull()
+            ?: continue
+        if (ep != episode) continue
+        return href
+    }
+    return null
+}
+
+/** Error/challenge pages parse to near-empty docs: no player iframe, no
+ *  download anchor, tiny body. A legit episode page always carries watch
+ *  servers, so a doc failing all three is a stale walled fetch, not content. */
+private fun isFaselHdWalled(doc: Document): Boolean {
+    if (isCfChallenge(doc.toString())) return true
+    if (doc.selectFirst("iframe") != null) return false
+    if (doc.selectFirst(".downloadLinks a") != null) return false
+    return doc.body().text().length < 3000
+}
+
+private suspend fun faselHdExtractServers(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    StreamlyCache.markEpisodeMatched("faselhd")
+    val base = faselHdBase()
+    val tPost = SystemClock.elapsedRealtime()
+    var doc = try {
+        // fastSolve: the episode post only needs clearance cookies for the
+        // OkHttp retry — skip the solver's 30s rendered-DOM wait (the
+        // challenge platform is DNS-blocked on this network, so settled DOM
+        // never arrives and the wait always burns the full timeout).
+        faselHdGet(postUrl, fastSolve = true)
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[watch  ] post page failed in ${SystemClock.elapsedRealtime() - tPost}ms: ${e.message}")
+        return false
+    }
+    Log.d(FASELHD_TAG, "[watch  ] post page in ${SystemClock.elapsedRealtime() - tPost}ms")
+    if (isFaselHdWalled(doc)) {
+        // Post-solve retries can throw and leave cfGetDoc's stale walled
+        // document behind (429 page: no player, no embeds). Clearance cookies
+        // are fresh now, so one refetch usually passes — bounded by the same
+        // timeouts, and the solve itself is milliseconds when re-walled.
+        Log.d(FASELHD_TAG, "[watch  ] walled/empty page (${doc.body().text().length} chars), refetching once")
+        doc = try {
+            faselHdGet(postUrl, fastSolve = true)
+        } catch (e: Exception) {
+            Log.e(FASELHD_TAG, "[watch  ] refetch failed: ${e.message}")
+            return false
+        }
+    }
+    var found = false
+
+    // Direct download path runs LAST (see below): the locker POST's blocking
+    // I/O ignores coroutine cancellation, so it must not starve the iframe
+    // passes that actually carry the links.
+
+    // Player iframes: WebView jwplayer decryption (enc: sources) + m3u8 sniff
+    // first — the fast inline scan never hits on encrypted embeds (v7 capture:
+    // 3 misses costing ~3.6s before the WebView even started), so it lives on
+    // as a fallback. Hosts are logged without tokens for CDN comparison.
+    val tWatch = SystemClock.elapsedRealtime()
+    val iframes = extractIframeSources(doc, base)
+    val iframeHosts = iframes.map { hostOfUrl(it) }
+    Log.d(FASELHD_TAG, "[watch  ] ${iframes.size} iframes hosts=$iframeHosts on $postUrl")
+    if (iframes.isEmpty()) StreamlyDiag.lastStage = "FaselHD: 0 iframes"
+    var resolved = false
+    val resolvedIdx = HashSet<Int>()
+    // Pass 1: WebView resolve (handles enc: payloads). Every watch server
+    // (سيرفر المشاهدة #01/#02 → distinct player_tokens) is resolved on its
+    // own and emitted with its server label — no early break. Servers resolve
+    // concurrently (independent hidden WebViews): wall time is the slowest
+    // server, not the sum.
+    val pass1Hits: Set<Int> = coroutineScope {
+        iframes.withIndex().map { (idx, iframe) ->
+            async {
+                val t0 = SystemClock.elapsedRealtime()
+                val m3u8 = sharedWebViewResolve(iframe, postUrl)
+                if (!m3u8.isNullOrBlank()) {
+                    Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${hostOfUrl(iframe)} webview HIT in ${SystemClock.elapsedRealtime() - t0}ms")
+                    emitResolvedVariants(m3u8, iframe, base, callback, "FaselHD [Server ${idx + 1}]")
+                    idx
+                } else {
+                    // Probe the token page size: a dead/rotated token serves a tiny
+                    // or challenge page, a live-but-undecrypted player serves ~10k+.
+                    val probe = runCatching { cfGetText(iframe, referer = postUrl, timeout = 15000) }.getOrNull()
+                    Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${hostOfUrl(iframe)} webview miss in ${SystemClock.elapsedRealtime() - t0}ms playerPage=${probe?.length ?: -1}")
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull().toSet()
+    }
+    if (pass1Hits.isNotEmpty()) {
+        found = true
+        resolved = true
+        resolvedIdx.addAll(pass1Hits)
+    }
+    // Pass 2 (fallback): cheap inline scan for the servers the WebView
+    // missed (non-encrypted embeds). Also reports enc: presence: the decryptor keys
+    // are already ported into the WebView strategy JS, so a static enc: blob
+    // here would mean the WebView (~10s) can be replaced with plain HTTP.
+    for ((idx, iframe) in iframes.withIndex()) {
+        if (idx in resolvedIdx) continue
+        val t0 = SystemClock.elapsedRealtime()
+        val scanned = try {
+            cfGetText(iframe, referer = postUrl, timeout = 15000)
+                .replace(Regex("""['"]\s*\+\s*['"]"""), "")
+        } catch (_: Exception) {
+            ""
+        }
+        val encCount = Regex("""enc:""").findAll(scanned).count()
+        val fastM3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(scanned)?.value
+        if (!fastM3u8.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${hostOfUrl(iframe)} fast-scan HIT enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+            found = true
+            resolved = true
+            emitResolvedVariants(fastM3u8, iframe, base, callback, "FaselHD [Server ${idx + 1}]")
+            continue
+        }
+        val fastMp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(scanned)?.value
+        if (!fastMp4.isNullOrBlank()) {
+            Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${hostOfUrl(iframe)} fast-scan MP4 enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+            found = true
+            resolved = true
+            callback(
+                newExtractorLink("FaselHD [Server ${idx + 1} MP4]", "FaselHD [Server ${idx + 1} MP4]", fastMp4) {
+                    this.referer = iframe
+                    this.quality = getQualityFromName(fastMp4)
+                    this.type = ExtractorLinkType.VIDEO
+                },
+            )
+            continue
+        }
+        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} ${hostOfUrl(iframe)} fast-scan miss enc=$encCount in ${SystemClock.elapsedRealtime() - t0}ms")
+    }
+    // Servers neither pass resolved still go through the shared extractor
+    // registry — their token/player URL may match a known host there.
+    for ((idx, iframe) in iframes.withIndex()) {
+        if (idx in resolvedIdx) continue
+        Log.d(FASELHD_TAG, "[watch  ] iframe $idx/${iframes.size} unresolved, routing via EmbedRouter")
+        EmbedRouter.route(iframe, postUrl, subtitleCallback, callback, "FaselHD [Server ${idx + 1}]")
+        found = true
+    }
+    Log.d(FASELHD_TAG, "[watch  ] resolve done in ${SystemClock.elapsedRealtime() - tWatch}ms resolved=$resolved")
+
+    // Fallback: the older inline-scan path for non-encrypted embeds.
+    if (!resolved) {
+        if (iframes.isNotEmpty()) StreamlyDiag.lastStage = "FaselHD: webview no m3u8"
+
+        val iframeSrc = doc.select("iframe[name=\"player_iframe\"], iframe[src*=\"video_player\"]")
+            .attr("src")
+            .ifEmpty {
+                val onclick = doc.selectFirst("ul.tabs-ul li[onclick], li.active[onclick]")?.attr("onclick")
+                Regex("""'([^']+)'""").find(onclick ?: "")?.groupValues?.get(1)?.let {
+                    if (it.startsWith("http")) it else "$base$it"
+                } ?: ""
+            }
+        if (iframeSrc.isNotBlank()) {
+            EmbedRouter.route(iframeSrc, postUrl, subtitleCallback, callback, "FaselHD")
+            found = true
+            try {
+                val playerText = cfGetText(
+                    iframeSrc,
+                    referer = postUrl,
+                    timeout = 20000,
+                ).replace(Regex("""['"]\s*\+\s*['"]"""), "")
+                val m3u8 = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""").find(playerText)?.value
+                if (!m3u8.isNullOrBlank()) {
+                    found = true
+                    emitResolvedVariants(m3u8, iframeSrc, base, callback, "FaselHD")
+                } else {
+                    val mp4 = Regex("""https?://[^\s"'\\]+\.mp4[^\s"'\\]*""").find(playerText)?.value
+                    if (!mp4.isNullOrBlank()) {
+                        found = true
+                        callback(
+                            newExtractorLink("FaselHD [MP4]", "FaselHD [MP4]", mp4) {
+                                this.referer = iframeSrc
+                                this.quality = getQualityFromName(mp4)
+                                this.type = ExtractorLinkType.VIDEO
+                            },
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(FASELHD_TAG, "[scan   ] failed: ${e.message}")
+            }
+        }
+    }
+
+    // Direct download path, LAST by design: .downloadLinks a -> POST ->
+    // .dl-link a (final video). The href is often relative — absolutize it
+    // or the POST below throws. Runs after the iframe passes because the
+    // locker POST's blocking I/O ignores coroutine cancellation:
+    // withTimeout(6s) measured 50.3s on a dead locker (Blacklist S1E13 v76
+    // run), starving the passes that carry the links. The inner timeout is
+    // 6s so even a stuck POST bounds itself without relying on cancellation.
+    // Skipped outright when the passes above already emitted: the ~34s locker
+    // grind buys nothing then and only delays invoke's return (and stats).
+    if (!found) {
+    val downloadAnchor = doc.selectFirst(".downloadLinks a")
+    var downloadHref = ""
+    if (downloadAnchor != null) {
+        val raw = downloadAnchor.absUrl("href").ifEmpty { downloadAnchor.attr("href") }
+        if (raw.isNotBlank()) downloadHref = fixUrl(raw, base)
+    }
+    if (downloadHref.isNotBlank()) {
+        val tDl = SystemClock.elapsedRealtime()
+        try {
+            val playerDoc = withTimeout(6_000) {
+                cfPostDoc(downloadHref, referer = postUrl, timeout = 6000)
+            }
+            val dlLink = playerDoc.select("div.dl-link a").attr("href")
+            if (dlLink.isNotBlank()) {
+                found = true
+                callback(
+                    newExtractorLink("FaselHD [Direct]", "FaselHD [Direct]", dlLink) {
+                        this.referer = postUrl
+                        this.quality = getQualityFromName(dlLink)
+                        this.type = ExtractorLinkType.VIDEO
+                    },
+                )
+            }
+            Log.d(FASELHD_TAG, "[direct ] done in ${SystemClock.elapsedRealtime() - tDl}ms hit=${dlLink.isNotBlank()}")
+        } catch (e: Exception) {
+            Log.w(FASELHD_TAG, "[direct ] capped/failed in ${SystemClock.elapsedRealtime() - tDl}ms: ${e.message}")
+        }
+    }
+    } else {
+        Log.d(FASELHD_TAG, "[direct ] skipped, rows already emitted")
+    }
+
+    return found
+}
+
+/**
+ * Last-resort FaselHD pick when nothing clears the fuzzy threshold: accept
+ * the best-scored candidate whose slug tokens contain every significant
+ * query token (e.g. "Moana" in "1-film-moana-2-2024-..."), with years within
+ * ±3 when both are known. The AJAX endpoint already matched these server-side,
+ * so token containment is a safe tie-break, not a blind guess.
+ */
+private fun faselHdContainmentPick(
+    scored: List<Pair<Candidate, Int>>,
+    title: String,
+    year: Int?,
+): Candidate? {
+    val queryTokens = title.lowercase().replace('-', ' ')
+        .split(Regex("\\s+")).filter { it.length > 2 }
+    if (queryTokens.isEmpty()) return null
+    return scored
+        .filter { (c, _) ->
+            val tokens = c.latinTitle.lowercase().replace('-', ' ')
+                .split(Regex("\\s+")).toSet()
+            queryTokens.all { q -> tokens.any { t -> t.contains(q) || q.contains(t) } } &&
+                (year == null || c.year == null || Math.abs(c.year - year) <= 3)
+        }
+        .maxByOrNull { it.second }?.first
+}
+
+private suspend fun faselHdResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val all = faselHdSearch(title)
+        .map { it to scoreCandidate(it, title, year) }
+    all.sortedByDescending { it.second }.forEach { (c, s) ->
+        Log.d(FASELHD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
+    }
+    val candidates = all.filter { it.second >= MIN_SCORE_MOVIE }
+
+    val strippedTitle = title.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
+    val best = candidates.maxByOrNull { it.second }?.first
+        ?: if (strippedTitle.isNotBlank() && strippedTitle != title) {
+            Log.d(FASELHD_TAG, "[search ] retry movie with stripped title '$strippedTitle'")
+            faselHdSearch(strippedTitle)
+                .map { it to scoreCandidate(it, title, year) }
+                .filter { it.second >= MIN_SCORE_MOVIE }
+                .maxByOrNull { it.second }?.first
+        } else null
+        ?: faselHdContainmentPick(all, title, year)?.also {
+            Log.d(FASELHD_TAG, "[match  ] CONTAINMENT fallback ${it.url}")
+        }
+    if (best == null) {
+        Log.d(FASELHD_TAG, "[match  ] no movie above $MIN_SCORE_MOVIE")
+        return false
+    }
+    Log.d(FASELHD_TAG, "[match  ] WINNER ${best.url}")
+    return faselHdExtractServers(best.url, subtitleCallback, callback)
+}
+
+private suspend fun faselHdResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val allSeries = faselHdSearch(title)
+        .map { it to scoreCandidate(it, title, year) }
+    allSeries.sortedByDescending { it.second }.forEach { (c, s) ->
+        Log.d(FASELHD_TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year} url=${c.url}")
+    }
+    val candidates = allSeries.filter { it.second >= MIN_SCORE_SERIES }
+
+    // Retry with stripped leading article ("The Mentalist" -> "Mentalist") when
+    // the initial search returns results but none score above the threshold.
+    // FaselHD often indexes Arabic slugs without Latin title parts, so the
+    // primary search yields candidates with near-empty latinTitle fields.
+    val strippedTitle = title.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
+    val best = candidates.maxByOrNull { it.second }?.first
+        ?: if (strippedTitle.isNotBlank() && strippedTitle != title) {
+            Log.d(FASELHD_TAG, "[search ] retry with stripped title '$strippedTitle'")
+            faselHdSearch(strippedTitle)
+                .map { it to scoreCandidate(it, title, year) }
+                .filter { it.second >= MIN_SCORE_SERIES }
+                .maxByOrNull { it.second }?.first
+        } else null
+        ?: faselHdContainmentPick(allSeries, title, year)?.also {
+            Log.d(FASELHD_TAG, "[match  ] CONTAINMENT fallback ${it.url}")
+        }
+    if (best == null) {
+        Log.d(FASELHD_TAG, "[match  ] no series above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(FASELHD_TAG, "[match  ] anchor ${best.url}")
+    StreamlyCache.markEpisodeMatched("faselhd")
+
+    val doc = try {
+        faselHdGet(best.url)
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[anchor ] failed: ${e.message}")
+        return false
+    }
+
+    // Multi-season: season tabs carry window.location.href to per-season pages.
+    val seasonCards = doc.select("div.seasonDiv")
+    Log.d(FASELHD_TAG, "[anchor ] seasonCards=${seasonCards.size}")
+    val seasonDoc = if (seasonCards.isNotEmpty()) {
+        val re = Regex("""window\.location\.href\s*=\s*['"]([^'"]+)['"]""")
+        val seasonHref = seasonCards.mapNotNull { re.find(it.attr("onclick"))?.groupValues?.get(1) }
+            .getOrNull(season - 1)
+        val seasonUrl = seasonHref?.let { if (it.startsWith("http")) it else "${faselHdBase()}$it" }
+        if (seasonUrl != null) try {
+            faselHdGet(seasonUrl)
+        } catch (_: Exception) {
+            doc
+        } else doc
+    } else doc
+
+    val epUrl = faselHdExactEpisode(seasonDoc, episode) ?: run {
+        Log.d(FASELHD_TAG, "[match  ] E$episode not found in page")
+        return false
+    }
+    Log.d(FASELHD_TAG, "[match  ] E$episode -> $epUrl")
+    return faselHdExtractServers(epUrl, subtitleCallback, callback)
+}
+
+suspend fun invokeFaselHd(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(FASELHD_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "FaselHD: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    return try {
+        val ok = if (res.isMovie) {
+            faselHdResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            faselHdResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(FASELHD_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "FaselHD: ok" else "FaselHD: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(FASELHD_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "FaselHD: ${e.message}"
+        emitted > 0
+    }
+}
 
 
 // ---------------------------------------------------------------------------

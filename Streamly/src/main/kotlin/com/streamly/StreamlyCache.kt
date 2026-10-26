@@ -92,6 +92,7 @@ object StreamlyCache {
     /** Sensible cold-start order before any stats exist. */
     private val BASE_PRIORITY = mapOf(
         "topcinema" to 3f,
+        "faselhd" to 1f,
         "egydead" to 1f,
         "akwam" to 1f,
         "egywatch" to 1f,
