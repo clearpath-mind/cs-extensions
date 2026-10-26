@@ -2128,13 +2128,13 @@ private suspend fun faselHdResolveMovie(
 
     val strippedTitle = title.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
     val best = candidates.maxByOrNull { it.second }?.first
-        ?: if (strippedTitle.isNotBlank() && strippedTitle != title) {
+        ?: (if (strippedTitle.isNotBlank() && strippedTitle != title) {
             Log.d(FASELHD_TAG, "[search ] retry movie with stripped title '$strippedTitle'")
             faselHdSearch(strippedTitle)
                 .map { it to scoreCandidate(it, title, year) }
                 .filter { it.second >= MIN_SCORE_MOVIE }
                 .maxByOrNull { it.second }?.first
-        } else null
+        } else null)
         ?: faselHdContainmentPick(all, title, year)?.also {
             Log.d(FASELHD_TAG, "[match  ] CONTAINMENT fallback ${it.url}")
         }
@@ -2167,13 +2167,13 @@ private suspend fun faselHdResolveEpisode(
     // primary search yields candidates with near-empty latinTitle fields.
     val strippedTitle = title.replace(Regex("^(the|a|an)\\s+", RegexOption.IGNORE_CASE), "").trim()
     val best = candidates.maxByOrNull { it.second }?.first
-        ?: if (strippedTitle.isNotBlank() && strippedTitle != title) {
+        ?: (if (strippedTitle.isNotBlank() && strippedTitle != title) {
             Log.d(FASELHD_TAG, "[search ] retry with stripped title '$strippedTitle'")
             faselHdSearch(strippedTitle)
                 .map { it to scoreCandidate(it, title, year) }
                 .filter { it.second >= MIN_SCORE_SERIES }
                 .maxByOrNull { it.second }?.first
-        } else null
+        } else null)
         ?: faselHdContainmentPick(allSeries, title, year)?.also {
             Log.d(FASELHD_TAG, "[match  ] CONTAINMENT fallback ${it.url}")
         }
