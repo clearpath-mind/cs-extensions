@@ -179,9 +179,9 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
         int("year") ?: str("release_date")?.take(4)?.toIntOrNull()
 
     private fun serverLabel(url: String): String {
-        val host = hostOf(url) ?: return "سيرفر"
+        val host = hostOf(url) ?: return "Server"
         val clean = host.removePrefix("www.").removePrefix("s1.")
-        return "سيرفر ${clean.substringBefore('.')}"
+        return "Server ${clean.substringBefore('.')}"
     }
 
     /**
@@ -544,7 +544,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
         Regex("""(https?://video-downloads[^"\\\s]+)""").find(page)?.groupValues?.get(1)?.let { dl ->
             callback(
                 newExtractorLink(
-                    source = "CimaCloud", name = "سيرفر Google (تنزيل)", url = dl,
+                    source = "CimaCloud", name = "Google (Download)", url = dl,
                     type = ExtractorLinkType.VIDEO,
                 ) {
                     this.referer = "https://photos.google.com"
@@ -561,7 +561,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
         Regex("""data-url=\\?"([^"\\]+)""").find(page)?.groupValues?.get(1)?.let { dataUrl ->
             callback(
                 newExtractorLink(
-                    source = "CimaCloud", name = "سيرفر Google Photos", url = dataUrl + MPD_SUFFIX,
+                    source = "CimaCloud", name = "Google Photos", url = dataUrl + MPD_SUFFIX,
                     type = ExtractorLinkType.DASH,
                 ) {
                     this.referer = "https://photos.google.com"
@@ -604,7 +604,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
 
                 clean.endsWith(".mp4") -> {
                     callback(
-                        newExtractorLink(source = "CimaCloud", name = "سيرفر Worker", url = u, type = ExtractorLinkType.VIDEO) {
+                        newExtractorLink(source = "CimaCloud", name = "Worker", url = u, type = ExtractorLinkType.VIDEO) {
                             this.headers = mapOf("User-Agent" to UA_CHROME)
                         },
                     )
@@ -613,7 +613,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
 
                 clean.endsWith(".m3u8") -> {
                     callback(
-                        newExtractorLink(source = "CimaCloud", name = "سيرفر Worker", url = u, type = ExtractorLinkType.M3U8) {
+                        newExtractorLink(source = "CimaCloud", name = "Worker", url = u, type = ExtractorLinkType.M3U8) {
                             this.headers = mapOf("User-Agent" to UA_CHROME)
                         },
                     )
@@ -654,7 +654,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
         var found = false
         for (srv in servers) {
             val url = srv.str("url")?.takeIf { it.startsWith("http") } ?: continue
-            val label = srv.str("name")?.trim()?.takeIf { it.isNotBlank() } ?: "سيرفر"
+            val label = srv.str("name")?.trim()?.takeIf { it.isNotBlank() } ?: "Server"
             val referer = srv.str("referer")
             val origin = srv.str("origin")
             val clean = url.substringBefore("?").lowercase()

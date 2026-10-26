@@ -519,7 +519,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
         val link = src.optString("url").trim()
         if (link.isEmpty()) return
         // `src.title` is the stream type (m3u8/webm/mov/embed), not the server; use the embed host.
-        val label = hostLabelOf(link) ?: src.optString("title").ifBlank { "سيرفر" }
+        val label = hostLabelOf(link) ?: src.optString("title").ifBlank { "Server" }
         if (isDirect(link)) {
             val type = if (link.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(
