@@ -300,7 +300,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
 
     // ---------------------------------------------------------------- search
 
-    suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
         val out = mutableListOf<SearchResponse>()
         try {
             val text = app.get(api("search/${enc(query)}/0"), headers = headers).text.trim()
@@ -324,7 +324,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
 
     // ---------------------------------------------------------------- load
 
-    suspend fun load(url: String): LoadResponse {
+    override suspend fun load(url: String): LoadResponse {
         val id = url.trimEnd('/').substringAfterLast('/').takeWhile { it.isDigit() }
         val isSerie = url.contains("/serie/")
         val isChannel = url.contains("/channel/")
@@ -404,7 +404,7 @@ class DramaWorldSource : com.lagradost.cloudstream3.MainAPI() {
 
     // ---------------------------------------------------------------- links
 
-    suspend fun loadLinks(
+    override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,

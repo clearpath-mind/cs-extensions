@@ -370,7 +370,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
 
     // ================================================================ search
 
-    suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
         val out = mutableListOf<SearchResponse>()
         var page = 1
         while (page <= 5) {
@@ -396,7 +396,7 @@ class CimaCloudSource : com.lagradost.cloudstream3.MainAPI() {
 
     // ================================================================ loadLinks
 
-    suspend fun loadLinks(
+    override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
