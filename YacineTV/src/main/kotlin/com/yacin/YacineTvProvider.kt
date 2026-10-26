@@ -64,6 +64,7 @@ class YacineTvProvider : MainAPI() {
         @JsonProperty("logo1") val logo1: String? = null,
         @JsonProperty("logo2") val logo2: String? = null,
         @JsonProperty("related") val related: List<LinkData>? = null,
+        @JsonProperty("logo") val logo: String? = null,
     )
 
     data class YacineEventResponse(
@@ -618,7 +619,7 @@ class YacineTvProvider : MainAPI() {
                 ?.let { (_, chs) ->
                     val channelItems = chs.mapNotNull { ch ->
                         val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                        val data = LinkData(kind = "channel", name = nm).toJson()
+                        val data = LinkData(kind = "channel", name = nm, logo = ch.logo).toJson()
                         newLiveSearchResponse(nm, data, TvType.Live) {
                             ch.logo?.takeIf { it.isNotBlank() }?.let { this.posterUrl = it }
                         }
@@ -719,7 +720,7 @@ class YacineTvProvider : MainAPI() {
         for (ch in channelCandidates) {
             val nm = ch.name?.trim()?.takeIf { it.isNotBlank() } ?: continue
             if (!seenNames.add(norm(nm))) continue
-            val data = LinkData(kind = "channel", name = nm).toJson()
+            val data = LinkData(kind = "channel", name = nm, logo = ch.logo).toJson()
             results.add(
                 newLiveSearchResponse(nm, data, TvType.Live) {
                     ch.logo?.takeIf { it.isNotBlank() }?.let { this.posterUrl = it }
@@ -734,7 +735,12 @@ class YacineTvProvider : MainAPI() {
         val data = parseJson<LinkData>(url)
         if (data.kind == "channel") {
             val nm = data.name?.takeIf { it.isNotBlank() } ?: "Channel"
-            return newLiveStreamLoadResponse(name = nm, url = url, dataUrl = url) {}
+            return newLiveStreamLoadResponse(name = nm, url = url, dataUrl = url) {
+                data.logo?.takeIf { it.isNotBlank() }?.let {
+                    this.posterUrl = it
+                    this.backgroundPosterUrl = it
+                }
+            }
         }
         // Cricify-style plot (emoji fields) from the baked event data.
         // Lines join with <br><br>: the app renders plot via setTextHtml,
