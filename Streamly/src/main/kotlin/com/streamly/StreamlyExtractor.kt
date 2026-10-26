@@ -517,6 +517,1448 @@ object MegaMaxExtractor {
         }
     }
 }
+
+private const val TOPCINEMA_MAIN_URL = "https://web8.topcinema.cam"
+private const val TOPCINEMA_AJAX_SERVER =
+    "$TOPCINEMA_MAIN_URL/wp-content/themes/movies2023/Ajaxat/Single/Server.php"
+private const val TAG = "TopCinema"
+
+/** TopCinema rotates mirrors; resolve the live origin once and reuse it. */
+private suspend fun topcinemaBase(): String = resolveOrigin(TOPCINEMA_MAIN_URL)
+
+private const val MIN_SCORE_MOVIE = 65
+private const val MIN_SCORE_SERIES = 60
+private const val YEAR_PENALTY = 30
+
+private data class Candidate(
+    val url: String,
+    val slug: String,
+    val latinTitle: String,
+    val year: Int?,
+    val isDub: Boolean = false,
+    /** Series signal from card/URL: true/false when known, null when unknown. */
+    val isSeries: Boolean? = null,
+)
+
+private val EPISODE_REGEX = Regex("""الحلقة[-\s]*(\d+)""")
+private val SEASON_DIGIT_REGEX = Regex("""(?:الموسم|موسم)[-\s]*(\d+)""")
+private val LATIN_REGEX = Regex("""[a-zA-Z][a-zA-Z0-9'&.:\-]*|[0-9]+""")
+private val YEAR_REGEX = Regex("""(19|20)\d{2}""")
+
+// ---------------------------------------------------------------------------
+// Shared CloudFlare-aware network layer
+//
+// Several sources sit behind Cloudflare's "Verify you are human" challenge.
+// CloudStream's built-in CloudflareKiller cannot always clear it, so when we
+// detect a challenge page we fall back to a WebView-based solver
+// (CloudflareSolver) that simulates the press-and-hold, stores the resulting
+// cf_clearance cookie, and lets subsequent same-origin requests pass. The
+// solver needs the foreground Activity, which StreamlyProvider / the settings
+// fragment publish here before invoking any provider.
+// ---------------------------------------------------------------------------
+
+object StreamlyRuntime {
+    var context: Context? = null
+}
+
+/** Shared diagnostic channel surfaced by the per-source Test UI. */
+object StreamlyDiag {
+    var lastStage: String = ""
+}
+
+/** One lock per host: solves on different sites proceed in parallel while
+ *  same-host solves still serialize (CF rate-limits per host). Previously a
+ *  single global lock queued MyCima behind EgyDead and vice versa. */
+private val cfHostLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+
+private fun cfLockFor(url: String): Mutex {
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("global")
+    return cfHostLocks.getOrPut(host) { Mutex() }
+}
+
+/** CloudflareKiller interceptor: native CF bypass, much faster than WebView solver. */
+private val cloudflareKiller by lazy { CloudflareKiller() }
+
+/** Per-provider CF timeout overrides: heavily CF-protected sites need more room. */
+private fun cfSolverTimeoutFor(url: String): Long {
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("") ?: ""
+    return when {
+        "egydead" in host -> 30000L // EgyDead aggressively 403s datacenter traffic
+        else -> 15000L              // Default: lightly CF-protected sites
+    }
+}
+
+/** Per-provider retry delay: rate-limited sites need more time between attempts. */
+private fun cfRetryDelayFor(url: String): Long {
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrDefault("") ?: ""
+    return when {
+        "egydead" in host -> 1000L // EgyDead rate-limits aggressively
+        else -> 500L               // Default: light delay
+    }
+}
+internal const val CF_UA =
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+/** Real device WebView UA (upstream WebViewResolver: "setting user agent will
+ *  make cloudflare break" — a stale hardcoded Chrome scores as a bot). Fetched
+ *  once on the UI thread; CF_UA stays as fallback until it lands. */
+@Volatile
+private var realUa: String? = null
+
+internal fun effectiveUa(): String = realUa ?: CF_UA
+
+internal fun refreshRealUa() {
+    if (realUa != null) return
+    val ctx = StreamlyRuntime.context ?: return
+    runCatching {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            runCatching {
+                val wv = android.webkit.WebView(ctx)
+                realUa = wv.settings.userAgentString?.takeIf { it.isNotBlank() }
+                runCatching { wv.destroy() }
+                Log.d(TAG, "[cf     ] real WebView UA: $realUa")
+            }
+        }
+    }
+}
+
+/** HTTP codes that mean Cloudflare / rate-limit wall (re-3arabi httpGet pattern). */
+private val CF_BLOCK_CODES = listOf(403, 503, 429)
+
+private fun cfCookies(url: String): String =
+    runCatching { CookieManager.getInstance().getCookie(url).orEmpty() }.getOrDefault("")
+
+private fun isCfChallenge(text: String): Boolean =
+    text.contains("just a moment", ignoreCase = true) ||
+        text.contains("checking your browser", ignoreCase = true) ||
+        text.contains("verify you are human", ignoreCase = true) ||
+        text.contains("verifying you are human", ignoreCase = true) ||
+        text.contains("i'm not a robot", ignoreCase = true) ||
+        text.contains("challenge-platform", ignoreCase = true) ||
+        text.contains("cf-chl", ignoreCase = true) ||
+        text.contains("turnstile", ignoreCase = true)
+
+/** Solve a CloudFlare challenge via the WebView solver, sharing one lock so
+ *  only a single solve runs at a time. Cookies land in the shared
+ *  CookieManager; callers retry with them (re-3arabi httpGet pattern). */
+private suspend fun cfSolve(url: String, awaitContent: Boolean = true, timeoutMs: Long = 15000): SolverResult? {
+    val activity = StreamlyRuntime.context as? Activity
+    if (activity == null) {
+        Log.w(TAG, "[cf     ] no Activity context available, skipping WebView solver for $url")
+        return null
+    }
+    refreshRealUa()
+    return cfLockFor(url).withLock { CloudflareSolver.solve(activity, url, effectiveUa(), awaitContent, timeoutMs) }
+}
+
+/** OkHttp rejects non-ASCII header values: Arabic slugs (Akwam episode
+ *  URLs like /episode/9131/.../الحلقة-1) crash as Referer with
+ *  `IllegalArgumentException: Unexpected char 0x627`. Percent-encode
+ *  non-ASCII/control/space chars as UTF-8, preserving existing %XX. */
+private fun safeReferer(referer: String?): String? {
+    if (referer == null) return null
+    val sb = StringBuilder(referer.length)
+    var i = 0
+    while (i < referer.length) {
+        val c = referer[i]
+        val code = c.code
+        if (code in 0x21..0x7E) {
+            sb.append(c)
+        } else if (c == ' ' || c == '\t') {
+            sb.append("%20")
+        } else {
+            // Non-ASCII: encode the full code point (handles surrogate pairs).
+            val cp = referer.codePointAt(i)
+            if (Character.isSupplementaryCodePoint(cp)) i++
+            for (b in String(Character.toChars(cp)).toByteArray(Charsets.UTF_8)) {
+                sb.append('%')
+                sb.append("0123456789ABCDEF"[(b.toInt() shr 4) and 0xF])
+                sb.append("0123456789ABCDEF"[b.toInt() and 0xF])
+            }
+        }
+        i++
+    }
+    return sb.toString()
+}
+
+private fun cfHeaders(
+    url: String,
+    referer: String?,
+    extra: Map<String, String>,
+): MutableMap<String, String> = extra.toMutableMap().apply {
+    putIfAbsent("User-Agent", effectiveUa())
+    // Full browser header set (re-3arabi MyCima pattern): Cloudflare bot
+    // score penalizes missing Accept/Accept-Language, so a bare OkHttp
+    // retry keeps failing the challenge even with a valid cf_clearance
+    // while the WebView (which sends these) passes.
+    putIfAbsent("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+    putIfAbsent("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+    putIfAbsent("Upgrade-Insecure-Requests", "1")
+    // Client-hint + fetch-metadata headers (ported from re-3arabi):
+    // CF bot score weighs their presence heavily.
+    // Values mirror a modern Android Chrome.
+    putIfAbsent("sec-ch-ua", "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")
+    putIfAbsent("sec-ch-ua-mobile", "?1")
+    putIfAbsent("sec-ch-ua-platform", "\"Android\"")
+    putIfAbsent("sec-fetch-site", "none")
+    putIfAbsent("sec-fetch-mode", "navigate")
+    putIfAbsent("sec-fetch-dest", "document")
+    putIfAbsent("priority", "u=0, i")
+    putIfAbsent("Cache-Control", "no-cache")
+    putIfAbsent("Pragma", "no-cache")
+    val c = cfCookies(url)
+    if (c.isNotBlank()) putIfAbsent("Cookie", c)
+    if (referer != null) put("Referer", safeReferer(referer) ?: referer)
+}
+
+/** Post-solve retry bound: with fresh clearance a healthy origin answers
+ *  HTML in seconds — a longer hang is a rate-limit tarpit (a walled host held
+ *  the retry the full 30s on Blacklist S1E13, then threw), not worth waiting
+ *  out when a bounded refetch can try again instead. */
+private fun cfRetryTimeout(timeout: Long): Long = maxOf(timeout, 12000)
+
+/** Use the solver's rendered DOM when it solved this exact page (avoids a
+ *  redundant OkHttp round-trip whose bridged clearance CF may reject). */
+private fun takeSolverHtml(solved: SolverResult, url: String): String? {
+    val html = solved.html
+    if (html.isNullOrBlank() || isCfChallenge(html)) return null
+    // Captured too early (cookie set before real navigation) the DOM is an
+    // empty shell — never accept it, fall through to the refetch instead.
+    if (html.length < 500) {
+        Log.d(TAG, "[cfGet  ] solved DOM trivial (${html.length} chars), refetching")
+        return null
+    }
+    val same = runCatching {
+        val a = java.net.URI(solved.finalUrl)
+        val b = java.net.URI(url)
+        a.host.equals(b.host, ignoreCase = true) && (a.path ?: "") == (b.path ?: "")
+    }.getOrDefault(false)
+    if (!same) {
+        Log.d(TAG, "[cfGet  ] solved page differs ($url vs ${solved.finalUrl}), refetching")
+        return null
+    }
+    return html
+}
+
+/** Hosts drift across solves (CF redirect chains land the solver on a live
+ *  mirror); clearance cookies are host-scoped, so retrying at the stale
+ *  origin goes out naked and hits the wall again (re-3arabi DOMAIN-UPDATE
+ *  pattern). Remember working hosts per process and retry where solved. */
+private val cfHostOverride = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+private fun applyHostOverride(url: String): String {
+    val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull() ?: return url
+    val better = cfHostOverride[host] ?: return url
+    if (better.equals(host, ignoreCase = true)) return url
+    return runCatching {
+        val u = java.net.URI(url)
+        java.net.URI(u.scheme, u.userInfo, better, u.port, u.path, u.query, u.fragment).toString()
+    }.getOrDefault(url)
+}
+
+/** Retry target after a solve: same path/query on the solver's landing host
+ *  when it moved, remembering the move for later calls. */
+private fun solvedRetryUrl(solved: SolverResult, url: String): String {
+    val newHost = runCatching { java.net.URI(solved.finalUrl).host }.getOrNull()
+    val oldHost = runCatching { java.net.URI(url).host }.getOrNull()
+    if (newHost.isNullOrBlank() || oldHost.isNullOrBlank() || newHost.equals(oldHost, ignoreCase = true)) return url
+    runCatching { cfHostOverride[oldHost.lowercase()] = newHost }
+    Log.d(TAG, "[cfGet  ] solver moved $oldHost -> $newHost, retrying there")
+    return runCatching {
+        val u = java.net.URI(url)
+        java.net.URI(u.scheme, u.userInfo, newHost, u.port, u.path, u.query, u.fragment).toString()
+    }.getOrDefault(url)
+}
+
+private suspend fun cfGetDoc(
+    url: String,
+    referer: String? = null,
+    headers: Map<String, String> = emptyMap(),
+    timeout: Long = 15000,
+    awaitContent: Boolean = true,
+): Document {
+    val target = applyHostOverride(url)
+    val ref = safeReferer(referer)
+    val solverTimeout = cfSolverTimeoutFor(target)
+    val retryDelay = cfRetryDelayFor(target)
+    val first = runCatching {
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+    }.getOrNull()
+    if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.document.toString())) {
+        return first.document
+    }
+    // Stage 2 (re-3arabi smartGet): one silent plain retry before burning a
+    // WebView solve — CF sometimes passes the second hit, or a parallel
+    // provider cleared the wall while we worked.
+    delay(retryDelay)
+    runCatching {
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+    }.getOrNull()?.let { pre ->
+        if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.document.toString())) {
+            Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
+            return pre.document
+        }
+    }
+    Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
+    val solved = cfSolve(target, awaitContent = false, timeoutMs = solverTimeout)
+    val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
+    if (solved != null) {
+        takeSolverHtml(solved, retryUrl)?.let { html ->
+            Log.d(TAG, "[cfGet  ] solved-page DOM for $retryUrl (${html.length} chars)")
+            return Jsoup.parse(html, retryUrl)
+        }
+    } else if (first != null) {
+        return first.document
+    }
+    val ck = cfCookies(retryUrl)
+    var retryErr: String? = null
+    val second = runCatching {
+        app.get(retryUrl, referer = ref, headers = cfHeaders(retryUrl, ref, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+    }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${second?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.document?.toString()?.let { isCfChallenge(it) }} err=$retryErr")
+    return second?.document ?: first?.document ?: Jsoup.parse("", retryUrl)
+}
+
+private suspend fun cfGetText(
+    url: String,
+    referer: String? = null,
+    headers: Map<String, String> = emptyMap(),
+    timeout: Long = 15000,
+): String {
+    val target = applyHostOverride(url)
+    val ref = safeReferer(referer)
+    val retryDelay = cfRetryDelayFor(target)
+    val first = runCatching {
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+    }.getOrNull()
+    if (first != null && first.code !in CF_BLOCK_CODES && !isCfChallenge(first.text)) {
+        return first.text
+    }
+    // Stage 2 (re-3arabi smartGet): one silent plain retry before solving.
+    delay(retryDelay)
+    runCatching {
+        app.get(target, referer = ref, headers = cfHeaders(target, ref, headers), timeout = timeout, allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+    }.getOrNull()?.let { pre ->
+        if (pre.code !in CF_BLOCK_CODES && !isCfChallenge(pre.text)) {
+            Log.d(TAG, "[cfGet  ] wall cleared on silent retry for $target")
+            return pre.text
+        }
+    }
+    Log.d(TAG, "[cfGet  ] wall ($target code=${first?.code}), solving…")
+    val solved = cfSolve(target, awaitContent = false, timeoutMs = cfSolverTimeoutFor(target))
+    val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
+    if (solved != null) {
+        takeSolverHtml(solved, retryUrl)?.let { html ->
+            Log.d(TAG, "[cfGet  ] solved-page DOM for $retryUrl (${html.length} chars)")
+            return html
+        }
+    } else if (first != null) {
+        // Explicit String? type: app response accessors carry a jspecify
+        // @Nullable annotation that isn't on the compile classpath.
+        val t: String? = first.text
+        return t ?: ""
+    }
+    val ck = cfCookies(retryUrl)
+    // Explicit String? type: app response accessors carry a jspecify
+    // @Nullable annotation that isn't on the compile classpath.
+    var retryErr: String? = null
+    val secondResp = runCatching {
+        app.get(retryUrl, referer = ref, headers = cfHeaders(retryUrl, ref, headers), timeout = cfRetryTimeout(timeout), allowRedirects = true, cacheTime = 0, interceptor = cloudflareKiller)
+    }.onFailure { retryErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
+    val second: String? = secondResp?.text
+    Log.d(TAG, "[cfGet  ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${second?.let { isCfChallenge(it) }} err=$retryErr")
+    return second ?: first?.text ?: ""
+}
+
+private suspend fun cfPostText(
+    url: String,
+    data: Map<String, String> = emptyMap(),
+    referer: String? = null,
+    headers: Map<String, String> = emptyMap(),
+    timeout: Long = 15000,
+    solveUrl: String? = null,
+): String {
+    val baseHeaders = headers.toMutableMap().apply {
+        putIfAbsent("X-Requested-With", "XMLHttpRequest")
+        // XHR JSON endpoints expect a JSON accept;
+        // cfHeaders only fills the HTML accept when absent.
+        putIfAbsent("Accept", "application/json, text/javascript, */*; q=0.01")
+    }
+    val target = applyHostOverride(url)
+    val ref = safeReferer(referer)
+    val retryDelay = cfRetryDelayFor(target)
+    val first = runCatching {
+        app.post(target, data = data, referer = ref, headers = cfHeaders(target, ref, baseHeaders), timeout = timeout, cacheTime = 0).text
+    }.getOrNull()
+    if (first != null && !isCfChallenge(first)) return first
+    // Stage 2 (re-3arabi smartPost): one silent plain retry before solving.
+    delay(retryDelay)
+    runCatching {
+        app.post(target, data = data, referer = ref, headers = cfHeaders(target, ref, baseHeaders), timeout = timeout, cacheTime = 0).text
+    }.getOrNull()?.let { pre ->
+        if (!isCfChallenge(pre)) {
+            Log.d(TAG, "[cfPost ] wall cleared on silent retry for $target")
+            return pre
+        }
+    }
+    // Challenge on a POST: solve a GET-able page on the same host, then
+    // retry with the freshly stored host-scoped clearance cookie. Solving
+    // the POST endpoint itself loads it via GET in the solver WebView, on
+    // which a POST-only endpoint renders nothing and the challenge may
+    // never complete (a POST-only endpoint renders nothing on solver GET).
+    val solveTarget = solveUrl?.let { applyHostOverride(it) } ?: target
+    Log.d(TAG, "[cfPost ] wall ($target), solving via $solveTarget…")
+    val solved = cfSolve(solveTarget, awaitContent = false, timeoutMs = cfSolverTimeoutFor(solveTarget))
+    val retryUrl = if (solved != null) solvedRetryUrl(solved, target) else target
+    val ck = cfCookies(retryUrl)
+    // Explicit String? type: app response accessors carry a jspecify
+    // @Nullable annotation that isn't on the compile classpath.
+    var postErr: String? = null
+    val secondResp = runCatching {
+        app.post(retryUrl, data = data, referer = ref, headers = cfHeaders(retryUrl, ref, baseHeaders), timeout = cfRetryTimeout(timeout), cacheTime = 0)
+    }.onFailure { postErr = "${it::class.java.simpleName}: ${it.message}" }.getOrNull()
+    val retry: String? = secondResp?.text
+    Log.d(TAG, "[cfPost ] retry $retryUrl code=${secondResp?.code} clearance=${ck.contains("cf_clearance")} challenge=${retry?.let { isCfChallenge(it) }} err=$postErr")
+    return retry ?: first ?: ""
+}
+
+private suspend fun cfPostDoc(
+    url: String,
+    data: Map<String, String> = emptyMap(),
+    referer: String? = null,
+    headers: Map<String, String> = emptyMap(),
+    timeout: Long = 15000,
+): Document = Jsoup.parse(cfPostText(url, data, referer, headers, timeout), url)
+
+suspend fun invokeTopCinema(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "TopCinema: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val countingCallback: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    val ok = if (res.isMovie) {
+        resolveMovie(title, res.year, subtitleCallback, countingCallback)
+    } else {
+        resolveEpisode(
+            title,
+            res.season ?: 1,
+            res.episode ?: 1,
+            res.year,
+            subtitleCallback,
+            countingCallback,
+        )
+    }
+    Log.d(TAG, "[done  ] emitted=$emitted")
+    StreamlyDiag.lastStage = if (emitted > 0) "TopCinema: ok" else "TopCinema: no links"
+    return ok || emitted > 0
+}
+
+// ---------------------------------------------------------------------------
+// Search & matching
+// ---------------------------------------------------------------------------
+
+private suspend fun searchSite(query: String, type: String): List<Candidate> {
+    val direct = searchOnce(query, type)
+    // WP-API discovery (same index, exact post URLs); HTML stays as the base.
+    val api = topcinemaApiSearch(query, type)
+    val merged = (direct + api).distinctBy { it.url }
+    if (merged.isNotEmpty() || type == "all") return merged
+
+    // Some posts are not indexed under their section; try unfiltered search
+    val fallback = searchOnce(query, "all")
+    Log.d(TAG, "[search ] '$type' empty for '$query', fallback 'all' -> ${fallback.size} cards")
+    return fallback
+}
+
+/**
+ * TopCinema WordPress REST discovery: /wp-json/wp/v2/search returns exact
+ * post URLs (title + url). Filtered by section to preserve the type=
+ * behavior; the HTML search stays as base/fallback.
+ */
+private suspend fun topcinemaApiSearch(query: String, type: String): List<Candidate> {
+    val out = ArrayList<Candidate>()
+    val want = when (type) {
+        "movies" -> "/movies/"
+        "series" -> "/series/"
+        else -> null
+    }
+    return try {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val endpoint = "${topcinemaBase()}/wp-json/wp/v2/search?search=$encoded&per_page=100"
+        val html = cfGetText(endpoint, timeout = 15000)
+        val jsonText = html.substringAfter("[", "").substringBeforeLast("]", "")
+        if (jsonText.isBlank()) return emptyList()
+        val arr = org.json.JSONArray("[$jsonText]")
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val href = o.optString("url").trim()
+            if (!href.startsWith("http")) continue
+            if (want != null && !href.contains(want)) continue
+            val slug = decodeSlug(href)
+            if (slug.isBlank()) continue
+            val candidate = Candidate(href, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            if (candidate.latinTitle.isBlank()) continue
+            if (out.any { it.url == href }) continue
+            out.add(candidate)
+        }
+        Log.d(TAG, "[api    ] $endpoint -> ${out.size} posts")
+        out
+    } catch (e: Exception) {
+        Log.e(TAG, "[api    ] TopCinema WP search failed: ${e.message}")
+        out
+    }
+}
+
+private suspend fun searchOnce(query: String, type: String): List<Candidate> {
+    return withContext(Dispatchers.IO) {
+        try {
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val url = "${topcinemaBase()}/search/?query=$encoded&type=$type"
+            val doc = cfGetDoc(url, timeout = 15000)
+            doc.select(".Small--Box").mapNotNull { box ->
+                val a = box.selectFirst("a[href]") ?: return@mapNotNull null
+                val cardUrl = a.absUrl("href").ifEmpty { a.attr("href") }
+                if (cardUrl.isBlank()) return@mapNotNull null
+                val slug = decodeSlug(cardUrl)
+                Candidate(cardUrl, slug, latinTitleFromSlug(slug), yearFromSlug(slug))
+            }.filter { it.latinTitle.isNotBlank() }
+        } catch (e: Exception) {
+            Log.e(TAG, "[search ] failed: ${e.message}")
+            emptyList()
+        }
+    }
+}
+
+private fun decodeSlug(url: String): String {
+    // Last path segment regardless of trailing slash: the .co site emits
+    // hrefs like …/movies/<slug> (no trailing slash), where the old
+    // beforeLast/afterLast dance returned the category ("movies") instead.
+    val segment = url.trimEnd('/').substringAfterLast('/').substringBefore('?')
+    return runCatching { URLDecoder.decode(segment, "UTF-8") }.getOrDefault(segment)
+}
+
+private fun latinTitleFromSlug(slug: String): String {
+    val cleaned = slug
+        .replace(Regex("^(?:مشاهدة-)?(?:فيلم|مسلسل|انمي|أنمي|برنامج|عروض)-+"), "")
+        .replace(Regex("-+(?:مترجم|مدبلج).*$"), "")
+    return LATIN_REGEX.findAll(cleaned)
+        .map { it.value.trim('-', ' ', '.') }
+        .filter { it.isNotBlank() }
+        .joinToString(" ")
+}
+
+private fun yearFromSlug(slug: String): Int? =
+    YEAR_REGEX.find(slug)?.value?.toIntOrNull()
+
+private fun scoreCandidate(candidate: Candidate, title: String, year: Int?): Int {
+    // Sites slugify Latin titles with hyphens ("la-casa-de-papel") while TMDB
+    // titles are spaced; normalize both before comparing.
+    val candidateTitle = candidate.latinTitle.lowercase().replace('-', ' ')
+    var score = FuzzySearch.weightedRatio(candidateTitle, title.lowercase().replace('-', ' '))
+    val candidateYear = candidate.year
+    if (candidateYear != null && year != null) {
+        // TMDB years skew by a year or two (festival vs wide release, or just
+        // wrong metadata) — only punish clear mismatches, never veto near ones.
+        when (Math.abs(candidateYear - year)) {
+            0, 1 -> score += 5
+            2 -> { /* no penalty, no bonus */ }
+            else -> score -= 25
+        }
+    }
+    return score
+}
+
+// ---------------------------------------------------------------------------
+// Movie flow
+// ---------------------------------------------------------------------------
+
+private suspend fun resolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = searchSite(title, "movies")
+    Log.d(TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+
+    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    scored.sortedByDescending { it.second }.take(3).forEach { (c, s) ->
+        Log.d(TAG, "[match  ] score=$s latin='${c.latinTitle}' year=${c.year}")
+    }
+
+    val best = scored.maxByOrNull { it.second }
+        ?.takeIf { it.second >= MIN_SCORE_MOVIE }?.first
+    if (best == null) {
+        Log.d(TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+
+    Log.d(TAG, "[match  ] WINNER ${best.url}")
+    val movieUrl = best.url.trimEnd('/')
+    val ok = extractServers("$movieUrl/watch/", subtitleCallback, callback)
+    val dl = topcinemaDownloadLinks("$movieUrl/download/", subtitleCallback, callback)
+    return ok || dl
+}
+
+// ---------------------------------------------------------------------------
+// Series episode flow
+// ---------------------------------------------------------------------------
+
+private suspend fun resolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = searchSite(title, "series")
+    Log.d(TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+
+    // Site search only returns the latest ~40 episode posts, so never resolve
+    // from search results directly. Instead use the best-matching post as an
+    // anchor into the show's season navigator, which exposes every season.
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("topcinema")
+
+    val doc = try {
+        cfGetDoc(anchor.url, timeout = 15000)
+    } catch (e: Exception) {
+        Log.e(TAG, "[anchor ] failed: ${e.message}")
+        return false
+    }
+
+    // Preferred path: the season navigator cards link to per-season hubs that
+    // list every episode of that season.
+    val seasonCards = doc.select("section.allseasonss div.Small--Box.Season")
+    if (seasonCards.isNotEmpty()) {
+        val card = seasonCards.firstOrNull { c ->
+            Regex("""\d+""").find(c.selectFirst(".epnum")?.text().orEmpty())
+                ?.value?.toIntOrNull() == season
+        }
+        if (card == null) {
+            Log.d(TAG, "[season ] S$season not among ${seasonCards.size} season cards")
+            return false
+        }
+        val hubUrl = card.selectFirst("a[href]")?.absUrl("href").orEmpty()
+        if (!hubUrl.startsWith("http")) return false
+        Log.d(TAG, "[season ] hub=$hubUrl")
+        val hub = try {
+            cfGetDoc(hubUrl, timeout = 15000)
+        } catch (e: Exception) {
+            Log.e(TAG, "[season ] hub failed: ${e.message}")
+            return false
+        }
+        val epUrl = exactEpisodeUrl(hub, season, episode)
+            ?: run {
+                // Hubs render only ~50 episodes inline (getMoreByScroll). If the
+                // requested one isn't rendered, pull the full list from the
+                // theme's Episodes.php endpoint.
+                Log.d(TAG, "[match  ] E$episode not on hub inline list, trying AJAX completion")
+                val fullList = topcinemaFullSeasonEpisodes(hub)
+                    ?: return false
+                val url = exactEpisodeUrl(fullList, season, episode)
+                if (url == null) Log.d(TAG, "[match  ] E$episode not in full S$season list either")
+                url
+            } ?: return false
+        return topcinemaWithDownload(epUrl, subtitleCallback, callback)
+    }
+
+    // Shows without a season navigator (anime etc.): fall back to the episode
+    // list rendered on the page itself.
+    val epUrl = exactEpisodeUrl(doc, season, episode)
+    if (epUrl == null) {
+        Log.d(TAG, "[match  ] E$episode not in page episode list")
+        return false
+    }
+    return topcinemaWithDownload(epUrl, subtitleCallback, callback)
+}
+
+/**
+ * Finds the post URL of exactly episode [episode] inside an episode listing
+ * (a season hub or an on-page episode list). If the slug carries an explicit
+ * season number it must match [season] too. Returns null when absent — callers
+ * fail cleanly instead of guessing.
+ */
+private fun exactEpisodeUrl(doc: Document, season: Int, episode: Int): String? {
+    val anchors = doc.select("section.allepcont a[href]").takeIf { it.isNotEmpty() }
+        ?: doc.select("a[href]")
+    for (a in anchors) {
+        val href = a.absUrl("href").ifEmpty { a.attr("href") }
+        if (!href.startsWith("http")) continue
+        val slug = decodeSlug(href)
+        val ep = EPISODE_REGEX.find(slug)?.groupValues?.get(1)?.toIntOrNull() ?: continue
+        if (ep != episode) continue
+        // The slug's explicit season (if any) must agree with the requested one;
+        // otherwise trust the listing scope we were given.
+        val slugSeason = SEASON_DIGIT_REGEX.find(slug)?.groupValues?.get(1)?.toIntOrNull()
+        if (slugSeason != null && slugSeason != season) continue
+        return href
+    }
+    return null
+}
+
+// ---------------------------------------------------------------------------
+// Watch page -> server iframes
+// ---------------------------------------------------------------------------
+
+/**
+ * Season hubs lazy-load their episode list. This fetches the complete season
+ * via the theme's Episodes.php endpoint: it reads the seasons toggler params
+ * from the /watch/ page of the first listed episode, then POSTs them.
+ * Returns a synthetic document whose anchors carry episode numbers in <em>.
+ */
+private suspend fun topcinemaFullSeasonEpisodes(hub: Document): Document? {
+    val firstEpisode = hub.select("section.allepcont a[href]")
+        .firstOrNull()?.absUrl("href")?.takeIf { it.startsWith("http") }
+        ?: return null
+    return runCatching {
+        val watchText = cfGetText("${firstEpisode.trimEnd('/')}/watch/", timeout = 15000)
+        val toggler = Jsoup.parse(watchText, firstEpisode)
+            .selectFirst(".seasons--toggler a[data-id][data-season]") ?: return null
+        val postId = toggler.attr("data-id")
+        val seasonId = toggler.attr("data-season")
+        if (postId.isBlank() || seasonId.isBlank()) return null
+        val ajaxBase = Regex("""MyAjaxURL\s*=\s*["']([^"']+)["']""").find(watchText)
+            ?.groupValues?.get(1) ?: topcinemaBase() + "/wp-content/themes/movies2023/Ajaxat"
+        val html = cfPostText(
+            ajaxBase.trimEnd('/') + "/Single/Episodes.php",
+            data = mapOf("season" to seasonId, "post_id" to postId),
+            headers = mapOf(
+                "Referer" to TOPCINEMA_MAIN_URL,
+                "X-Requested-With" to "XMLHttpRequest",
+            ),
+            timeout = 15000,
+        )
+        Log.d(TAG, "[season ] AJAX completion returned ${html.length} chars")
+        Jsoup.parse(html, firstEpisode)
+    }.onFailure {
+        Log.e(TAG, "[season ] AJAX completion failed: ${it.message}")
+    }.getOrNull()
+}
+
+/** Fetch one server slot's embed URL via the theme AJAX endpoint; retries once. */
+private suspend fun fetchServerEmbed(
+    ajaxServer: String,
+    postId: String,
+    server: String,
+    watchUrl: String,
+): String? {
+    repeat(2) { attempt ->
+        try {
+            val html = cfPostText(
+                ajaxServer,
+                data = mapOf("id" to postId, "i" to server),
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+                referer = watchUrl,
+                timeout = 15000,
+            )
+            val src = Jsoup.parse(html).selectFirst("iframe")?.attr("src").orEmpty()
+            if (src.startsWith("http")) {
+                Log.d(TAG, "[slot $server t$attempt] iframe=$src")
+                return src
+            }
+            Log.d(TAG, "[slot $server t$attempt] EMPTY (${html.length} chars)")
+        } catch (e: Exception) {
+            Log.e(TAG, "[slot $server t$attempt] error: ${e.message}")
+        }
+    }
+    return null
+}
+
+private suspend fun extractServers(
+    watchUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    try {
+        val watchText = cfGetText(watchUrl, timeout = 15000)
+        val watchDoc = Jsoup.parse(watchText, watchUrl)
+
+        // The AJAX base is defined per-page (theme dir can change between
+        // mirrors); fall back to the known constant.
+        val ajaxServer = Regex("""MyAjaxURL\s*=\s*["']([^"']+)["']""").find(watchText)
+            ?.groupValues?.get(1)?.trimEnd('/')?.plus("/Single/Server.php")
+            ?: TOPCINEMA_AJAX_SERVER
+
+        // The watch page always renders its default player inline — use it even
+        // if the AJAX endpoint misbehaves.
+        val inlineIframe = watchDoc.selectFirst(".player--iframe iframe")?.attr("src")
+            ?.takeIf { it.startsWith("http") }
+
+        val servers = watchDoc.select(".watch--servers--list li.server--item")
+        val postId = servers.first()?.attr("data-id").orEmpty()
+        Log.d(TAG, "[watch  ] servers=${servers.size} postId=$postId inline=${inlineIframe != null}")
+
+        // Deduplicate inline iframe vs AJAX embeds (re-3arabi TopCinema ConcurrentHashMap style).
+        val seenEmbeds = LinkedHashSet<String>()
+        inlineIframe?.let { seenEmbeds.add(it) }
+
+        var found = false
+        if (inlineIframe != null) {
+            found = true
+            EmbedRouter.route(inlineIframe, watchUrl, subtitleCallback, callback, "TopCinema")
+        }
+
+        if (postId.isNotBlank() && servers.isNotEmpty()) {
+            val embeds = servers.mapNotNull { li ->
+                val server = li.attr("data-server").ifBlank { li.attr("data-i") }
+                if (server.isBlank()) null
+                else async { fetchServerEmbed(ajaxServer, postId, server, watchUrl) }
+            }.awaitAll().filterNotNull()
+                .filter { seenEmbeds.add(it) } // skip dup of inline iframe
+            Log.d(TAG, "[watch  ] ajax embeds=${embeds.size}/${servers.size}")
+
+            if (embeds.isNotEmpty()) {
+                found = true
+                embeds.amap { embed ->
+                    async { EmbedRouter.route(embed, watchUrl, subtitleCallback, callback, "TopCinema") }
+                }.awaitAll()
+            }
+        }
+
+        found
+    } catch (e: Exception) {
+        Log.e(TAG, "[watch  ] extractServers failed: ${e.message}")
+        false
+    }
+}
+
+/**
+ * TopCinema exposes a parallel `/download/` page listing raw/embed links via
+ * `a.downloadsLink`. Some are wrapped in `play.php?to=<encoded>` (unwrap), the
+ * rest are routed through the shared extractor registry.
+ */
+private suspend fun topcinemaDownloadLinks(
+    downloadUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean = coroutineScope {
+    return@coroutineScope try {
+        val html = cfGetText(downloadUrl, timeout = 15000)
+        val doc = Jsoup.parse(html, downloadUrl)
+        val links = doc.select("a.downloadsLink")
+            .mapNotNull { it.absUrl("href").ifEmpty { it.attr("href") } }
+            .filter { it.startsWith("http") }
+        Log.d(TAG, "[download] ${links.size} links on $downloadUrl")
+        // Premium lockers never yield streams (login/API only) — skip them
+        // instead of burning a loadExtractor timeout each. The rest resolve
+        // concurrently: these are independent IO-bound fetches.
+        val routable = links.mapNotNull { raw ->
+            val url = unwrapPlayUrl(raw)
+            if (isDeadLocker(url)) {
+                Log.d(TAG, "[download] skip locker $url")
+                null
+            } else url
+        }
+        routable.amap { url ->
+            async { EmbedRouter.route(url, downloadUrl, subtitleCallback, callback, "TopCinema") }
+        }.awaitAll()
+        links.isNotEmpty()
+    } catch (e: Exception) {
+        Log.e(TAG, "[download] failed: ${e.message}")
+        false
+    }
+}
+
+/** Resolve a TopCinema post's watch servers and its parallel download page. */
+private suspend fun topcinemaWithDownload(
+    epUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    StreamlyCache.markEpisodeMatched("topcinema")
+    val base = epUrl.trimEnd('/')
+    val ok = extractServers("$base/watch/", subtitleCallback, callback)
+    val dl = topcinemaDownloadLinks("$base/download/", subtitleCallback, callback)
+    return ok || dl
+}
+
+// ---------------------------------------------------------------------------
+// Mirror handling — these sites rotate domains constantly; the seed domain
+// usually 301s to the current mirror. Resolve the final origin once and reuse.
+// ---------------------------------------------------------------------------
+
+private val originCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+private suspend fun resolveOrigin(seedUrl: String): String {
+    originCache[seedUrl]?.let { return it }
+    val resolved = runCatching {
+        val response = app.get(seedUrl, timeout = 15000)
+        val uri = java.net.URI(response.url)
+        "${uri.scheme}://${uri.host}"
+    }.getOrDefault(seedUrl)
+    originCache[seedUrl] = resolved
+    Log.d("StreamlyMirror", "resolveOrigin($seedUrl) -> $resolved")
+    return resolved
+}
+
+private fun getBaseUrl(url: String): String =
+    runCatching { val u = java.net.URI(url); "${u.scheme}://${u.host}" }.getOrDefault(url)
+
+internal fun fixUrl(url: String, base: String): String {
+    if (url.startsWith("http")) return url
+    if (url.startsWith("//")) return "https:$url"
+    val host = runCatching { java.net.URI(base).let { "${it.scheme}://${it.host}" } }.getOrDefault(base)
+    return if (url.startsWith("/")) "$host$url" else "$host/$url"
+}
+
+/** Some embed hosts wrap the real URL in `play.php?to=<encoded>`; unwrap it. */
+private fun unwrapPlayUrl(url: String): String {
+    if (!url.contains("play.php?to=")) return url
+    return runCatching {
+        val decoded = java.net.URLDecoder.decode(url.substringAfter("play.php?to="), "UTF-8").trim()
+        if (decoded.startsWith("http")) decoded else "https:${decoded.trimStart(':')}"
+    }.getOrDefault(url)
+}
+// ---------------------------------------------------------------------------
+// EgyDead (egydead.skin) link source. Port of the re-3arabi EgyDead search +
+// watch chain, adapted to Streamly's TMDB-title matching: `?s=<query>` ->
+// ul.posts-list li.movieItem cards -> /film/ posts play directly, series
+// resolve through div.seasons-list season pages and div.EpsList episode
+// lists. Watch flow is `?view=watch` + POST View=1; servers come from
+// ul.serversList / donwload-servers-list / [data-link] candidates.
+// EarnVids/StreamHG go through the ported ExternalEarnVidsExtractor, the
+// rest through EmbedRouter. All traffic uses cfGet*/cfPost*: the site sits
+// behind Cloudflare (403s datacenter/bot traffic; the on-device solver
+// clears it).
+// ---------------------------------------------------------------------------
+
+private const val EGDEAD_SEED_URL = "https://egydead.beer"
+private const val EGDEAD_TAG = "EgyDead"
+
+/** EgyDead rotates domains; resolve the live origin once and reuse it. */
+private suspend fun egDeadBase(): String = resolveOrigin(EGDEAD_SEED_URL)
+
+/** Dubbed-post signals: explicit مدبلج/dubbed markers, or EgyDead's -ar
+ *  slug suffix for Arabic-dubbed versions (sultana-2026-1080p-web-dl-ar). */
+private fun egDeadIsDub(slug: String, text: String): Boolean {
+    if (text.contains("مدبلج") || text.contains("مدبلجه")) return true
+    if (slug.contains("مدبلج") || slug.contains("dubbed", ignoreCase = true)) return true
+    if (slug.trimEnd('/').endsWith("-ar", ignoreCase = true)) return true
+    return false
+}
+/** Arabic-aware season/episode numbers (SxxExx, xN, حلقة/الموسم).
+ *  Season hrefs use bare موسم-10 (no ال); hub card titles spell S1-S9 out
+ *  (الموسم الاول..التاسع), so ordinals are mapped explicitly. */
+private val EGDEAD_SEASON_REGEX =
+    Regex("""(?ix)(?:(?:ال)?موسم[\s:\-_.]*0*(\d+))|(?:S(?:eason)?[\s:\-_.]*0*(\d+))""")
+private val EGDEAD_SEASON_WORDS = mapOf(
+    "الاول" to 1, "الأول" to 1, "الاولى" to 1, "الأولى" to 1,
+    "الثاني" to 2, "الثانى" to 2, "الثانية" to 2, "الثانيه" to 2,
+    "الثالث" to 3, "الثالثة" to 3, "الثالثه" to 3,
+    "الرابع" to 4, "الرابعة" to 4, "الرابعه" to 4,
+    "الخامس" to 5, "الخامسة" to 5, "الخامسه" to 5,
+    "السادس" to 6, "السادسة" to 6, "السادسه" to 6,
+    "السابع" to 7, "السابعة" to 7, "السابعه" to 7,
+    "الثامن" to 8, "الثامنة" to 8, "الثامنه" to 8,
+    "التاسع" to 9, "التاسعة" to 9, "التاسعه" to 9,
+    "العاشر" to 10, "العاشرة" to 10, "العاشره" to 10,
+)
+private val EGDEAD_EPISODE_REGEX =
+    Regex("""(?ix)(?:حلقة[\s:\-_.]*0*(\d+))|(?:Episode[\s:\-_.]*0*(\d+))|(?:EP[\s:\-_.]*0*(\d+))|(?:\d+[xX]0*(\d+))|(?:S(?:eason)?[\s:\-_.]*\d+[\s\-_.,]*E(?:p(?:isode)?)?[\s:\-_.]*0*(\d+))""")
+
+private fun egDeadNum(re: Regex, s: String?): Int? {
+    if (s.isNullOrBlank()) return null
+    return re.find(s)?.groupValues?.drop(1)?.firstOrNull { it.isNotEmpty() }?.toIntOrNull()
+}
+
+/** Season number from decoded slug + card text: digits first, then Arabic
+ *  ordinals (الموسم الاول has no digit to match). */
+private fun egDeadSeasonNum(href: String, text: String): Int? {
+    val decoded = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
+    egDeadNum(EGDEAD_SEASON_REGEX, "$decoded $text")?.let { return it }
+    return arabicOrdinalNum("$decoded $text")
+}
+
+/** Arabic ordinal words (الاول..العاشر) -> number; shared season-tab helper. */
+private fun arabicOrdinalNum(s: String?): Int? {
+    if (s.isNullOrBlank()) return null
+    return EGDEAD_SEASON_WORDS.entries.firstOrNull { (w, _) -> s.contains(w) }?.value
+}
+
+suspend fun invokeEgyDead(
+    res: LinkData,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val title = res.title?.trim().orEmpty()
+    Log.d(EGDEAD_TAG, "[invoke] title=$title year=${res.year} movie=${res.isMovie} s=${res.season} e=${res.episode}")
+    StreamlyDiag.lastStage = "EgyDead: start"
+    if (title.isEmpty()) return false
+
+    var emitted = 0
+    val counting: (ExtractorLink) -> Unit = { emitted++; callback(it) }
+
+    return try {
+        val ok = if (res.isMovie) {
+            egDeadResolveMovie(title, res.year, subtitleCallback, counting)
+        } else {
+            egDeadResolveEpisode(title, res.season ?: 1, res.episode ?: 1, res.year, subtitleCallback, counting)
+        }
+        Log.d(EGDEAD_TAG, "[done  ] emitted=$emitted ok=$ok")
+        StreamlyDiag.lastStage = if (emitted > 0) "EgyDead: ok" else "EgyDead: no links"
+        ok || emitted > 0
+    } catch (e: Exception) {
+        Log.e(EGDEAD_TAG, "[invoke] failed: ${e.message}")
+        StreamlyDiag.lastStage = "EgyDead: ${e.message}"
+        emitted > 0
+    }
+}
+
+private suspend fun egDeadSearch(query: String, type: String): List<Candidate> {
+    return withContext(Dispatchers.IO) {
+        try {
+            val base = egDeadBase()
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val fetchUrl = "$base/?s=$encoded"
+            val doc = cfGetDoc(fetchUrl, timeout = 20000)
+            fun looksSeries(href: String, text: String): Boolean =
+                href.contains("/season/") || href.contains("/serie") || href.contains("/episode/") ||
+                text.contains("مسلسل")
+            fun looksFilm(href: String, text: String): Boolean =
+                href.contains("/film/") || text.contains("فيلم") || text.contains("افلام")
+            // The .live mirrors dropped the /film/ URL prefix: posts live at
+            // /<slug>/. Accept same-host single-segment post URLs for films
+            // unless series signals are present.
+            fun isPostUrl(href: String): Boolean = runCatching {
+                val u = URI(href)
+                val b = URI(base)
+                u.host.equals(b.host, ignoreCase = true) &&
+                u.path.trim('/').isNotEmpty() && '/' !in u.path.trim('/')
+            }.getOrDefault(false)
+            fun typeOk(href: String, text: String): Boolean {
+                return if (type == "film") {
+                    !looksSeries(href, text) && (looksFilm(href, text) || isPostUrl(href))
+                } else {
+                    looksSeries(href, text)
+                }
+            }
+            fun fromCard(li: Element): Candidate? {
+                val a = li.selectFirst("a[href]") ?: return null
+                val href = fixUrl(a.attr("href"), base).takeIf { it.startsWith("http") } ?: return null
+                val titleText = li.selectFirst("h1.BottomTitle")?.text()?.trim()
+                    .takeIf { !it.isNullOrBlank() } ?: a.text().trim()
+                val cardText = li.text() + " " + titleText
+                if (!typeOk(href, cardText)) return null
+                val slug = decodeSlug(href)
+                val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(titleText) }
+                if (latin.isBlank()) return null
+                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(titleText), egDeadIsDub(slug, cardText))
+            }
+            fun fromLink(rawHref: String, label: String): Candidate? {
+                val href = fixUrl(rawHref, base)
+                if (!href.startsWith("http") || !typeOk(href, label)) return null
+                val slug = decodeSlug(href)
+                val latin = latinTitleFromSlug(slug).ifBlank { latinTitleFromSlug(label) }
+                if (latin.isBlank()) return null
+                return Candidate(href, slug, latin, yearFromSlug(slug) ?: yearFromSlug(label), egDeadIsDub(slug, label))
+            }
+            val primary = doc.select("ul.posts-list li.movieItem").mapNotNull { fromCard(it) }.distinctBy { it.url }
+            if (primary.isNotEmpty()) return@withContext primary
+            // Mirror drift: cards rendered outside ul.posts-list on .live mirrors.
+            val anyItem = doc.select("li.movieItem").mapNotNull { fromCard(it) }.distinctBy { it.url }
+            if (anyItem.isNotEmpty()) {
+                Log.d(EGDEAD_TAG, "[search ] fallback li.movieItem -> ${anyItem.size} candidates")
+                return@withContext anyItem
+            }
+            // Last resort: harvest result links directly (card markup unknown).
+            val harvested = doc.select("a[href]").mapNotNull { a ->
+                fromLink(a.attr("href"), a.text().trim())
+            }.distinctBy { it.url }
+            if (harvested.isNotEmpty()) {
+                Log.d(EGDEAD_TAG, "[search ] fallback link-harvest -> ${harvested.size} candidates")
+                return@withContext harvested
+            }
+            // Structural dump so the next miss is classifiable from logcat.
+            val body = runCatching { doc.body()?.text().orEmpty() }.getOrDefault("")
+            val uls = doc.select("ul[class]").map { it.attr("class") }.distinct().take(10)
+            val filmLinks = doc.select("a[href*=/film/]").map { it.attr("href") }.take(3)
+            val items = doc.select("li.movieItem")
+            val hrefKinds = doc.select("a[href]").map { a ->
+                runCatching { URI(fixUrl(a.attr("href"), base)).path?.split("/")?.getOrNull(1) }.getOrDefault("?")
+            }.distinct().take(15)
+            Log.d(EGDEAD_TAG, "[search ] 0 cards url=$fetchUrl title='${doc.title()}' movieItem=${items.size} uls=$uls filmLinks=$filmLinks hrefKinds=$hrefKinds body='${body.take(200)}'")
+            items.take(5).forEach { li ->
+                // Explicit Element? types: jsoup's @Nullable isn't on the compile classpath.
+                val chain = ArrayList<String>()
+                var p: Element? = li.parent()
+                repeat(3) {
+                    val cur: Element? = p
+                    if (cur == null) {
+                        chain.add("null")
+                    } else {
+                        chain.add(cur.tagName() + "." + cur.className())
+                        p = cur.parent()
+                    }
+                }
+                val html: String = li.toString().take(300)
+                Log.d(EGDEAD_TAG, "[search ] item parents=$chain html='$html'")
+            }
+            emptyList<Candidate>()
+        } catch (e: Exception) {
+            Log.e(EGDEAD_TAG, "[search ] failed: ${e.message}")
+            emptyList()
+        }
+    }
+}
+
+private suspend fun egDeadResolveMovie(
+    title: String,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = egDeadSearch(title, "film")
+    Log.d(EGDEAD_TAG, "[search ] movie '$title' -> ${candidates.size} candidates")
+    if (candidates.isEmpty()) return false
+
+    val scored = candidates.map { it to scoreCandidate(it, title, year) }
+    val above = scored.filter { it.second >= MIN_SCORE_MOVIE }
+    if (above.isEmpty()) {
+        Log.d(EGDEAD_TAG, "[match  ] no candidate reached $MIN_SCORE_MOVIE")
+        return false
+    }
+    // Include every top qualifying post (cap 3): subtitled + dubbed
+    // versions resolve side by side, tagged "EgyDead" / "EgyDead • DUB".
+    val winners = above.sortedByDescending { it.second }.take(3).map { it.first }
+    var ok = false
+    winners.forEachIndexed { i, post ->
+        Log.d(EGDEAD_TAG, "[match  ] WINNER ${i + 1}/${winners.size} ${post.url} dub=${post.isDub}")
+        val label = if (post.isDub) "EgyDead • DUB" else "EgyDead"
+        ok = egDeadWatchServers(post.url, subtitleCallback, callback, label) || ok
+    }
+    return ok
+}
+
+private suspend fun egDeadResolveEpisode(
+    title: String,
+    season: Int,
+    episode: Int,
+    year: Int?,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+): Boolean {
+    val candidates = egDeadSearch(title, "series")
+    Log.d(EGDEAD_TAG, "[search ] series '$title' S$season E$episode -> ${candidates.size} candidates")
+    val anchor = candidates.map { it to scoreCandidate(it, title, year) }
+        .filter { it.second >= MIN_SCORE_SERIES }
+        .maxByOrNull { it.second }?.first
+    if (anchor == null) {
+        Log.d(EGDEAD_TAG, "[match  ] no anchor above $MIN_SCORE_SERIES")
+        return false
+    }
+    Log.d(EGDEAD_TAG, "[match  ] anchor ${anchor.url}")
+    StreamlyCache.markEpisodeMatched("egydead")
+
+    // A direct episode hit still wins when its numbers agree.
+    if ("/episode/" in anchor.url) {
+        if (egDeadNum(EGDEAD_SEASON_REGEX, anchor.slug) == season &&
+            egDeadNum(EGDEAD_EPISODE_REGEX, anchor.slug) == episode
+        ) {
+            return egDeadWatchServers(anchor.url, subtitleCallback, callback)
+        }
+        Log.d(EGDEAD_TAG, "[match  ] anchor is not the requested episode")
+        return false
+    }
+    var seasonUrl = anchor.url
+    if ("/season/" !in seasonUrl) {
+        // Series hub (/serie/): find the requested season link.
+        val hub = try {
+            cfGetDoc(seasonUrl, timeout = 20000)
+        } catch (e: Exception) {
+            Log.e(EGDEAD_TAG, "[anchor ] failed: ${e.message}")
+            return false
+        }
+        val seasonsCont = hub.selectFirst("div.seasons-list") ?: hub.selectFirst("div.seasons")
+        val seasonLinks = seasonsCont?.select("a[href]").orEmpty()
+        Log.d(EGDEAD_TAG, "[season ] ${seasonLinks.size} season links on hub")
+        val link = seasonLinks.mapNotNull { a ->
+            val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") }
+                ?: return@mapNotNull null
+            if ("/season/" !in href) return@mapNotNull null
+            href to (egDeadSeasonNum(href, a.text()) ?: 9999)
+        }.firstOrNull { it.second == season }?.first
+        if (link == null) {
+            Log.d(EGDEAD_TAG, "[match  ] S$season not in seasons list")
+            return false
+        }
+        seasonUrl = link
+    }
+    val seasonDoc = try {
+        cfGetDoc(seasonUrl, timeout = 20000)
+    } catch (e: Exception) {
+        Log.e(EGDEAD_TAG, "[season ] failed: ${e.message}")
+        return false
+    }
+    val epsCont = seasonDoc.selectFirst("div.EpsList")
+        ?: seasonDoc.selectFirst("div.episodes-list")
+    val epUrl = epsCont?.select("a[href]")?.mapNotNull { a ->
+        val href = fixUrl(a.attr("href"), seasonUrl).takeIf { it.startsWith("http") }
+            ?: return@mapNotNull null
+        if ("/season/" in href || "/film/" in href) return@mapNotNull null
+        val label = (a.attr("title").takeIf { it.isNotBlank() } ?: a.text()).trim()
+        val decodedHref = runCatching { URLDecoder.decode(href, "UTF-8") }.getOrDefault(href)
+        href to (egDeadNum(EGDEAD_EPISODE_REGEX, "$decodedHref $label") ?: 9999)
+    }?.firstOrNull { it.second == episode }?.first
+    if (epUrl == null) {
+        Log.d(EGDEAD_TAG, "[match  ] E$episode not in season episode list")
+        return false
+    }
+    Log.d(EGDEAD_TAG, "[match  ] E$episode -> $epUrl")
+    return egDeadWatchServers(epUrl, subtitleCallback, callback)
+}
+
+/** Film/episode post -> `?view=watch` (+POST View=1) -> server candidates. */
+private suspend fun egDeadWatchServers(
+    postUrl: String,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit,
+    providerLabel: String = "EgyDead",
+): Boolean = coroutineScope {
+    StreamlyCache.markEpisodeMatched("egydead")
+    try {
+        val watchUrl = postUrl.trimEnd('/') + "?view=watch"
+        val doc = try {
+            cfPostDoc(watchUrl, data = mapOf("View" to "1"), referer = postUrl, timeout = 20000)
+        } catch (_: Exception) {
+            try {
+                cfGetDoc(watchUrl, referer = postUrl, timeout = 20000)
+            } catch (e: Exception) {
+                Log.e(EGDEAD_TAG, "[watch  ] page failed: ${e.message}")
+                return@coroutineScope false
+            }
+        }
+        val seen = LinkedHashSet<String>()
+        fun norm(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            val t = raw.trim()
+            if (t.startsWith("#") || t.startsWith("javascript:", ignoreCase = true)) return null
+            val fixed = fixUrl(t, watchUrl).takeIf { it.startsWith("http") } ?: return null
+            // Same file behind both pages; collapse to the iframe variant so
+            // the pair doesn't extract (and emit) twice.
+            if (fixed.contains("megamax.me")) return fixed.replace("/download/", "/iframe/")
+            // Same hgcloud file behind /<id> and /e/<id> (both resolve to the
+            // same variant set) — collapse so it extracts (and emits) once.
+            if (fixed.contains("hgcloud")) {
+                return runCatching {
+                    val u = java.net.URI(fixed)
+                    val p = u.path.replace("/e/", "/")
+                    java.net.URI(u.scheme, u.userInfo, u.host, u.port, p, u.query, u.fragment).toString()
+                }.getOrDefault(fixed)
+            }
+            return fixed
+        }
+        val candidates = ArrayList<Pair<String, String?>>()
+        fun add(link: String?, name: String?) {
+            norm(link)?.takeIf { seen.add(it) }?.let { candidates.add(it to name?.trim()) }
+        }
+        // Download servers.
+        listOf(
+            "ul.donwload-servers-list li", "ul.download-servers-list li",
+            "div.donwload-servers-list li",
+        ).flatMap { doc.select(it) }.forEach { li ->
+            val name = li.selectFirst("span.ser-name")?.text()
+                ?: li.selectFirst("p")?.text()
+            add(
+                li.selectFirst("a.ser-link")?.attr("href")
+                    ?: li.selectFirst("a")?.attr("href")
+                    ?: li.attr("data-link").takeIf { it.isNotBlank() },
+                name,
+            )
+        }
+        // Watch servers.
+        listOf(
+            "ul.serversList li", "ul.servers-list li",
+            "div.serversList li", "div.servers-list li",
+        ).flatMap { doc.select(it) }.forEach { li ->
+            val name = li.selectFirst("p")?.text()
+                ?: li.selectFirst(".ser-name")?.text()
+                ?: li.selectFirst("span.ser-name")?.text()
+            add(
+                li.attr("data-link").takeIf { it.isNotBlank() }
+                    ?: li.selectFirst("[data-link]")?.attr("data-link")
+                    ?: li.selectFirst("button[data-link]")?.attr("data-link")
+                    ?: li.selectFirst("a")?.attr("href"),
+                name,
+            )
+        }
+        // Generic data-link hooks.
+        doc.select("[data-link]").forEach { el ->
+            add(
+                el.attr("data-link"),
+                el.attr("data-name").takeIf { it.isNotBlank() }
+                    ?: el.attr("data-provider").takeIf { it.isNotBlank() },
+            )
+        }
+        // Generic player/embed/download anchors.
+        doc.select("a[href]").forEach { a ->
+            val href = a.attr("href")
+            if (href.contains("player", true) || href.contains("embed", true) ||
+                href.contains("download", true) || href.contains("drive", true) ||
+                href.contains("mp4", true)
+            ) {
+                add(href, a.attr("title").takeIf { it.isNotBlank() } ?: a.text().takeIf { it.isNotBlank() })
+            }
+        }
+        Log.d(EGDEAD_TAG, "[watch  ] servers=${candidates.size}")
+        if (candidates.isEmpty()) return@coroutineScope false
+        candidates.forEach { (link, name) ->
+            Log.d(EGDEAD_TAG, "[watch  ] server name=${name ?: "?"} link=$link")
+        }
+        candidates.amap { (link, name) ->
+            async {
+                if (isDeadLocker(link)) {
+                    Log.d(EGDEAD_TAG, "[watch  ] skip locker name=${name ?: "?"}")
+                    return@async
+                }
+                var n = 0
+                val counting: (ExtractorLink) -> Unit = { n++; callback(it) }
+                if (link.contains("hgcloud", ignoreCase = true)) {
+                    // The JS loader redirects to rotating player hosts. Use one
+                    // bounded WebView attempt, not the shared challenge queue.
+                    // Label with the server name so the player list reads
+                    // "EgyDead [StreamHG]" instead of a bare "EgyDead".
+                    val serverLabel = if (!name.isNullOrBlank() && name != "?") {
+                        "$providerLabel [${cleanServerName(name)}]"
+                    } else {
+                        "$providerLabel [${hostOfUrl(link)}]"
+                    }
+                    // Cheap path first: hgcloud.to is StreamWish-family
+                    // (upstream Hgcloudto), so the packed-JWPlayer parse often
+                    // resolves without any WebView.
+                    runCatching {
+                        EmbedRouter.route(link, watchUrl, subtitleCallback, counting, providerLabel)
+                    }
+                    Log.d(EGDEAD_TAG, "[watch  ] hgcloud streamwish attempt emitted=$n")
+                    if (n > 0) {
+                        Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n (streamwish, no webview)")
+                        return@async
+                    }
+                    var playerUrl = link
+                    val hit = sharedWebViewResolve(link, watchUrl, sniffMp4 = true) {
+                        playerUrl = it
+                    }
+                    if (!hit.isNullOrBlank()) {
+                        if (hit.substringBefore("?").endsWith(".mp4", ignoreCase = true)) {
+                            counting(
+                                newExtractorLink(providerLabel, serverLabel, url = hit) {
+                                    this.referer = link
+                                    this.quality = getQualityFromName(hit)
+                                    this.type = ExtractorLinkType.VIDEO
+                                },
+                            )
+                        } else {
+                            emitResolvedVariants(hit, link, getBaseUrl(link), counting, serverLabel)
+                        }
+                    }
+                    Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n webview=${!hit.isNullOrBlank()}")
+                    return@async
+                }
+                if (link.contains("megamax.me", ignoreCase = true)) {
+                    val ok = MegaMaxExtractor.extract(link, watchUrl, subtitleCallback, counting, providerLabel)
+                    Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n megamax=$ok")
+                    return@async
+                }
+                val isEarn = name != null &&
+                    (name.equals("EarnVids", true) || name.equals("StreamHG", true))
+                if (isEarn) {
+                    val custom = runCatching {
+                        withContext(Dispatchers.IO) {
+                            ExternalEarnVidsExtractor.extract(link, egDeadBase())
+                        }
+                    }.getOrNull()
+                    if (!custom.isNullOrBlank()) {
+                        val expanded = runCatching {
+                            generateM3u8("$name (Custom)", custom, egDeadBase())
+                        }.getOrNull().orEmpty()
+                        if (expanded.isNotEmpty()) dropRedundantMasters(expanded).forEach(counting)
+                        else counting(
+                            newExtractorLink(providerLabel, "$name (Custom)", url = custom) {
+                                this.referer = egDeadBase()
+                                this.quality = Qualities.Unknown.value
+                                this.type = ExtractorLinkType.M3U8
+                            }
+                        )
+                    }
+                }
+                EmbedRouter.route(link, watchUrl, subtitleCallback, counting, providerLabel)
+                Log.d(EGDEAD_TAG, "[watch  ] server done name=${name ?: "?"} emitted=$n")
+            }
+        }.awaitAll()
+        true
+    } catch (e: Exception) {
+        Log.e(EGDEAD_TAG, "[watch  ] failed: ${e.message}")
+        false
+    }
+}
+private fun cleanServerName(raw: String?): String? {
+    var name = raw?.trim().takeIf { !it.isNullOrBlank() } ?: return raw
+    name = name.replace(Regex("""(?i)\s*[\[(]?\d{3,4}\s*p[\])]??\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?\d+\s*K[\])]??\s*$"""), "")
+        .replace(Regex("""(?i)\s*[\[(]?(HD|HQ|CAM|HDTC)[\])]??\s*$"""), "")
+        .trim()
+    return name.ifBlank { raw?.trim() }
+}
+
+/** Host only, no path/query/token — safe for logs. */
+private fun hostOfUrl(url: String): String =
+    runCatching { URI(url.substringBefore("#")).host ?: url.take(48) }.getOrDefault(url.take(48))
+
+/** Shared emit for a resolved m3u8: always expand into per-quality variants. */
+private suspend fun emitResolvedVariants(
+    m3u8: String,
+    iframe: String,
+    base: String,
+    callback: (ExtractorLink) -> Unit,
+    label: String = "Streamly",
+) {
+    val variants = runCatching {
+        generateM3u8(
+            label,
+            m3u8,
+            referer = iframe,
+            headers = mapOf(
+                "Referer" to iframe,
+                "Origin" to base,
+                "User-Agent" to RESOLVER_UA,
+                "Cookie" to cfCookies(m3u8),
+            ),
+        )
+    }.getOrNull().orEmpty()
+    if (variants.isNotEmpty()) {
+        dropRedundantMasters(variants).forEach(callback)
+        return
+    }
+    callback(
+        newExtractorLink(label, label, url = m3u8) {
+            this.referer = iframe
+            this.quality = Qualities.Unknown.value
+            this.type = ExtractorLinkType.M3U8
+            this.headers = mapOf(
+                "Referer" to iframe,
+                "Origin" to base,
+                "User-Agent" to RESOLVER_UA,
+            )
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // EgyWatch (EasyPlex app API). Search hits carry tmdb_id, so matching is
 // exact against LinkData.id with a fuzzy-title fallback — no slug scraping.
