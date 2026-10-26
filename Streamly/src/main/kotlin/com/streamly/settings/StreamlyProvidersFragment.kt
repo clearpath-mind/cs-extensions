@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
-import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -63,7 +62,6 @@ class StreamlyProvidersFragment(
 
     private val providerStatuses = mutableMapOf<String, ProviderStatus>()
     private val testScope: CoroutineScope = MainScope()
-    private val categoryHeaders = mutableMapOf<String, TextView>()
 
     /** Known-good titles used as test probes (movie + show, TMDB + IMDb keyed). */
     private val testCandidates = listOf(
@@ -156,22 +154,18 @@ class StreamlyProvidersFragment(
         }
     }
 
-    /** Embed-chain providers (2Embed -> Uqload -> m3u8) need room: the real
-     * loadLinks path gives them 90s+ while the old 25s probe budget timed
-     * out healthy runs and reported OFFLINE. */
-    private fun probeBudgetMs(provider: Provider): Long =
-        if (provider.id == "2embed") 60000L else 25000L
+    /** Probe budget for the settings test button; the real loadLinks path
+     * still allows for extraction tails beyond this. */
+    private val PROBE_BUDGET_MS = 25_000L
 
     /**
      * Probe a provider against known-good candidates. Returns true on the
      * first candidate that yields any video link or subtitle URL (StreamPlay
-     * testProvider pattern adapted to the 3-arg invoke). Dune: Part Two
-     * (2024) goes first: 2Embed serves new releases on its legacy uqloads
-     * path while old catalogue titles moved to vidsrc-family players.
+     * testProvider pattern adapted to the 3-arg invoke).
      */
     private suspend fun testProvider(provider: Provider): Boolean = withContext(Dispatchers.IO) {
         StreamlyRuntime.context = CommonActivity.activity
-        val budget = probeBudgetMs(provider)
+        val budget = PROBE_BUDGET_MS
         for (candidate in testCandidates) {
             var found = false
             val subCb: (SubtitleFile) -> Unit = { sub ->
@@ -236,31 +230,6 @@ class StreamlyProvidersFragment(
         val enabled = providers.count { !adapter.isDisabled(it.id) }
         val total = providers.size
         tvProviderCount.text = "$enabled / $total enabled"
-        // Per-category header counts (display-only, same disabled set).
-        ProvidersList.categoryOrder.forEach { category ->
-            val header = categoryHeaders[category] ?: return@forEach
-            val inCategory = providers.filter { it.category == category }
-            if (inCategory.isEmpty()) return@forEach
-            val enabledInCategory = inCategory.count { !adapter.isDisabled(it.id) }
-            header.text = "$category ($enabledInCategory/${inCategory.size})"
-        }
-    }
-
-    private fun addCategoryHeader(category: String) {
-        val density = container.context.resources.displayMetrics.density
-        val header = TextView(container.context).apply {
-            tag = "header_$category"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(
-                (16 * density).toInt(),
-                (12 * density).toInt(),
-                (16 * density).toInt(),
-                (4 * density).toInt(),
-            )
-        }
-        categoryHeaders[category] = header
-        container.addView(header)
     }
 
     @RequiresApi(Build.VERSION_CODES.O)
@@ -279,14 +248,12 @@ class StreamlyProvidersFragment(
         container = view.findView("list_container")
         container.makeTvCompatible()
         container.removeAllViews()
-        categoryHeaders.clear()
-        val order = ProvidersList.categoryOrder
-        providers = ProvidersList.providers.sortedWith(
-            compareBy({ order.indexOf(it.category).takeIf { idx -> idx >= 0 } ?: Int.MAX_VALUE }, { it.name.lowercase() })
-        )
+        providers = ProvidersList.providers
         loadTestStatuses()
 
-        val savedDisabled = sharedPref.getStringSet(PREFS_DISABLED, emptySet()) ?: emptySet()
+        val knownIds = providers.mapTo(mutableSetOf()) { it.id }
+        val savedDisabled = sharedPref.getStringSet(PREFS_DISABLED, emptySet())
+            ?.filterTo(mutableSetOf()) { it in knownIds } ?: mutableSetOf()
 
         adapter = ProviderAdapter(providers, savedDisabled) { disabled ->
             sharedPref.edit { putStringSet(PREFS_DISABLED, disabled) }
@@ -299,7 +266,6 @@ class StreamlyProvidersFragment(
         val testId = res.getIdentifier("btn_test_provider", "id", BuildConfig.LIBRARY_PACKAGE_NAME)
 
         providers.forEach { provider ->
-            if (categoryHeaders[provider.category] == null) addCategoryHeader(provider.category)
             val item = getLayout("item_provider_checkbox", layoutInflater, container)
             item.tag = provider.id
             val chk = item.findViewById<CheckBox>(chkId)
@@ -341,7 +307,7 @@ class StreamlyProvidersFragment(
         val byId = providers.associateBy { it.id }
         for (i in 0 until container.childCount) {
             val row = container.getChildAt(i)
-            // Section headers carry a "header_<category>" tag, provider rows the provider id.
+            // Rows are tagged with the provider id.
             val provider = byId[row.tag as? String] ?: continue
             row.findViewById<CheckBox>(chkId)?.let { chk ->
                 chk.isChecked = !adapter.isDisabled(provider.id)

@@ -377,7 +377,7 @@ class Uqload : ExtractorApi() {    override val name = "Uqload"
         } ?: return
 
         val regex = Regex("""hls2":"(?<hls2>[^"]+)"|hls4":"(?<hls4>[^"]+)"""")
-        // 2Embed serves uqloads.xyz while mainUrl is pinned to uqload.is:
+        // Some embed chains serve uqloads.xyz while mainUrl is pinned to uqload.is:
         // prefix relative hls4 paths (and the playback Referer) with the
         // host that actually served the page, not the hardcoded mainUrl.
         val origin = runCatching {

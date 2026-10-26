@@ -95,16 +95,6 @@ class StreamlyMainSettingsFragment(
         chevronLanguage.setImageDrawable(getDrawable("ic_chevron"))
         languageRow.nextFocusUpId = providersRow.id
 
-        val wyzieRow: View = view.findView("wyzieRow")
-        val wyzieIconBg = view.findView<View>("wyzieIconBg")
-        val wyzieIcon = view.findView<ImageView>("wyzieIcon")
-        val chevronWyzie = view.findView<ImageView>("chevronWyzie")
-        wyzieRow.background = getDrawable("settings_item_background")
-        wyzieIconBg.background = getDrawable("ic_icon_bg_purple")
-        wyzieIcon.setImageDrawable(getDrawable("ic_addon"))
-        chevronWyzie.setImageDrawable(getDrawable("ic_chevron"))
-        wyzieRow.nextFocusUpId = languageRow.id
-
         val showSubFragment = { fragmentCreator: (() -> Unit) -> DialogFragment, tag: String ->
             val fm = activity?.supportFragmentManager
             if (fm != null) {
@@ -123,10 +113,6 @@ class StreamlyMainSettingsFragment(
 
         languageRow.setOnClickListener {
             showSubFragment({ cb -> StreamlyLanguageFragment(plugin, sharedPref, cb) }, "streamly_language")
-        }
-
-        wyzieRow.setOnClickListener {
-            showSubFragment({ cb -> StreamlyWyzieFragment(plugin, sharedPref, cb) }, "streamly_wyzie")
         }
 
         saveBtn.setOnClickListener {

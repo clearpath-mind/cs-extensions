@@ -584,7 +584,11 @@ open class Streamly : MainAPI() {
         val res = parseJson<LinkData>(data)
 
         // Prioritize providers by past success rate; circuit-broken ones sink.
-        val disabled = sharedPref?.getStringSet("disabled_providers", emptySet()) ?: emptySet()
+        // Stale ids from older builds (removed sources) are ignored.
+        val knownIds = ProvidersList.providers.mapTo(mutableSetOf()) { it.id }
+        val disabled = sharedPref?.getStringSet("disabled_providers", emptySet())
+            ?.filterTo(mutableSetOf()) { it in knownIds }
+            ?: emptySet()
         val prioritized = ProvidersList.providers
             .filter { !disabled.contains(it.id) }
             .sortedByDescending {
