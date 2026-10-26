@@ -2,7 +2,7 @@
 
 import org.jetbrains.kotlin.konan.properties.Properties
 
-version = 141
+version = 142
 
 android {
     namespace = "com.streamly"
@@ -54,4 +54,5 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     // Language picker list (ported from StreamPlay).
     implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
 }
