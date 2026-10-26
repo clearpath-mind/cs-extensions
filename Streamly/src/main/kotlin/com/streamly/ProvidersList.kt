@@ -16,12 +16,6 @@ data class Provider(
 object ProvidersList {
     val providers: List<Provider> by lazy {
         listOf(
-            Provider("topcinema", "TopCinema") { res, sub, cb ->
-                invokeTopCinema(res, sub, cb)
-            },
-            Provider("egydead", "EgyDead") { res, sub, cb ->
-                invokeEgyDead(res, sub, cb)
-            },
             // EasyPlex app API (TMDB-keyed search, exact tmdb_id match).
             Provider("egywatch", "EgyWatch") { res, sub, cb ->
                 invokeEgyWatch(res, sub, cb)
@@ -31,6 +25,9 @@ object ProvidersList {
             },
             Provider("dramaworld", "DramaWorld") { res, sub, cb ->
                 invokeDramaWorld(res, sub, cb)
+            },
+            Provider("timemovies", "TimeMovies") { res, sub, cb ->
+                invokeTimeMovies(res, sub, cb)
             },
         )
     }
