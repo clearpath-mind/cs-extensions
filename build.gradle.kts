@@ -33,7 +33,8 @@ fun Project.android(configuration: LibraryExtension.() -> Unit) {
     extensions.getByName<LibraryExtension>("android").apply {
         project.extensions.findByType(JavaPluginExtension::class.java)?.apply {
             // Use Java 17 toolchain even if a higher JDK runs the build.
-            // We still use Java 8 for now which higher JDKs have deprecated.
+            // The upstream cloudstream3 library is built with jvmTarget 11,
+            // so plugins must target 11 too (Kotlin refuses to inline 11 bytecode into 1.8).
             toolchain {
                 languageVersion.set(JavaLanguageVersion.of(17))
             }
@@ -65,14 +66,14 @@ subprojects {
         }
 
         compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
+            sourceCompatibility = JavaVersion.VERSION_11
+            targetCompatibility = JavaVersion.VERSION_11
         }
 
         //noinspection WrongGradleMethod
         tasks.withType<KotlinJvmCompile> {
             compilerOptions {
-                jvmTarget.set(JvmTarget.JVM_1_8)
+                jvmTarget.set(JvmTarget.JVM_11)
                 freeCompilerArgs.addAll(
                     "-Xno-call-assertions",
                     "-Xno-param-assertions",
