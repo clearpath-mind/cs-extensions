@@ -13,7 +13,7 @@
 ## CI notes (`.github/workflows/build.yml`)
 
 - Triggers on push to `main` (`*.md` changes ignored) + `workflow_dispatch`.
-- Needs JDK 17 and the `TMDB_API` secret (written to `local.properties` in CI).
+- Needs JDK 17.
 - Artifacts (`*.cs3`, `plugins.json`, `repo.json`) are force-pushed to the `builds` branch.
 
 ## Versioning
@@ -46,14 +46,13 @@
 
 ## Local reference repos (`/home/imad/Projects/cs-repos`, read-only)
 
-- `StreamPlay/` (`com.Phisher98`) — architecture template Streamly mirrors.
+- `StreamPlay/` (`com.Phisher98`) — architecture template for this repo.
   Port patterns from here, don't re-derive: `StreamPlayCache.kt`
-  (adaptive timeout + circuit breaker → `StreamlyCache.kt`),
-  `StreamPlayConcurrency.kt` (→ `StreamlyConcurrency.kt`),
+  (adaptive timeout + circuit breaker), `StreamPlayConcurrency.kt`,
   `ProvidersList.kt`, `Extractors.kt`.
-- `re-3arabi/` — per-site provider implementations. Streamly's
-  FaselHD/MyCima/EgyDead/TopCinema logic tracks `Faselhd/`,
-  `MyCimaProvider/`, `Egydead/`, `Topcinema/`, `Wecima/` respectively.
+- `re-3arabi/` — per-site provider implementations. FaselHD/MyCima/EgyDead/
+  TopCinema logic tracks `Faselhd/`, `MyCimaProvider/`, `Egydead/`,
+  `Topcinema/`, `Wecima/` respectively.
   Check here first when a site changes selectors, headers, or AJAX flows
   (e.g. client-hint + fetch-metadata headers were ported from re-3arabi Faselhd).
 - `CricifyProvider/` (`com.cncverse`) — live-sports provider
@@ -67,7 +66,7 @@
   (plugin list updated 12 Oct 2026).
 - Key: `⭐` = works well, `🛑` = anti-features (closed-source/ads),
   `~~strikethrough~~` = disabled/broken.
-- Directly relevant to this repo (`Streamly/`, `YacineTV/`, `FreeSidePlus/`):
+- Directly relevant to this repo (`YacineTV/`, `FreeSidePlus/`):
   - `re-3arabi` (`arb` / `343`, open) — `github.com/Abodabodd/re-3arabi` —
     Arabic VOD, tracks FaselHD/MyCima/EgyDead/TopCinema.
   - `Phisher Repo` (`phisherrepo` / `864`, 🛑 closed-source) —

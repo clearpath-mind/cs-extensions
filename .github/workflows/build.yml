@@ -59,13 +59,6 @@ jobs:
         with:
           cache-read-only: false
 
-      - name: Access Secrets
-        env:
-          TMDB_API: ${{ secrets.TMDB_API }}
-        run: |
-          cd $GITHUB_WORKSPACE/src
-          echo TMDB_API=$TMDB_API >> local.properties
-
       - name: Build Plugins
         run: |
           cd $GITHUB_WORKSPACE/src

@@ -54,10 +54,6 @@ subprojects {
 
     android {
         // Each plugin module sets its own namespace in its build.gradle.kts.
-        // Keep a safe default only for the legacy Streamly module.
-        if (name == "Streamly") {
-            namespace = "com.streamly"
-        }
         compileSdk = 36
 
         defaultConfig {
