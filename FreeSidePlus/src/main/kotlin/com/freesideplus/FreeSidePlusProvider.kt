@@ -79,6 +79,9 @@ class FreeSidePlusProvider : MainAPI() {
         "36" to "BTS",
     )
 
+    // Site art is portrait (1280x1920, 2:3); these categories render vertical cards.
+    private val verticalCategories = setOf(37) // Side+ Saturdays
+
     // Full fields (with content HTML) — only for single-post load()/loadLinks().
     private val postFields = "_fields=id,link,date,title,content,categories,featured_media"
     // List fields (no content): the full post HTML is ~50x the payload
@@ -90,9 +93,13 @@ class FreeSidePlusProvider : MainAPI() {
 
     private fun unescape(s: String): String = Parser.unescapeEntities(s, false).trim()
 
-    // Media IDs repeat across Latest/category rows and paginations — cache hits
-    // skip the /media round-trip entirely (server takes ~2-8s per call).
-    private val posterCache = ConcurrentHashMap<Int, String>()
+    // Media IDs repeat across rows and paginations — cache hits skip the
+    // /media round-trip entirely (server takes ~2-8s per call). The key carries
+    // orientation too: the same post appears in horizontal rows (Latest) and in
+    // the vertical Side+ Saturdays row, which need different crops.
+    private val posterCache = ConcurrentHashMap<String, String>()
+
+    private fun posterKey(id: Int, vertical: Boolean): String = "$id:${if (vertical) "v" else "h"}"
 
     private data class CachedRow(
         val timestamp: Long,
@@ -133,32 +140,41 @@ class FreeSidePlusProvider : MainAPI() {
     private fun cleanTitle(raw: String): String =
         unescape(raw).replace(qualitySuffixRegex, "").trim()
 
-    /** Landscape thumbnail for horizontal cards (780x470 crop, else fallbacks). */
-    private fun landscapeUrl(media: WpMedia): String? {
+    /**
+     * Poster URL for a featured image. Site originals are portrait (1280x1920),
+     * so horizontal cards use the theme's landscape crops while vertical cards
+     * use the 2:3 sizes.
+     */
+    private fun posterUrl(media: WpMedia, vertical: Boolean = false): String? {
         val sizes = media.mediaDetails?.sizes
-        val crop = sizes?.get("jannah-image-post")?.sourceUrl
-            ?.takeIf { it.startsWith("http") }
-            ?: sizes?.get("jannah-image-large")?.sourceUrl
-                ?.takeIf { it.startsWith("http") }
-        if (crop != null) return crop
+        val preferred = if (vertical) {
+            listOf("medium_large", "large", "1536x1536")
+        } else {
+            listOf("jannah-image-post", "jannah-image-large")
+        }
+        preferred.firstNotNullOfOrNull { name ->
+            sizes?.get(name)?.sourceUrl?.takeIf { it.startsWith("http") }
+        }?.let { return it }
         return media.sourceUrl?.takeIf { it.startsWith("http") }
     }
 
-    private suspend fun fetchPosters(ids: List<Int>): Map<Int, String> {
+    private suspend fun fetchPosters(ids: List<Int>, vertical: Boolean = false): Map<Int, String> {
         val wanted = ids.filter { it > 0 }.distinct()
         if (wanted.isEmpty()) return emptyMap()
-        val cached = wanted.mapNotNull { id -> posterCache[id]?.let { id to it } }.toMap()
-        val missing = wanted.filter { !posterCache.containsKey(it) }
+        val cached = wanted.mapNotNull { id ->
+            posterCache[posterKey(id, vertical)]?.let { id to it }
+        }.toMap()
+        val missing = wanted.filter { posterCache[posterKey(it, vertical)] == null }
         if (missing.isEmpty()) return cached
         val fetched = runCatching {
             val url = "$apiBase/media?include=${missing.joinToString(",")}" +
                 "&per_page=100&_fields=id,source_url,media_details"
             parseJson<List<WpMedia>>(app.get(url).text).mapNotNull { media ->
-                val thumb = landscapeUrl(media) ?: return@mapNotNull null
+                val thumb = posterUrl(media, vertical) ?: return@mapNotNull null
                 media.id to thumb
             }.toMap()
         }.getOrNull().orEmpty()
-        fetched.forEach { (id, url) -> posterCache[id] = url }
+        fetched.forEach { (id, url) -> posterCache[posterKey(id, vertical)] = url }
         return cached + fetched
     }
 
@@ -180,18 +196,22 @@ class FreeSidePlusProvider : MainAPI() {
         return posts to (totalPages == null || page < totalPages)
     }
 
-    private suspend fun postsToCards(posts: List<WpPost>): List<SearchResponse> {
+    private suspend fun postsToCards(
+        posts: List<WpPost>,
+        vertical: Boolean = false,
+    ): List<SearchResponse> {
         if (posts.isEmpty()) return emptyList()
-        val posters = fetchPosters(posts.map { it.featuredMedia })
+        val posters = fetchPosters(posts.map { it.featuredMedia }, vertical)
         return posts.mapNotNull { toSearchResponse(it, posters) }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val catId = request.data.toIntOrNull() ?: 0
+        val vertical = catId in verticalCategories
         val key = "$catId:$page"
         rowCache[key]?.takeIf { System.currentTimeMillis() - it.timestamp < rowTtlMs }?.let {
             return newHomePageResponse(
-                listOf(HomePageList(request.name, it.items, isHorizontalImages = true)),
+                listOf(HomePageList(request.name, it.items, isHorizontalImages = !vertical)),
                 it.hasNext,
             )
         }
@@ -201,10 +221,10 @@ class FreeSidePlusProvider : MainAPI() {
             if (catId > 0) append("&categories=$catId")
         }
         val (posts, hasNext) = fetchPosts(url)
-        val items = postsToCards(posts)
+        val items = postsToCards(posts, vertical)
         rowCache[key] = CachedRow(System.currentTimeMillis(), items, hasNext)
         return newHomePageResponse(
-            listOf(HomePageList(request.name, items, isHorizontalImages = true)),
+            listOf(HomePageList(request.name, items, isHorizontalImages = !vertical)),
             hasNext,
         )
     }
@@ -248,9 +268,11 @@ class FreeSidePlusProvider : MainAPI() {
             ?: yearRegex.find(title)?.value?.toIntOrNull()
         // Poster, categories, and recommendations are independent — fetch them
         // concurrently instead of sequentially (server takes seconds per call).
+        // Portrait art: detail posters and same-category recommendations stay vertical.
+        val vertical = post.categories?.any { it in verticalCategories } == true
         val (poster, names, recommendations) = coroutineScope {
             val posterDeferred = async {
-                if (post.featuredMedia > 0) fetchPosters(listOf(post.featuredMedia))[post.featuredMedia]
+                if (post.featuredMedia > 0) fetchPosters(listOf(post.featuredMedia), vertical)[post.featuredMedia]
                 else null
             }
             val namesDeferred = async { getCategoryNames() }
@@ -261,7 +283,7 @@ class FreeSidePlusProvider : MainAPI() {
                             "$apiBase/posts?categories=$catId&exclude=${post.id}" +
                                 "&per_page=12&$listFields&orderby=date&order=desc"
                         )
-                        postsToCards(related)
+                        postsToCards(related, vertical)
                     }.getOrNull()
                 }.orEmpty()
             }
