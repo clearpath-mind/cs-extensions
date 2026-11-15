@@ -8,7 +8,7 @@
         "authors": [
             "clearpath-mind"
         ],
-        "fileSize": 33079,
+        "fileSize": 33136,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "en",
         "tvTypes": [
@@ -16,27 +16,7 @@
         ],
         "iconUrl": "https://freesideplus.plus/wp-content/uploads/2026/06/FSP-LOGO.png",
         "apiVersion": 1,
-        "fileHash": "sha256-f32793505d0ddca6b0fce726129a2020f55434475d5486482a1b12d1fc429b37"
-    },
-    {
-        "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/Streamly.cs3",
-        "status": 1,
-        "version": 147,
-        "name": "Streamly",
-        "internalName": "Streamly",
-        "authors": [
-            "clearpath-mind"
-        ],
-        "fileSize": 653955,
-        "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
-        "language": "ar",
-        "tvTypes": [
-            "Movie",
-            "TvSeries"
-        ],
-        "iconUrl": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/main/Streamly/icon.png",
-        "apiVersion": 1,
-        "fileHash": "sha256-77b4fa2ebd93c86bb315ad18967ab66d75f836b9a2411d2db65e11696c01174d"
+        "fileHash": "sha256-913e97c595a86f973a65f68e4f81a4e5bf7c3a2908e8275e2a393bcfcb36f85e"
     },
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
@@ -47,7 +27,7 @@
         "authors": [
             "clearpath-mind"
         ],
-        "fileSize": 80987,
+        "fileSize": 81136,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "ar",
         "tvTypes": [
@@ -55,6 +35,6 @@
         ],
         "iconUrl": "https://yt3.googleusercontent.com/ulm35tweg3do5istps0TgCjMmJSVczGUL2NIrXMwI1DDRi5ty29BIzQSUHVgqZN5CSo1PHhiA6M=s900-c-k-c0x00ffffff-no-rj",
         "apiVersion": 1,
-        "fileHash": "sha256-4604725d20a72b9573fbdce1681d79c5fc8185992485ac1418c32786ae48a0e0"
+        "fileHash": "sha256-536fad5d90a6c4491b7cce2f9fdc4bed4f3d616627c3768295da05563867d087"
     }
 ]
