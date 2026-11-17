@@ -2,13 +2,13 @@
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/FreeSidePlus.cs3",
         "status": 1,
-        "version": 15,
+        "version": 16,
         "name": "FreeSidePlus",
         "internalName": "FreeSidePlus",
         "authors": [
             "clearpath-mind"
         ],
-        "fileSize": 34169,
+        "fileSize": 45668,
         "repositoryUrl": "https://github.com/clearpath-mind/cs-extensions",
         "language": "en",
         "tvTypes": [
@@ -16,7 +16,7 @@
         ],
         "iconUrl": "https://freesideplus.plus/wp-content/uploads/2026/06/FSP-LOGO.png",
         "apiVersion": 1,
-        "fileHash": "sha256-8c02dcd2416705ca275387abcca00d9f0d52fcb45a37c9089eb30a1d9dbdd47a"
+        "fileHash": "sha256-c589394847922f213533f44d2f98447a5d6a2703f305354f92720ff6c0f0e141"
     },
     {
         "url": "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/YacineTV.cs3",
