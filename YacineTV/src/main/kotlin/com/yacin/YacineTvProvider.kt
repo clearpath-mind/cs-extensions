@@ -37,11 +37,12 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class YacineTvProvider : MainAPI() {
-    override var mainUrl = "https://def67.ycnapi.com/api"
+    override var mainUrl = "https://def111.ycnapi.com/api"
     // API hosts rotate. The app publishes the current one in Firebase Remote
-    // Config ("defaults"); retired hosts answer Cloudflare 403 "Attention
-    // Required", which used to leave Today's Matches empty (Oct 2026:
-    // def.ycnapi.com retired -> def67.ycnapi.com).
+    // Config ("defaults"); retired hosts either answer Cloudflare 403
+    // "Attention Required" or drop their DNS record, which used to leave
+    // Today's Matches empty (Oct 2026: def -> def67; Nov 2026: def67 ->
+    // def111, and both older names stopped resolving).
 
     override var name = "YacineTV"
     override val hasMainPage = true
@@ -155,17 +156,14 @@ class YacineTvProvider : MainAPI() {
     private val hostRetryMs = 30_000L
 
     // API roots; the mandatory /api prefix is added in apiHosts()
-    // (https://def67.ycnapi.com/events is a 404, /api/events is not).
+    // (https://def111.ycnapi.com/events is a 404, /api/events is not).
+    // Nov 2026 audit: def67/def no longer resolve in DNS and
+    // deft.yacinelive.com is a parked domain, so Remote Config discovery is
+    // the real source of truth; this entry only lets a cold start skip the
+    // Firebase round trip.
     private val fallbackHosts = listOf(
-        "https://def67.ycnapi.com",
-        "https://def.ycnapi.com",
-        "https://deft.yacinelive.com",
+        "https://def111.ycnapi.com",
     )
-
-    // If every direct host fails (WAF/network), each call would pay 3
-    // failed requests. Skip them briefly and go straight to the relay.
-    @Volatile private var relayUntil = 0L
-    private val relayCooldownMs = 10 * 60_000L
 
     @Volatile private var discoveredHost: String? = null
     @Volatile private var hostCheckedAt: Long = 0L
@@ -220,7 +218,7 @@ class YacineTvProvider : MainAPI() {
         } catch (_: Exception) { null }
     }
 
-    /** Remote Config publishes a bare origin ("def67.ycnapi.com"), while
+    /** Remote Config publishes a bare origin ("def111.ycnapi.com"), while
      *  every endpoint lives under /api. Keeping the suffix here (not in
      *  join(), which also resolves page-relative m3u8/iframe URLs) is
      *  what v22 missed: it requested /events and got the origin's 404. */
@@ -243,44 +241,54 @@ class YacineTvProvider : MainAPI() {
             .distinct()
     }
 
+    /** Drop the cached origin so the next apiHosts() asks Remote Config
+     *  again. Without this a mid-session host rotation pinned the dead
+     *  origin for the whole 6h TTL. */
+    private fun invalidateHost() {
+        discoveredHost = null
+        hostCheckedAt = 0L
+    }
+
     /** Only accept decrypted JSON: a Cloudflare HTML challenge (or a
      *  missing/stale `t`) decrypts to noise, and returning that would
-     *  stop the host/relay fallback with an empty row. */
+     *  stop the host fallback with an empty row. */
     private fun decryptJson(encryptedText: String, tHeader: String): String? {
         val out = decrypt(encryptedText, tHeader).trim()
         return out.takeIf { it.startsWith("{") }
     }
 
     /** Encrypted API payload, decryptable with the response `t` header.
-     *  Direct hosts first (fast, no third party); when this network's
-     *  OkHttp traffic is WAF-blocked, the card worker relays the same
-     *  body from Cloudflare's egress. */
+     *  Direct hosts only: the old card-worker relay (`/yacine/...`) was
+     *  pinned to a retired upstream and answers 502, so it is gone rather
+     *  than costing a doomed round trip. */
     private suspend fun getDecrypted(path: String): String? {
-        if (System.currentTimeMillis() >= relayUntil) {
-            for (host in apiHosts()) {
-                try {
-                    val res = app.get(
-                        join(host, path),
-                        headers = mapOf("User-Agent" to "okhttp/4.12.0"),
-                        timeout = 15,
-                    )
-                    if (res.code == 200 && res.text.isNotBlank()) {
-                        decryptJson(res.text, res.headers["t"] ?: "")?.let { return it }
-                    }
-                } catch (_: Exception) { /* try next host */ }
-            }
-            relayUntil = System.currentTimeMillis() + relayCooldownMs
-        }
-        return getViaRelay(path)
+        tryHosts(path)?.let { return it }
+        // Every host failed: the origin most likely rotated. Ask Remote
+        // Config again and retry once with the fresh origin instead of
+        // pinning the dead one for the rest of the 6h TTL.
+        val stale = discoveredHost
+        invalidateHost()
+        discoverHost()?.let { discoveredHost = it }
+        hostCheckedAt = System.currentTimeMillis()
+        val fresh = discoveredHost
+        if (fresh == null || fresh == stale) return null
+        return tryHosts(path)
     }
 
-    private suspend fun getViaRelay(path: String): String? {
-        return try {
-            val res = app.get("$cardBase/yacine/$path", timeout = 20)
-            if (res.code == 200 && res.text.isNotBlank()) {
-                decryptJson(res.text, res.headers["t"] ?: "")
-            } else null
-        } catch (_: Exception) { null }
+    private suspend fun tryHosts(path: String): String? {
+        for (host in apiHosts()) {
+            try {
+                val res = app.get(
+                    join(host, path),
+                    headers = mapOf("User-Agent" to "okhttp/4.12.0"),
+                    timeout = 15,
+                )
+                if (res.code == 200 && res.text.isNotBlank()) {
+                    decryptJson(res.text, res.headers["t"] ?: "")?.let { return it }
+                }
+            } catch (_: Exception) { /* try next host */ }
+        }
+        return null
     }
 
     private suspend fun getEvents(): List<YacineEvent> {
