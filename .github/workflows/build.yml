@@ -72,8 +72,8 @@ jobs:
         run: |
           cat > $GITHUB_WORKSPACE/builds/repo.json <<'EOF'
           {
-              "name": "Clearpath-mind Repo",
-              "description": "CloudStream extensions by clearpath-mind: YacineTV (Arabic live sports) and FreeSidePlus (movies).",
+              "name": "ClearPathMind",
+              "description": "ClearPathMind Repository",
               "manifestVersion": 1,
               "pluginLists": [
                   "https://raw.githubusercontent.com/clearpath-mind/cs-extensions/builds/plugins.json"
