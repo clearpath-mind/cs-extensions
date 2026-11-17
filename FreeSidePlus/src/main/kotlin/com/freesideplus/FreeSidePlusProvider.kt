@@ -62,6 +62,36 @@ data class LinkData(
     @JsonProperty("id") val id: Int = 0,
 )
 
+data class FspServer(
+    @JsonProperty("label") val label: String? = null,
+    @JsonProperty("embed") val embed: String? = null,
+    @JsonProperty("download") val download: String? = null,
+)
+
+data class FspSeries(
+    @JsonProperty("id") val id: Int = 0,
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("url") val url: String? = null,
+)
+
+/** Payload of the theme's `fsp/v1/episode/{id}` route, the same one fx.js uses. */
+data class FspEpisode(
+    @JsonProperty("id") val id: Int = 0,
+    @JsonProperty("servers") val servers: List<FspServer>? = null,
+    @JsonProperty("desc") val desc: String? = null,
+    @JsonProperty("season") val season: String? = null,
+    @JsonProperty("runtime") val runtime: String? = null,
+    @JsonProperty("quality") val quality: String? = null,
+    @JsonProperty("year") val year: String? = null,
+    @JsonProperty("num") val num: String? = null,
+    @JsonProperty("title") val title: String? = null,
+    @JsonProperty("url") val url: String? = null,
+    @JsonProperty("thumb") val thumb: String? = null,
+    @JsonProperty("thumb_lg") val thumbLg: String? = null,
+    @JsonProperty("date") val date: String? = null,
+    @JsonProperty("series") val series: FspSeries? = null,
+)
+
 class FreeSidePlusProvider : MainAPI() {
     override var mainUrl = "https://freesideplus.plus"
     private val apiBase = "$mainUrl/wp-json/wp/v2"
@@ -110,6 +140,92 @@ class FreeSidePlusProvider : MainAPI() {
     // revisit instant without noticeably delaying new episodes.
     private val rowCache = ConcurrentHashMap<String, CachedRow>()
     private val rowTtlMs = 3 * 60 * 1000L
+
+    private data class CachedEpisode(
+        val timestamp: Long,
+        val episode: FspEpisode,
+    )
+    // load() and loadLinks() want the same payload; caching it makes opening an
+    // episode cost one request instead of two.
+    private val episodeCache = ConcurrentHashMap<Int, CachedEpisode>()
+    private val episodeTtlMs = 10 * 60 * 1000L
+
+    /** Everything load()/loadLinks() need, straight from the theme's episode route. */
+    private suspend fun fetchEpisode(id: Int): FspEpisode? {
+        if (id <= 0) return null
+        episodeCache[id]?.takeIf { System.currentTimeMillis() - it.timestamp < episodeTtlMs }
+            ?.let { return it.episode }
+        val episode = runCatching {
+            parseJson<FspEpisode>(app.get("$mainUrl/wp-json/fsp/v1/episode/$id").text)
+                .takeIf { it.title?.isNotBlank() == true }
+        }.getOrNull() ?: return null
+        episodeCache[id] = CachedEpisode(System.currentTimeMillis(), episode)
+        return episode
+    }
+
+    /** Some server rows ship broken ("https:// bysevepoin.com/…"); drop the gap. */
+    private fun normalizeEmbed(url: String?): String? =
+        url?.trim()
+            ?.replace(Regex("""^(https?://)\s+""")) { it.groupValues[1] }
+            ?.takeIf { it.startsWith("http") }
+
+    /** "Mirror" rows that are not videos: Side+ landing pages and raw image assets. */
+    private fun isJunkServer(url: String): Boolean =
+        url.contains("sideplus.com", true) || url.contains("imgix.net", true)
+
+    /** The site occasionally puts unrelated copy in the description field. */
+    private val junkPlots = listOf(
+        "You will immediately log out of this account",
+        "Click here to apply",
+    )
+
+    private fun plotText(raw: String?): String? =
+        raw?.trim()?.takeIf { plot ->
+            plot.isNotBlank() && junkPlots.none { plot.contains(it, ignoreCase = true) }
+        }
+
+    /** "November 5, 2026" -> "5 Nov 2026". */
+    private fun formatApiDate(value: String?): String? {
+        val raw = value?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return try {
+            val parsed = java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.US)
+                .parse(raw) ?: return null
+            java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.US).format(parsed)
+        } catch (_: Exception) { null }
+    }
+
+    /** "BTS [2026]" -> "2026"; null when the season just repeats the series name. */
+    private fun seasonLabel(season: String?, seriesName: String?): String? {
+        var label = season?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val name = seriesName?.trim().orEmpty()
+        if (name.isNotEmpty() && label.startsWith(name, ignoreCase = true)) {
+            label = label.substring(name.length)
+        }
+        label = label.trim(' ', '-', '–', '—', ':', '[', ']', '(', ')')
+        return label.takeIf { it.isNotBlank() && !it.equals(name, ignoreCase = true) }
+    }
+
+    /** "#264 – We End On GTA"; titles already carrying "Episode N" keep their form. */
+    private fun episodeTitle(episode: FspEpisode): String? {
+        val title = episode.title?.let(::cleanTitle)?.takeIf { it.isNotBlank() } ?: return null
+        val num = episode.num?.trim()?.takeIf { it.isNotEmpty() } ?: return title
+        val numbered = Regex("""\b(?:ep|episode)\.?\s*$num\b""", RegexOption.IGNORE_CASE)
+        return if (numbered.containsMatchIn(title)) title else "#$num – $title"
+    }
+
+    /** "00:25:01" / "25:01" -> minutes, rounded up like the site's own runtime. */
+    private fun runtimeMinutes(value: String?): Int? {
+        val match = value?.let { durationRegex.find(it) } ?: return null
+        val parts = match.groupValues
+        val totalSeconds = if (parts[3].isNotEmpty()) {
+            (parts[1].toIntOrNull() ?: 0) * 3600 +
+                (parts[2].toIntOrNull() ?: 0) * 60 +
+                (parts[3].toIntOrNull() ?: 0)
+        } else {
+            (parts[1].toIntOrNull() ?: 0) * 60 + (parts[2].toIntOrNull() ?: 0)
+        }
+        return (totalSeconds + 30) / 60
+    }
 
     private var categoryNames: Map<Int, String>? = null
 
@@ -246,24 +362,54 @@ class FreeSidePlusProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val id = runCatching { parseJson<LinkData>(url).id }.getOrNull() ?: 0
+        fetchEpisode(id)?.let { return loadFromEpisode(url, id, it) }
+        // Fallback for when the theme route is unavailable.
+        return loadFromPost(url, id)
+    }
+
+    /** Title, plot, runtime, poster and servers in a single request. */
+    private suspend fun loadFromEpisode(url: String, id: Int, episode: FspEpisode): LoadResponse {
+        val seriesName = episode.series?.name?.let(::cleanTitle)?.takeIf { it.isNotBlank() }
+        val title = episodeTitle(episode) ?: seriesName ?: "Episode"
+        val vertical = episode.series?.id?.let { it in verticalCategories } == true
+        val recommendations = episode.series?.id?.takeIf { it > 0 }?.let { catId ->
+            runCatching {
+                val (related, _) = fetchPosts(
+                    "$apiBase/posts?categories=$catId&exclude=$id" +
+                        "&per_page=12&$listFields&orderby=date&order=desc"
+                )
+                postsToCards(related, vertical)
+            }.getOrNull()
+        }.orEmpty()
+        val year = episode.year?.trim()?.toIntOrNull()
+        val tags = buildList {
+            seriesName?.let(::add)
+            seasonLabel(episode.season, seriesName)
+                ?.takeIf { it != episode.year?.trim() }
+                ?.let(::add)
+            episode.quality?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
+            formatApiDate(episode.date)?.let(::add)
+        }.distinct().takeIf { it.isNotEmpty() }
+        val poster = episode.thumbLg?.takeIf { it.startsWith("http") }
+            ?: episode.thumb?.takeIf { it.startsWith("http") }
+        return newMovieLoadResponse(title, url, TvType.Movie, url) {
+            this.posterUrl = poster
+            this.plot = plotText(episode.desc)
+            this.tags = tags
+            this.year = year
+            this.duration = runtimeMinutes(episode.runtime)
+            this.recommendations = recommendations.takeIf { it.isNotEmpty() }
+        }
+    }
+
+    private suspend fun loadFromPost(url: String, id: Int): LoadResponse {
         val post = fetchPost(id) ?: throw IllegalStateException("Post not found")
         val title = post.title?.rendered?.let(::cleanTitle)?.takeIf { it.isNotBlank() } ?: "Episode"
         val frag = post.content?.rendered?.let { Jsoup.parseBodyFragment(it) }
-        val plot = frag?.selectFirst(".fsp-desc")?.text()?.trim()?.takeIf { it.isNotBlank() }
+        val plot = plotText(frag?.selectFirst(".fsp-desc")?.text())
         // LoadResponse.duration is in minutes.
         val duration = frag?.select(".fsp-tag, .fsp-item-value")
-            ?.firstNotNullOfOrNull { durationRegex.find(it.text()) }
-            ?.let { match ->
-                val parts = match.groupValues
-                val totalSeconds = if (parts[3].isNotEmpty()) {
-                    (parts[1].toIntOrNull() ?: 0) * 3600 +
-                        (parts[2].toIntOrNull() ?: 0) * 60 +
-                        (parts[3].toIntOrNull() ?: 0)
-                } else {
-                    (parts[1].toIntOrNull() ?: 0) * 60 + (parts[2].toIntOrNull() ?: 0)
-                }
-                (totalSeconds + 30) / 60
-            }
+            ?.firstNotNullOfOrNull { runtimeMinutes(it.text()) }
         val year = yearRegex.find(post.date.orEmpty())?.value?.toIntOrNull()
             ?: yearRegex.find(title)?.value?.toIntOrNull()
         // Poster, categories, and recommendations are independent — fetch them
@@ -289,7 +435,6 @@ class FreeSidePlusProvider : MainAPI() {
             }
             Triple(posterDeferred.await(), namesDeferred.await(), recsDeferred.await())
         }
-        val pageUrl = post.link?.takeIf { it.startsWith("http") } ?: "$mainUrl/?p=${post.id}"
         val tags = buildList {
             post.categories?.mapNotNullTo(this) { names[it] }
             post.date?.let(::formatDate)?.let(::add)
@@ -311,15 +456,31 @@ class FreeSidePlusProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val id = runCatching { parseJson<LinkData>(data).id }.getOrNull() ?: 0
+        fetchEpisode(id)?.let { episode ->
+            val embeds = episode.servers.orEmpty().mapNotNull { server ->
+                normalizeEmbed(server.embed)?.takeIf { !isJunkServer(it) }
+            }.distinct()
+            if (embeds.isNotEmpty()) {
+                val referer = normalizeEmbed(episode.url) ?: mainUrl
+                var found = false
+                for (embed in embeds) {
+                    runCatching {
+                        loadExtractor(embed, referer, subtitleCallback) { found = true; callback(it) }
+                    }
+                }
+                return found
+            }
+        }
+        // Fallback for when the theme route is unavailable.
         val post = fetchPost(id, "_fields=id,link,content") ?: return false
         val html = post.content?.rendered?.takeIf { it.isNotBlank() } ?: return false
         val doc = Jsoup.parseBodyFragment(html)
         val embeds = linkedSetOf<String>()
         doc.select("[data-fsp-embed]").forEach { el ->
-            el.attr("data-fsp-embed").trim().takeIf { it.startsWith("http") }?.let(embeds::add)
+            normalizeEmbed(el.attr("data-fsp-embed"))?.let(embeds::add)
         }
         doc.select("iframe[src^=http]").forEach { el ->
-            el.attr("src").trim().takeIf { it.startsWith("http") }?.let(embeds::add)
+            normalizeEmbed(el.attr("src"))?.let(embeds::add)
         }
         if (embeds.isEmpty()) return false
         val referer = post.link?.takeIf { it.startsWith("http") } ?: mainUrl
